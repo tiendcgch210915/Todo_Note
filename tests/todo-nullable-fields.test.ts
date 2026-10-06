@@ -223,6 +223,69 @@ test("PATCH todo can set and clear time", async () => {
   assert.equal(cleared?.time, null);
 });
 
+test("marking frog keeps one frog per day and forces important urgent", async () => {
+  await insertTodo("todo-frog-a", {
+    scheduled_date: "2099-01-02",
+    is_important: 0,
+    is_urgent: 0,
+  });
+  await insertTodo("todo-frog-b", {
+    scheduled_date: "2099-01-02",
+    is_important: 0,
+    is_urgent: 0,
+  });
+
+  const first = await todosService.markFrog(USER_ID, "todo-frog-a", {
+    date: "2099-01-02",
+  });
+  assert.equal(first.is_frog, 1);
+  assert.equal(first.frog_date, "2099-01-02");
+  assert.equal(first.is_important, 1);
+  assert.equal(first.is_urgent, 1);
+
+  const second = await todosService.markFrog(USER_ID, "todo-frog-b", {
+    date: "2099-01-02",
+  });
+  assert.equal(second.is_frog, 1);
+  assert.equal(second.frog_date, "2099-01-02");
+  assert.equal(second.is_important, 1);
+  assert.equal(second.is_urgent, 1);
+
+  const oldFrog = await getTodo("todo-frog-a");
+  assert.equal(Number(oldFrog.is_frog), 0);
+  assert.equal(oldFrog.frog_date, null);
+});
+
+test("PATCH moving an existing frog enforces one frog on the target day", async () => {
+  await insertTodo("todo-frog-source", {
+    scheduled_date: "2099-01-02",
+    is_frog: 1,
+    frog_date: "2099-01-02",
+    is_important: 1,
+    is_urgent: 1,
+  });
+  await insertTodo("todo-frog-target", {
+    scheduled_date: "2099-01-03",
+    is_frog: 1,
+    frog_date: "2099-01-03",
+    is_important: 1,
+    is_urgent: 1,
+  });
+
+  const moved = await todosService.updateTodo(USER_ID, "todo-frog-source", {
+    scheduled_date: "2099-01-03",
+  });
+
+  assert.equal(moved.is_frog, 1);
+  assert.equal(moved.frog_date, "2099-01-03");
+  assert.equal(moved.is_important, 1);
+  assert.equal(moved.is_urgent, 1);
+
+  const oldTarget = await getTodo("todo-frog-target");
+  assert.equal(Number(oldTarget.is_frog), 0);
+  assert.equal(oldTarget.frog_date, null);
+});
+
 test("todo time requires top-level todo with scheduled_date", async () => {
   await assert.rejects(
     () => todosRepo.createTodo({
@@ -268,6 +331,33 @@ test("move-to-day clears time when date is removed", async () => {
 
   assert.equal(moved.scheduled_date, null);
   assert.equal(moved.time, null);
+});
+
+test("sync push clearing scheduled_date on an existing frog clears frog fields", async () => {
+  await insertTodo("todo-sync-clear-frog-date", {
+    is_frog: 1,
+    frog_date: "2026-01-02",
+    is_important: 1,
+    is_urgent: 1,
+  });
+
+  const results = await processPush(USER_ID, [
+    {
+      op: "update",
+      type: "todo",
+      payload: {
+        id: "todo-sync-clear-frog-date",
+        updated_at: NEW_UPDATED_AT,
+        scheduled_date: null,
+      },
+    },
+  ]);
+
+  assert.equal(results[0]?.status, "applied");
+  const row = await getTodo("todo-sync-clear-frog-date");
+  assert.equal(row.scheduled_date, null);
+  assert.equal(Number(row.is_frog), 0);
+  assert.equal(row.frog_date, null);
 });
 
 test("PATCH todo can clear recurrence fields with null", async () => {

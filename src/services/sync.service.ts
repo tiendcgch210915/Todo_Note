@@ -270,6 +270,8 @@ async function processOp(userId: string, op: SyncOp): Promise<OpResult> {
     type === "todo" && opType !== "delete"
       ? await todosRepo.getTodoByIdScoped(id, userId)
       : null;
+  let frogDateToEnforce: string | null = null;
+  let frogUpdatedAt: string | undefined;
 
   if (type === "todo" && opType !== "delete") {
     await ensurePastTodoDayClosedForMutation(
@@ -292,9 +294,46 @@ async function processOp(userId: string, op: SyncOp): Promise<OpResult> {
     const finalTime = hasOwn(dbPayload, "time")
       ? (dbPayload.time as string | null) ?? null
       : beforeTodo?.time ?? null;
+    const finalFrogDate = hasOwn(dbPayload, "frog_date")
+      ? (dbPayload.frog_date as string | null) ?? null
+      : beforeTodo?.is_frog === 1 && hasOwn(dbPayload, "scheduled_date")
+        ? finalScheduledDate
+        : beforeTodo?.frog_date ?? null;
+    const clearFrogBecauseDateRemoved =
+      beforeTodo?.is_frog === 1 &&
+      !hasOwn(dbPayload, "is_frog") &&
+      hasOwn(dbPayload, "scheduled_date") &&
+      finalScheduledDate === null &&
+      !hasOwn(dbPayload, "frog_date");
+    const finalIsFrog = clearFrogBecauseDateRemoved
+      ? false
+      : hasOwn(dbPayload, "is_frog")
+      ? Number(dbPayload.is_frog) === 1
+      : beforeTodo?.is_frog === 1;
 
     if (finalTime !== null && (finalParentId !== null || finalScheduledDate === null)) {
       return { id, status: "error", error: "bad_input" };
+    }
+    if (finalIsFrog) {
+      frogDateToEnforce = finalFrogDate ?? finalScheduledDate;
+      if (!frogDateToEnforce) {
+        return { id, status: "error", error: "bad_input" };
+      }
+      dbPayload.is_frog = 1;
+      dbPayload.frog_date = frogDateToEnforce;
+      dbPayload.is_important = 1;
+      dbPayload.is_urgent = 1;
+      frogUpdatedAt =
+        typeof payload.updated_at === "string" ? payload.updated_at : undefined;
+    } else if (clearFrogBecauseDateRemoved) {
+      dbPayload.is_frog = 0;
+      dbPayload.frog_date = null;
+    } else if (
+      hasOwn(dbPayload, "is_frog") &&
+      Number(dbPayload.is_frog) === 0 &&
+      !hasOwn(dbPayload, "frog_date")
+    ) {
+      dbPayload.frog_date = null;
     }
   }
 
@@ -335,6 +374,14 @@ async function processOp(userId: string, op: SyncOp): Promise<OpResult> {
     }
 
     if (type === "todo") {
+      if (frogDateToEnforce) {
+        await todosRepo.setSingleFrogForDay(
+          id,
+          userId,
+          frogDateToEnforce,
+          frogUpdatedAt
+        );
+      }
       const afterTodo = await todosRepo.getTodoByIdScoped(id, userId);
       if (afterTodo?.status === "done" && beforeTodo?.status !== "done") {
         await autoLogHabitForCompletedTodo(userId, afterTodo);

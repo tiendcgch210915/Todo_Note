@@ -87,7 +87,7 @@ export const getTodayStats = async (
   }
 
   const todos = await dashRepo.listDayTopLevelStats(userId, date);
-  const score = computeScore(todos, date);
+  const score = computeScore(todos, date, habits);
 
   for (const t of todos) {
     if (t.status === "done") continue;
@@ -655,7 +655,10 @@ export const getCalendarOverview = async (
 
   for (const d of Object.keys(days)) {
     if (d === today) {
-      days[d].score = computeScore(todosByDay[d] ?? [], d);
+      days[d].score = computeScore(todosByDay[d] ?? [], d, {
+        total: days[d].habits_total,
+        completed: days[d].habits_completed,
+      });
     }
   }
 

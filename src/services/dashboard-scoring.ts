@@ -1,7 +1,9 @@
 import { vietnamDateFromISO } from "../utils/vietnam-time.js";
 
-export const SCORE_BASE = 100;
-export const TODO_BONUS = { FROG: 10, IMPORTANT: 5 } as const;
+export const TODO_WEIGHT_SCORE = 80;
+export const FROG_BONUS_SCORE = 10;
+export const HABIT_SCORE = 30;
+export const MIN_TODOS_FOR_SCORE = 3;
 
 export type Quadrant = "q1" | "q2" | "q3" | "q4";
 
@@ -31,42 +33,72 @@ export const isFrogForDate = (t: ScorableTodo, date: string): boolean =>
   t.is_frog === 1 && t.frog_date === date;
 
 export const isScoredTodo = (t: ScorableTodo, date: string): boolean =>
-  t.is_important === 1 || t.is_urgent === 1 || isFrogForDate(t, date);
+  todoWeight(t, date) > 0;
 
 export const isCompletedForScore = (
   t: ScorableTodo,
   date: string
 ): boolean => {
   if (t.status !== "done") return false;
-  if (!t.completed_at) return true;
+  if (!t.completed_at) return false;
   const completedDate = vietnamDateFromISO(t.completed_at);
   return completedDate !== null && completedDate <= date;
 };
 
-const completedTodoScore = (
-  t: ScorableTodo,
-  date: string,
-  baseScore: number
-): number => {
-  if (!isCompletedForScore(t, date)) return 0;
-  return (
-    baseScore +
-    (isFrogForDate(t, date) ? TODO_BONUS.FROG : 0) +
-    (t.is_important === 1 ? TODO_BONUS.IMPORTANT : 0)
-  );
+const todoWeight = (t: ScorableTodo, date: string): number => {
+  const regularWeight =
+    (t.is_important === 1 ? 1 : 0) + (t.is_urgent === 1 ? 1 : 0);
+  return isFrogForDate(t, date) ? Math.max(regularWeight, 2) : regularWeight;
 };
 
-export const computeScore = (
+const computeTodoScore = (
   todos: ScorableTodo[],
   date: string
 ): number => {
   const scoredTodos = todos.filter((t) => isScoredTodo(t, date));
   if (scoredTodos.length === 0) return 0;
 
-  const baseScore = SCORE_BASE / scoredTodos.length;
-  const score = scoredTodos.reduce(
-    (sum, t) => sum + completedTodoScore(t, date, baseScore),
+  const totalWeight = scoredTodos.reduce(
+    (sum, todo) => sum + todoWeight(todo, date),
     0
   );
-  return Math.round(score);
+  if (totalWeight === 0) return 0;
+
+  const completedWeight = scoredTodos.reduce(
+    (sum, todo) =>
+      sum + (isCompletedForScore(todo, date) ? todoWeight(todo, date) : 0),
+    0
+  );
+  const frogBonus = scoredTodos.some(
+    (todo) => isFrogForDate(todo, date) && isCompletedForScore(todo, date)
+  )
+    ? FROG_BONUS_SCORE
+    : 0;
+
+  return (TODO_WEIGHT_SCORE * completedWeight) / totalWeight + frogBonus;
+};
+
+const computeHabitScore = (habits?: {
+  total: number;
+  completed: number;
+}): number => {
+  if (!habits || habits.total <= 0) return 0;
+  return (HABIT_SCORE * habits.completed) / habits.total;
+};
+
+export const computeScore = (
+  todos: ScorableTodo[],
+  date: string,
+  habits?: { total: number; completed: number }
+): number => {
+  const completedTodos = todos.filter((todo) =>
+    isCompletedForScore(todo, date)
+  ).length;
+  if (
+    todos.length < MIN_TODOS_FOR_SCORE ||
+    completedTodos < MIN_TODOS_FOR_SCORE
+  ) {
+    return 0;
+  }
+  return Math.round(computeTodoScore(todos, date) + computeHabitScore(habits));
 };

@@ -80,6 +80,17 @@ const todoTagIds = async (todoId: string): Promise<string[]> => {
   return (res.rows as unknown as { tag_id: string }[]).map((row) => row.tag_id);
 };
 
+const getTodoRow = async (
+  todoId: string
+): Promise<Record<string, unknown>> => {
+  const res = await turso.execute({
+    sql: "SELECT * FROM todos WHERE id = ?",
+    args: [todoId],
+  });
+  assert.equal(res.rows.length, 1);
+  return res.rows[0] as unknown as Record<string, unknown>;
+};
+
 before(async () => {
   await turso.execute(`
     CREATE TABLE IF NOT EXISTS users (
@@ -457,6 +468,58 @@ test("sync push tag_ids attaches and clears todo tags", async () => {
   ]);
   assert.equal(cleared[0].status, "applied");
   assert.deepEqual(await todoTagIds(todoId), []);
+});
+
+test("sync push frog is unique per day and forces Q1 classification", async () => {
+  const firstId = newId();
+  const secondId = newId();
+  await insertTodo(firstId, {
+    scheduled_date: "2099-01-10",
+    is_important: 0,
+    is_urgent: 0,
+  });
+  await insertTodo(secondId, {
+    scheduled_date: "2099-01-10",
+    is_important: 0,
+    is_urgent: 0,
+  });
+
+  let pushed = await processPush(USER_ID, [
+    {
+      op: "update",
+      type: "todo",
+      payload: {
+        id: firstId,
+        updated_at: NEW,
+        is_frog: true,
+        frog_date: "2099-01-10",
+      },
+    },
+  ]);
+  assert.equal(pushed[0].status, "applied");
+
+  pushed = await processPush(USER_ID, [
+    {
+      op: "update",
+      type: "todo",
+      payload: {
+        id: secondId,
+        updated_at: "2026-01-03T00:00:00.000Z",
+        is_frog: true,
+        frog_date: "2099-01-10",
+      },
+    },
+  ]);
+  assert.equal(pushed[0].status, "applied");
+
+  const oldFrog = await getTodoRow(firstId);
+  const newFrog = await getTodoRow(secondId);
+  assert.equal(Number(oldFrog.is_frog), 0);
+  assert.equal(oldFrog.frog_date, null);
+  assert.equal(Number(newFrog.is_frog), 1);
+  assert.equal(newFrog.frog_date, "2099-01-10");
+  assert.equal(Number(newFrog.is_important), 1);
+  assert.equal(Number(newFrog.is_urgent), 1);
 });
 
 test("sync push and changes preserve todo time", async () => {

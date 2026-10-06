@@ -532,10 +532,10 @@ export const createNextRecurringTodo = async (
           source.title,
           source.description,
           source.position,
-          source.is_frog,
-          source.frog_date,
-          source.is_important,
-          source.is_urgent,
+          0,
+          null,
+          source.is_frog === 1 ? 1 : source.is_important,
+          source.is_frog === 1 ? 1 : source.is_urgent,
           source.estimated_minutes,
           source.start_at,
           source.due_at,
@@ -673,10 +673,10 @@ export const ensureRecurringSubtasksCopied = async (
           source.title,
           source.description,
           source.position,
-          source.is_frog,
-          source.frog_date,
-          source.is_important,
-          source.is_urgent,
+          0,
+          null,
+          source.is_frog === 1 ? 1 : source.is_important,
+          source.is_frog === 1 ? 1 : source.is_urgent,
           source.estimated_minutes,
           source.start_at,
           source.due_at,
@@ -860,14 +860,43 @@ export const markFrog = async (
   userId: string,
   date: string
 ): Promise<TodoRow | null> => {
+  return setSingleFrogForDay(id, userId, date);
+};
+
+export const setSingleFrogForDay = async (
+  id: string,
+  userId: string,
+  date: string,
+  updatedAt = nowISO()
+): Promise<TodoRow | null> => {
   const now = nowISO();
-  const res = await turso.execute({
-    sql: `UPDATE todos
-          SET is_frog = 1, frog_date = ?, updated_at = ?
-          WHERE id = ? AND user_id = ? AND deleted_at IS NULL`,
-    args: [date, now, id, userId],
-  });
-  if (res.rowsAffected === 0) return null;
+  const stamp = updatedAt || now;
+  const res = await turso.batch(
+    [
+      {
+        sql: `UPDATE todos
+              SET is_frog = 0, frog_date = NULL, updated_at = ?
+              WHERE user_id = ?
+                AND id <> ?
+                AND is_frog = 1
+                AND COALESCE(frog_date, scheduled_date) = ?
+                AND deleted_at IS NULL`,
+        args: [stamp, userId, id, date],
+      },
+      {
+        sql: `UPDATE todos
+              SET is_frog = 1,
+                  frog_date = ?,
+                  is_important = 1,
+                  is_urgent = 1,
+                  updated_at = ?
+              WHERE id = ? AND user_id = ? AND deleted_at IS NULL`,
+        args: [date, stamp, id, userId],
+      },
+    ],
+    "write"
+  );
+  if ((res[1].rowsAffected ?? 0) === 0) return null;
   return getTodoByIdScoped(id, userId);
 };
 

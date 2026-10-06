@@ -39,6 +39,12 @@ const wrapRepo = (e: unknown): never => {
 
 const ISO_DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
 
+const hasOwn = <K extends PropertyKey>(
+  obj: object,
+  key: K
+): obj is object & Record<K, unknown> =>
+  Object.prototype.hasOwnProperty.call(obj, key);
+
 const safeInterval = (interval: number | null): number =>
   interval !== null && interval > 0 ? interval : 1;
 
@@ -161,6 +167,22 @@ const resolveTagIds = async (
   return [...ids];
 };
 
+const resolveFrogDate = (
+  values: {
+    frog_date?: string | null;
+    scheduled_date?: string | null;
+  },
+  fallback?: {
+    frog_date?: string | null;
+    scheduled_date?: string | null;
+  }
+): string | null =>
+  values.frog_date ??
+  values.scheduled_date ??
+  fallback?.frog_date ??
+  fallback?.scheduled_date ??
+  null;
+
 export const createTodo = async (
   userId: string,
   input: CreateTodoInput
@@ -172,6 +194,14 @@ export const createTodo = async (
 
   let todo: todosRepo.TodoRow;
   try {
+    const frogDate = input.is_frog
+      ? resolveFrogDate({
+          frog_date: input.frog_date ?? null,
+          scheduled_date: input.scheduled_date ?? null,
+        })
+      : input.frog_date ?? null;
+    if (input.is_frog && !frogDate) throw new ServiceError("bad_input");
+
     todo = await todosRepo.createTodo({
       user_id: userId,
       title: input.title,
@@ -180,9 +210,9 @@ export const createTodo = async (
       scheduled_date: input.scheduled_date ?? null,
       status: input.status,
       is_frog: input.is_frog,
-      frog_date: input.frog_date ?? null,
-      is_important: input.is_important ?? null,
-      is_urgent: input.is_urgent ?? null,
+      frog_date: frogDate,
+      is_important: input.is_frog ? true : input.is_important ?? null,
+      is_urgent: input.is_frog ? true : input.is_urgent ?? null,
       estimated_minutes: input.estimated_minutes ?? null,
       start_at: input.start_at ?? null,
       due_at: input.due_at ?? null,
@@ -196,6 +226,15 @@ export const createTodo = async (
       recurrence_end_date: input.recurrence_end_date ?? null,
       recurrence_template_id: input.recurrence_template_id ?? null,
     });
+    if (input.is_frog && frogDate) {
+      const marked = await todosRepo.setSingleFrogForDay(
+        todo.id,
+        userId,
+        frogDate
+      );
+      if (!marked) throw new ServiceError("not_found");
+      todo = marked;
+    }
   } catch (e) {
     return wrapRepo(e);
   }
@@ -267,8 +306,49 @@ export const updateTodo = async (
       );
     }
 
-    const row = await todosRepo.updateTodo(id, userId, todoPatch);
+    const hasScheduledDate = hasOwn(todoPatch, "scheduled_date");
+    const hasFrogDate = hasOwn(todoPatch, "frog_date");
+    const isSelectingFrog = todoPatch.is_frog === true;
+    const staysFrog = before.is_frog === 1 && todoPatch.is_frog !== false;
+    const clearFrogBecauseDateRemoved =
+      staysFrog &&
+      hasScheduledDate &&
+      todoPatch.scheduled_date === null &&
+      !hasFrogDate;
+    const shouldResolveFrogDate =
+      isSelectingFrog || (staysFrog && (hasScheduledDate || hasFrogDate));
+    const frogDate =
+      shouldResolveFrogDate && !clearFrogBecauseDateRemoved
+        ? resolveFrogDate(
+            {
+              frog_date: todoPatch.frog_date,
+              scheduled_date: todoPatch.scheduled_date,
+            },
+            before
+          )
+        : null;
+    if (shouldResolveFrogDate && !clearFrogBecauseDateRemoved && !frogDate) {
+      throw new ServiceError("bad_input");
+    }
+    if (clearFrogBecauseDateRemoved) {
+      todoPatch.is_frog = false;
+      todoPatch.frog_date = null;
+    } else if (shouldResolveFrogDate) {
+      todoPatch.frog_date = frogDate;
+    } else if (todoPatch.is_frog === false && todoPatch.frog_date === undefined) {
+      todoPatch.frog_date = null;
+    }
+    if (!clearFrogBecauseDateRemoved && (isSelectingFrog || staysFrog)) {
+      todoPatch.is_important = true;
+      todoPatch.is_urgent = true;
+    }
+
+    let row = await todosRepo.updateTodo(id, userId, todoPatch);
     if (!row) throw new ServiceError("not_found");
+    if (shouldResolveFrogDate && !clearFrogBecauseDateRemoved && frogDate) {
+      row = await todosRepo.setSingleFrogForDay(id, userId, frogDate);
+      if (!row) throw new ServiceError("not_found");
+    }
     if (shouldReplaceTags) {
       const resolvedTagIds = await resolveTagIds(userId, {
         tag_ids,
@@ -380,11 +460,13 @@ export const classifyEisenhower = async (
   id: string,
   body: ClassifyEisenhowerInput
 ): Promise<todosRepo.TodoRow> => {
+  const before = await todosRepo.getTodoByIdScoped(id, userId);
+  if (!before) throw new ServiceError("not_found");
   const todo = await todosRepo.classifyEisenhower(
     id,
     userId,
-    body.is_important,
-    body.is_urgent
+    before.is_frog === 1 ? true : body.is_important,
+    before.is_frog === 1 ? true : body.is_urgent
   );
   if (!todo) throw new ServiceError("not_found");
   return todo;
@@ -401,11 +483,27 @@ export const moveToDay = async (
     await ensurePastTodoDayClosedForMutation(userId, before.scheduled_date);
     await ensurePastTodoDayClosedForMutation(userId, body.date);
 
-    const row = await todosRepo.updateTodo(id, userId, {
+    const patch: todosRepo.UpdateTodoPatch = {
       scheduled_date: body.date,
       ...(body.date === null ? { time: null } : {}),
-    });
+    };
+    if (before.is_frog === 1) {
+      if (body.date === null) {
+        patch.is_frog = false;
+        patch.frog_date = null;
+      } else {
+        patch.frog_date = body.date;
+        patch.is_important = true;
+        patch.is_urgent = true;
+      }
+    }
+
+    let row = await todosRepo.updateTodo(id, userId, patch);
     if (!row) throw new ServiceError("not_found");
+    if (before.is_frog === 1 && body.date !== null) {
+      row = await todosRepo.setSingleFrogForDay(id, userId, body.date);
+      if (!row) throw new ServiceError("not_found");
+    }
     return row;
   } catch (e) {
     return wrapRepo(e);

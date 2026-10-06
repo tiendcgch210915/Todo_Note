@@ -1,4 +1,5 @@
 import * as dailyRepo from "../repositories/daily-todo-logs.js";
+import * as dashRepo from "../repositories/dashboard.js";
 import { addDays, daysInRange, nowISO } from "../utils/time.js";
 import { getVietnamNowParts } from "../utils/vietnam-time.js";
 import {
@@ -47,7 +48,10 @@ export const closeUserTodoDay = async (
   const existing = await dailyRepo.getDailyTodoSummary(userId, date);
   if (existing) return existing;
 
-  const snapshots = await dailyRepo.listTodoSnapshotsForDailyClose(userId, date);
+  const [snapshots, habits] = await Promise.all([
+    dailyRepo.listTodoSnapshotsForDailyClose(userId, date),
+    dashRepo.countDayHabits(userId, date),
+  ]);
   const logs = snapshots.map((todo) => {
     const completed = isCompletedForScore(toScorable(todo), date);
     return {
@@ -83,7 +87,8 @@ export const closeUserTodoDay = async (
       is_frog: log.is_frog,
       frog_date: log.frog_date,
     })),
-    date
+    date,
+    habits
   );
 
   await dailyRepo.insertDailyTodoClose({

@@ -4,6 +4,39 @@ type TestDb = {
 
 export const createDailyTodoLogTables = async (db: TestDb): Promise<void> => {
   await db.execute(`
+    CREATE TABLE IF NOT EXISTS habits (
+      id TEXT PRIMARY KEY,
+      user_id TEXT NOT NULL,
+      title TEXT NOT NULL,
+      description TEXT,
+      icon TEXT,
+      color TEXT NOT NULL DEFAULT '#4CAF50',
+      frequency_type TEXT NOT NULL DEFAULT 'daily',
+      target_per_period INTEGER NOT NULL DEFAULT 1,
+      active_weekdays TEXT,
+      start_date TEXT NOT NULL,
+      end_date TEXT,
+      current_streak INTEGER NOT NULL DEFAULT 0,
+      longest_streak INTEGER NOT NULL DEFAULT 0,
+      is_archived INTEGER NOT NULL DEFAULT 0,
+      created_at TEXT NOT NULL DEFAULT '1970-01-01T00:00:00.000Z',
+      updated_at TEXT NOT NULL DEFAULT '1970-01-01T00:00:00.000Z',
+      deleted_at TEXT
+    )
+  `);
+  await db.execute(`
+    CREATE TABLE IF NOT EXISTS habit_logs (
+      id TEXT PRIMARY KEY,
+      habit_id TEXT NOT NULL,
+      log_date TEXT NOT NULL,
+      completed INTEGER NOT NULL DEFAULT 0,
+      note TEXT,
+      created_at TEXT NOT NULL DEFAULT '1970-01-01T00:00:00.000Z',
+      updated_at TEXT NOT NULL DEFAULT '1970-01-01T00:00:00.000Z',
+      deleted_at TEXT
+    )
+  `);
+  await db.execute(`
     CREATE TABLE IF NOT EXISTS daily_todo_logs (
       id TEXT PRIMARY KEY,
       user_id TEXT NOT NULL,
