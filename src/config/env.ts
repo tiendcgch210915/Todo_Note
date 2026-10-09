@@ -26,6 +26,10 @@ const EnvSchema = z.object({
     .regex(/^\$2[aby]\$\d{2}\$.{53}$/, "ADMIN_PASSWORD_HASH must be a bcrypt hash (run `npm run admin:hash <password>`)"),
 
   NOTIFICATIONS_ENABLED: boolFromEnv,
+  // Application Default Credentials: path to the service-account JSON file
+  // (on Render: the Secret File, /etc/secrets/<name>).
+  GOOGLE_APPLICATION_CREDENTIALS: z.string().trim().min(1).optional(),
+  // Deprecated alias of GOOGLE_APPLICATION_CREDENTIALS, kept so existing deploys keep working.
   FIREBASE_SERVICE_ACCOUNT_PATH: z.string().trim().min(1).optional(),
 });
 
@@ -37,6 +41,18 @@ if (!parsed.success) {
     console.error(`  - ${issue.path.join(".")}: ${issue.message}`);
   }
   process.exit(1);
+}
+
+// firebase-admin's applicationDefault() reads GOOGLE_APPLICATION_CREDENTIALS straight
+// from process.env, so mirror the deprecated alias into it before anything initialises the SDK.
+if (
+  !parsed.data.GOOGLE_APPLICATION_CREDENTIALS &&
+  parsed.data.FIREBASE_SERVICE_ACCOUNT_PATH
+) {
+  parsed.data.GOOGLE_APPLICATION_CREDENTIALS =
+    parsed.data.FIREBASE_SERVICE_ACCOUNT_PATH;
+  process.env.GOOGLE_APPLICATION_CREDENTIALS =
+    parsed.data.FIREBASE_SERVICE_ACCOUNT_PATH;
 }
 
 export const env = parsed.data;

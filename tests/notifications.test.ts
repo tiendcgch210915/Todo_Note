@@ -63,11 +63,11 @@ const insertTodo = async (
 
 const tokensFor = async (userId: string): Promise<string[]> => {
   const res = await turso.execute({
-    sql: "SELECT fcm_token FROM user_devices WHERE user_id = ? ORDER BY fcm_token ASC",
+    sql: "SELECT registration_id FROM user_devices WHERE user_id = ? ORDER BY registration_id ASC",
     args: [userId],
   });
-  return (res.rows as unknown as { fcm_token: string }[]).map(
-    (row) => row.fcm_token
+  return (res.rows as unknown as { registration_id: string }[]).map(
+    (row) => row.registration_id
   );
 };
 
@@ -91,14 +91,17 @@ before(async () => {
     CREATE TABLE IF NOT EXISTS user_devices (
       id TEXT PRIMARY KEY,
       user_id TEXT NOT NULL,
-      fcm_token TEXT NOT NULL,
+      registration_id TEXT NOT NULL,
+      kind TEXT NOT NULL DEFAULT 'token',
+      platform TEXT NOT NULL DEFAULT 'android',
+      last_seen_at TEXT NOT NULL DEFAULT '1970-01-01T00:00:00.000Z',
       created_at TEXT NOT NULL,
       updated_at TEXT NOT NULL
     )
   `);
   await turso.execute(`
     CREATE UNIQUE INDEX IF NOT EXISTS idx_user_devices_user_token
-      ON user_devices(user_id, fcm_token)
+      ON user_devices(user_id, registration_id)
   `);
   await turso.execute(`
     CREATE TABLE IF NOT EXISTS todos (
@@ -180,13 +183,15 @@ test("morning notification counts important urgent todos and cleans invalid toke
     sent.push({
       title: message.title,
       body: message.body,
-      tokens: [...message.tokens].sort(),
+      tokens: message.devices.map((device) => device.registrationId).sort(),
     });
-    const invalidTokens = message.tokens.filter((token) => token === "bad-token");
+    const invalid = message.devices.filter(
+      (device) => device.registrationId === "bad-token"
+    );
     return {
-      successCount: message.tokens.length - invalidTokens.length,
-      failureCount: invalidTokens.length,
-      invalidTokens,
+      successCount: message.devices.length - invalid.length,
+      failureCount: invalid.length,
+      invalidDeviceIds: invalid.map((device) => device.id),
     };
   });
 
@@ -214,9 +219,9 @@ test("evening notification sends congratulations when all todos are done", async
   notifications.setNotificationSenderForTests(async (message) => {
     sent.push({ title: message.title, body: message.body });
     return {
-      successCount: message.tokens.length,
+      successCount: message.devices.length,
       failureCount: 0,
-      invalidTokens: [],
+      invalidDeviceIds: [],
     };
   });
 
@@ -236,9 +241,9 @@ test("custom todo reminder sends due todo once per minute", async () => {
   notifications.setNotificationSenderForTests(async (message) => {
     sent.push({ body: message.body, data: message.data });
     return {
-      successCount: message.tokens.length,
+      successCount: message.devices.length,
       failureCount: 0,
-      invalidTokens: [],
+      invalidDeviceIds: [],
     };
   });
 

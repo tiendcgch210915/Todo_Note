@@ -2,12 +2,25 @@ import { turso } from "../config/db.js";
 import { newId } from "../utils/id.js";
 import { nowISO } from "../utils/time.js";
 
+export type DeviceKind = "fid" | "token";
+export type DevicePlatform = "android";
+
 export type UserDeviceRow = {
   id: string;
   user_id: string;
-  fcm_token: string;
+  registration_id: string;
+  kind: DeviceKind;
+  platform: DevicePlatform;
+  last_seen_at: string;
   created_at: string;
   updated_at: string;
+};
+
+/** What the sender needs to address one device. */
+export type DeviceTarget = {
+  id: string;
+  registration_id: string;
+  kind: DeviceKind;
 };
 
 export type TodoReminderRow = {
@@ -20,10 +33,18 @@ export type TodoReminderRow = {
 
 export type NotificationKind = "morning" | "evening" | "todo_reminder";
 
+const DEVICE_COLUMNS =
+  "id, user_id, registration_id, kind, platform, last_seen_at, created_at, updated_at";
+
+const DELETE_BATCH_SIZE = 500;
+
 const mapDeviceRow = (row: Record<string, unknown>): UserDeviceRow => ({
   id: row.id as string,
   user_id: row.user_id as string,
-  fcm_token: row.fcm_token as string,
+  registration_id: row.registration_id as string,
+  kind: row.kind as DeviceKind,
+  platform: row.platform as DevicePlatform,
+  last_seen_at: row.last_seen_at as string,
   created_at: row.created_at as string,
   updated_at: row.updated_at as string,
 });
@@ -41,37 +62,71 @@ export const activeUserExists = async (userId: string): Promise<boolean> => {
   return res.rows.length > 0;
 };
 
-export const upsertUserDeviceToken = async (
+/**
+ * Insert or refresh a device registration. Every call bumps `last_seen_at`.
+ * A registration id belongs to one user at a time: re-registering it under a
+ * different user (shared phone, new login) detaches it from the previous owner.
+ */
+export const upsertUserDevice = async (
   userId: string,
-  token: string
+  input: {
+    registrationId: string;
+    kind: DeviceKind;
+    platform: DevicePlatform;
+  }
 ): Promise<UserDeviceRow> => {
   const id = newId();
   const now = nowISO();
   await turso.batch(
     [
       {
-        sql: "DELETE FROM user_devices WHERE fcm_token = ? AND user_id <> ?",
-        args: [token, userId],
+        sql: "DELETE FROM user_devices WHERE registration_id = ? AND user_id <> ?",
+        args: [input.registrationId, userId],
       },
       {
-        sql: `INSERT INTO user_devices (id, user_id, fcm_token, created_at, updated_at)
-              VALUES (?, ?, ?, ?, ?)
-              ON CONFLICT(user_id, fcm_token)
-              DO UPDATE SET updated_at = excluded.updated_at`,
-        args: [id, userId, token, now, now],
+        sql: `INSERT INTO user_devices
+              (id, user_id, registration_id, kind, platform, last_seen_at, created_at, updated_at)
+              VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+              ON CONFLICT(user_id, registration_id)
+              DO UPDATE SET kind = excluded.kind,
+                            platform = excluded.platform,
+                            last_seen_at = excluded.last_seen_at,
+                            updated_at = excluded.updated_at`,
+        args: [
+          id,
+          userId,
+          input.registrationId,
+          input.kind,
+          input.platform,
+          now,
+          now,
+          now,
+        ],
       },
     ],
     "write"
   );
 
   const res = await turso.execute({
-    sql: "SELECT id, user_id, fcm_token, created_at, updated_at FROM user_devices WHERE user_id = ? AND fcm_token = ?",
-    args: [userId, token],
+    sql: `SELECT ${DEVICE_COLUMNS} FROM user_devices WHERE user_id = ? AND registration_id = ?`,
+    args: [userId, input.registrationId],
   });
   if (res.rows.length === 0) {
-    throw new Error("upsertUserDeviceToken: row missing after upsert");
+    throw new Error("upsertUserDevice: row missing after upsert");
   }
   return mapDeviceRow(res.rows[0] as unknown as Record<string, unknown>);
+};
+
+/** Remove one of the user's own registrations; returns how many rows were deleted. */
+export const deleteUserDevice = async (
+  userId: string,
+  registrationId: string
+): Promise<number> => {
+  const res = await turso.execute({
+    sql: "DELETE FROM user_devices WHERE user_id = ? AND registration_id = ?",
+    args: [userId, registrationId],
+  });
+  return res.rowsAffected;
 };
 
 export const listActiveUserIds = async (): Promise<string[]> => {
@@ -82,25 +137,50 @@ export const listActiveUserIds = async (): Promise<string[]> => {
   return (res.rows as unknown as { id: string }[]).map((row) => row.id);
 };
 
-export const listDeviceTokensByUser = async (
+export const listDevicesByUser = async (
   userId: string
-): Promise<string[]> => {
+): Promise<DeviceTarget[]> => {
   const res = await turso.execute({
-    sql: "SELECT fcm_token FROM user_devices WHERE user_id = ? ORDER BY updated_at DESC",
+    sql: `SELECT id, registration_id, kind
+          FROM user_devices
+          WHERE user_id = ?
+          ORDER BY last_seen_at DESC, id ASC`,
     args: [userId],
   });
-  return (res.rows as unknown as { fcm_token: string }[]).map(
-    (row) => row.fcm_token
-  );
+  return (res.rows as unknown as Record<string, unknown>[]).map((row) => ({
+    id: row.id as string,
+    registration_id: row.registration_id as string,
+    kind: row.kind as DeviceKind,
+  }));
 };
 
-export const deleteDeviceTokens = async (tokens: string[]): Promise<void> => {
-  const unique = [...new Set(tokens)].filter((token) => token.length > 0);
-  if (unique.length === 0) return;
-  await turso.execute({
-    sql: `DELETE FROM user_devices WHERE fcm_token IN (${unique.map(() => "?").join(", ")})`,
-    args: unique,
+/** Delete device rows by primary key (what the sender reports back as invalid). */
+export const deleteDevicesByIds = async (ids: string[]): Promise<void> => {
+  const unique = [...new Set(ids)].filter((id) => id.length > 0);
+  for (let i = 0; i < unique.length; i += DELETE_BATCH_SIZE) {
+    const chunk = unique.slice(i, i + DELETE_BATCH_SIZE);
+    await turso.execute({
+      sql: `DELETE FROM user_devices WHERE id IN (${chunk.map(() => "?").join(", ")})`,
+      args: chunk,
+    });
+  }
+};
+
+export const countStaleDevices = async (cutoffISO: string): Promise<number> => {
+  const res = await turso.execute({
+    sql: "SELECT COUNT(*) AS c FROM user_devices WHERE last_seen_at < ?",
+    args: [cutoffISO],
   });
+  return Number((res.rows[0] as unknown as Record<string, unknown>).c);
+};
+
+/** Delete registrations whose app has not checked in since `cutoffISO`. */
+export const deleteStaleDevices = async (cutoffISO: string): Promise<number> => {
+  const res = await turso.execute({
+    sql: "DELETE FROM user_devices WHERE last_seen_at < ?",
+    args: [cutoffISO],
+  });
+  return res.rowsAffected;
 };
 
 export const countImportantUrgentTodosForDate = async (

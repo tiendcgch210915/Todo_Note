@@ -11,6 +11,7 @@ import apiRoutes from "./routes/api/v1/index.js";
 import notificationRoutes from "./routes/api/notifications.js";
 import { startNotificationScheduler } from "./services/notification-scheduler.js";
 import { startDailyTodoLogScheduler } from "./services/daily-todo-log-scheduler.js";
+import { initFirebase } from "./services/firebase.js";
 
 const app: FastifyInstance = Fastify({
   logger: {
@@ -80,6 +81,10 @@ await app.register(apiRoutes, { prefix: "/api/v1" });
 
 // Notification API alias requested by mobile integrations.
 await app.register(notificationRoutes, { prefix: "/api/notifications" });
+
+// Firebase Admin SDK (Application Default Credentials). Missing credentials only
+// log a warning; the server keeps running with push disabled.
+await initFirebase(app.log);
 
 startNotificationScheduler(app.log);
 startDailyTodoLogScheduler(app.log);

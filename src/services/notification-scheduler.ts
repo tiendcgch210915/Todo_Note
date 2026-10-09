@@ -4,6 +4,7 @@ import {
   getVietnamNowParts,
   VIETNAM_TIME_ZONE,
 } from "../utils/vietnam-time.js";
+import { isPushConfigured } from "./firebase.js";
 import {
   sendEveningNotifications,
   sendMorningNotifications,
@@ -40,9 +41,9 @@ export const startNotificationScheduler = (
   }
   if (interval) return;
 
-  if (!env.FIREBASE_SERVICE_ACCOUNT_PATH) {
+  if (!isPushConfigured()) {
     logger.warn(
-      "NOTIFICATIONS_ENABLED=true but FIREBASE_SERVICE_ACCOUNT_PATH is not set; pushes will be skipped"
+      "NOTIFICATIONS_ENABLED=true but Firebase credentials are not loaded (check GOOGLE_APPLICATION_CREDENTIALS); pushes will be skipped"
     );
   }
 
