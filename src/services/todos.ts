@@ -104,51 +104,137 @@ const nextRecurrenceDate = (todo: todosRepo.TodoRow): string | null => {
   return nextDate;
 };
 
-const createNextRecurringTodo = async (
+// Serialises work per recurrence series inside this process, so two requests
+// (double tap, retry) cannot both decide "the next occurrence does not exist".
+// The INSERT in todosRepo.createNextRecurringTodo is the cross-process guard.
+const seriesLocks = new Map<string, Promise<unknown>>();
+
+const withSeriesLock = <T>(
+  userId: string,
+  seriesId: string,
+  fn: () => Promise<T>
+): Promise<T> => {
+  const key = `${userId}:${seriesId}`;
+  const run = (seriesLocks.get(key) ?? Promise.resolve()).then(fn, fn);
+  const tail = run.catch(() => undefined);
+  seriesLocks.set(key, tail);
+  void tail.then(() => {
+    if (seriesLocks.get(key) === tail) seriesLocks.delete(key);
+  });
+  return run;
+};
+
+type NextSlot = {
+  templateId: string;
+  scheduledDate: string;
+  /** Live occurrence already holding the slot, if any. */
+  existing: todosRepo.TodoRow | null;
+};
+
+/**
+ * The slot the next occurrence belongs in. A deleted single occurrence is a
+ * recurrence exception, so its date is skipped instead of being recreated.
+ */
+const resolveNextSlot = async (
   userId: string,
   source: todosRepo.TodoRow
-): Promise<todosRepo.TodoRow | null> => {
-  const recurrenceTemplateId = source.recurrence_template_id ?? source.id;
+): Promise<NextSlot | null> => {
+  const templateId = source.recurrence_template_id ?? source.id;
   let cursor = source;
 
-  // A deleted single occurrence is a recurrence exception. Skip its date
-  // instead of recreating it when an earlier occurrence completes later.
   for (let skipped = 0; skipped < 1_000; skipped += 1) {
     const scheduledDate = nextRecurrenceDate(cursor);
     if (!scheduledDate) return null;
 
     const existing = await todosRepo.findRecurringOccurrenceByDate(
       userId,
-      recurrenceTemplateId,
+      templateId,
       scheduledDate,
       true
     );
-    if (!existing) {
-      const created = await todosRepo.createNextRecurringTodo(
-        source,
-        scheduledDate,
-        recurrenceTemplateId
-      );
-      await todosRepo.ensureRecurringSubtasksCopied(
-        source.id,
-        created.id,
-        userId
-      );
-      return created;
-    }
+    if (!existing) return { templateId, scheduledDate, existing: null };
     if (existing.deleted_at === null) {
-      await todosRepo.ensureRecurringSubtasksCopied(
-        source.id,
-        existing.id,
-        userId
-      );
-      return existing;
+      return { templateId, scheduledDate, existing };
     }
     cursor = { ...cursor, scheduled_date: scheduledDate };
   }
 
   return null;
 };
+
+const createNextRecurringTodo = (
+  userId: string,
+  source: todosRepo.TodoRow
+): Promise<todosRepo.TodoRow | null> =>
+  withSeriesLock(userId, source.recurrence_template_id ?? source.id, async () => {
+    const slot = await resolveNextSlot(userId, source);
+    if (!slot) return null;
+    const { templateId, scheduledDate, existing } = slot;
+
+    let occurrence: todosRepo.TodoRow;
+    if (existing) {
+      // 1. The slot is taken. If it was parked when the previous completion
+      //    was undone, bring it back instead of leaving it hidden.
+      occurrence =
+        existing.status === "archived"
+          ? await todosRepo.reviveRecurringOccurrence(existing.id, userId)
+          : existing;
+    } else if (source.scheduled_date) {
+      const parked = await todosRepo.findParkedOccurrence(userId, templateId);
+      if (parked) {
+        // 2. Parked for another date (the schedule moved since): reuse it.
+        occurrence = await todosRepo.reviveRecurringOccurrence(parked.id, userId, {
+          scheduledDate,
+          dueAt: source.due_at,
+        });
+      } else {
+        // 3. The user already has a live next occurrence somewhere else
+        //    (rescheduled by hand): do not add a second one.
+        const open = await todosRepo.findOpenSuccessor(
+          userId,
+          templateId,
+          source.scheduled_date
+        );
+        occurrence =
+          open ??
+          (await todosRepo.createNextRecurringTodo(
+            source,
+            scheduledDate,
+            templateId
+          ));
+      }
+    } else {
+      return null;
+    }
+
+    await todosRepo.ensureRecurringSubtasksCopied(
+      source.id,
+      occurrence.id,
+      userId
+    );
+    return occurrence;
+  });
+
+/**
+ * Undoing a completion must not leave the occurrence it generated behind: it
+ * would sit next to the reopened todo, and completing again after a reschedule
+ * would add yet another one. Park it; completing again revives it.
+ */
+const parkGeneratedNextOccurrence = (
+  userId: string,
+  reopened: todosRepo.TodoRow
+): Promise<void> =>
+  withSeriesLock(
+    userId,
+    reopened.recurrence_template_id ?? reopened.id,
+    async () => {
+      const slot = await resolveNextSlot(userId, reopened);
+      const next = slot?.existing;
+      if (next && next.status === "open" && next.parent_id === null) {
+        await todosRepo.parkRecurringOccurrence(next.id, userId);
+      }
+    }
+  );
 
 const resolveTagIds = async (
   userId: string,
@@ -433,6 +519,13 @@ export const uncompleteTodo = async (
 
   const todo = await todosRepo.uncompleteTodo(id, userId);
   if (!todo) throw new ServiceError("not_found");
+  if (
+    before.status === "done" &&
+    todo.recurrence_type !== null &&
+    todo.parent_id === null
+  ) {
+    await parkGeneratedNextOccurrence(userId, todo);
+  }
   return todo;
 };
 

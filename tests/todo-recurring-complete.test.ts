@@ -7,6 +7,7 @@ process.env.TURSO_AUTH_TOKEN = "";
 const { turso } = await import("../src/config/db.js");
 const todosService = await import("../src/services/todos.js");
 const syncService = await import("../src/services/sync.service.js");
+const todosRepo = await import("../src/repositories/todos.js");
 const { createDailyTodoLogTables, clearDailyTodoLogTables } = await import(
   "./helpers/daily-todo-log-tables.js"
 );
@@ -201,6 +202,13 @@ before(async () => {
       PRIMARY KEY (todo_id, tag_id)
     )
   `);
+  // Read by getFullEntity when a sync conflict returns the canonical todo.
+  await turso.execute(
+    "CREATE TABLE IF NOT EXISTS notes (id TEXT PRIMARY KEY, deleted_at TEXT)"
+  );
+  await turso.execute(
+    "CREATE TABLE IF NOT EXISTS note_todo_links (note_id TEXT NOT NULL, todo_id TEXT NOT NULL)"
+  );
   await createDailyTodoLogTables(turso);
 });
 
@@ -537,4 +545,272 @@ test("sync push todo delete supports future scope", async () => {
   assert.deepEqual(results, [{ id: "todo-selected", status: "applied" }]);
   assert.deepEqual(await liveTodoIds(), ["todo-template"]);
   assert.equal((await getTodo("todo-template")).recurrence_end_date, "2026-06-16");
+});
+
+const countRowsOn = async (date: string): Promise<number> => {
+  const res = await turso.execute({
+    sql: "SELECT COUNT(*) AS count FROM todos WHERE scheduled_date = ?",
+    args: [date],
+  });
+  return Number((res.rows[0] as unknown as { count: number }).count);
+};
+
+test("uncompleting parks the generated occurrence and completing again revives that same row", async () => {
+  await insertTodo("todo-a");
+
+  const first = await todosService.completeTodo(USER_ID, "todo-a", {});
+  const nextId = first.next_recurring_todo?.id;
+  assert.ok(nextId);
+  assert.equal(await countTodos(), 2);
+
+  const reopened = await todosService.uncompleteTodo(USER_ID, "todo-a");
+  assert.equal(reopened.status, "open");
+  assert.equal((await getTodo(nextId)).status, "archived");
+  assert.equal((await getTodo(nextId)).deleted_at, null);
+  assert.equal(await countTodos(), 2);
+
+  const second = await todosService.completeTodo(USER_ID, "todo-a", {});
+  assert.equal(second.next_recurring_todo?.id, nextId);
+  assert.equal(second.next_recurring_todo?.status, "open");
+  assert.equal(second.next_recurring_todo?.scheduled_date, "2026-06-17");
+  assert.equal(await countTodos(), 2);
+
+  // The undo/redo cycle can repeat without ever adding a row.
+  await todosService.uncompleteTodo(USER_ID, "todo-a");
+  await todosService.completeTodo(USER_ID, "todo-a", {});
+  assert.equal(await countTodos(), 2);
+  assert.equal((await getTodo(nextId)).status, "open");
+});
+
+test("rescheduling the reopened todo moves the parked occurrence instead of adding another", async () => {
+  await insertTodo("todo-a");
+  const first = await todosService.completeTodo(USER_ID, "todo-a", {});
+  const nextId = first.next_recurring_todo?.id;
+  assert.ok(nextId);
+
+  await todosService.uncompleteTodo(USER_ID, "todo-a");
+  // Later than the parked occurrence's own date (2026-06-17).
+  await todosService.updateTodo(USER_ID, "todo-a", {
+    scheduled_date: "2026-06-20",
+  });
+  const second = await todosService.completeTodo(USER_ID, "todo-a", {});
+
+  assert.equal(second.next_recurring_todo?.id, nextId);
+  assert.equal(second.next_recurring_todo?.scheduled_date, "2026-06-22");
+  assert.equal(second.next_recurring_todo?.status, "open");
+  assert.equal(await countTodos(), 2);
+  assert.equal(await countRowsOn("2026-06-17"), 0);
+});
+
+test("a next occurrence the user moved is not parked and is reused instead of duplicated", async () => {
+  await insertTodo("todo-a");
+  const first = await todosService.completeTodo(USER_ID, "todo-a", {});
+  const nextId = first.next_recurring_todo?.id;
+  assert.ok(nextId);
+  await todosService.updateTodo(USER_ID, nextId, {
+    scheduled_date: "2026-06-18",
+  });
+
+  await todosService.uncompleteTodo(USER_ID, "todo-a");
+  assert.equal((await getTodo(nextId)).status, "open");
+
+  const second = await todosService.completeTodo(USER_ID, "todo-a", {});
+  assert.equal(second.next_recurring_todo?.id, nextId);
+  assert.equal(second.next_recurring_todo?.scheduled_date, "2026-06-18");
+  assert.equal(await countTodos(), 2);
+});
+
+test("undoing an old completion leaves later done and open occurrences alone", async () => {
+  await insertTodo("todo-a");
+  const first = await todosService.completeTodo(USER_ID, "todo-a", {});
+  const secondId = first.next_recurring_todo?.id;
+  assert.ok(secondId);
+  const second = await todosService.completeTodo(USER_ID, secondId, {});
+  const thirdId = second.next_recurring_todo?.id;
+  assert.ok(thirdId);
+  assert.equal(await countTodos(), 3);
+
+  await todosService.uncompleteTodo(USER_ID, "todo-a");
+
+  assert.equal((await getTodo(secondId)).status, "done");
+  assert.equal((await getTodo(thirdId)).status, "open");
+  assert.equal(await countTodos(), 3);
+});
+
+test("uncompleting a todo that is not recurring changes nothing else", async () => {
+  await insertTodo("todo-plain", {
+    recurrence_type: null,
+    recurrence_interval: null,
+    recurrence_end_date: null,
+  });
+  await insertTodo("todo-other");
+
+  await todosService.completeTodo(USER_ID, "todo-plain", {});
+  await todosService.uncompleteTodo(USER_ID, "todo-plain");
+
+  assert.equal((await getTodo("todo-plain")).status, "open");
+  assert.equal((await getTodo("todo-other")).status, "open");
+  assert.equal(await countTodos(), 2);
+});
+
+test("concurrent completions in one series create the next occurrence once", async () => {
+  await insertTodo("todo-t");
+  await insertTodo("todo-x", { recurrence_template_id: "todo-t" });
+
+  const [a, b] = await Promise.all([
+    todosService.completeTodo(USER_ID, "todo-t", {}),
+    todosService.completeTodo(USER_ID, "todo-x", {}),
+  ]);
+
+  assert.ok(a.next_recurring_todo);
+  assert.equal(a.next_recurring_todo?.id, b.next_recurring_todo?.id);
+  assert.equal(await countRowsOn("2026-06-17"), 1);
+  assert.equal(await countTodos(), 3);
+});
+
+test("the repository insert never creates a second row for a taken series date", async () => {
+  await insertTodo("todo-t");
+  await insertTag("tag-keep");
+  await attachTag("todo-t", "tag-keep");
+  const source = await todosRepo.getTodoById("todo-t");
+  assert.ok(source);
+
+  const first = await todosRepo.createNextRecurringTodo(
+    source,
+    "2026-06-17",
+    "todo-t"
+  );
+  const second = await todosRepo.createNextRecurringTodo(
+    source,
+    "2026-06-17",
+    "todo-t"
+  );
+
+  assert.equal(second.id, first.id);
+  assert.equal(await countTodos(), 2);
+  assert.deepEqual(await todoTagIds(first.id), ["tag-keep"]);
+  const tagRows = await turso.execute("SELECT COUNT(*) AS count FROM todo_tags");
+  assert.equal(Number((tagRows.rows[0] as unknown as { count: number }).count), 2);
+});
+
+test("sync push cannot create a second occurrence for an occupied series date", async () => {
+  await insertTodo("todo-template");
+  await insertTodo("todo-existing-next", {
+    scheduled_date: "2026-06-17",
+    recurrence_template_id: "todo-template",
+  });
+
+  const occurrence = (id: string, scheduledDate: string) => ({
+    op: "create" as const,
+    type: "todo" as const,
+    payload: {
+      id,
+      title: "Recurring todo",
+      status: "open",
+      position: 0,
+      scheduled_date: scheduledDate,
+      recurrence_type: "daily",
+      recurrence_interval: 2,
+      recurrence_template_id: "todo-template",
+      created_at: "2026-06-18T00:00:00.000Z",
+      updated_at: "2026-06-18T00:00:00.000Z",
+    },
+  });
+
+  const [duplicate] = await syncService.processPush(USER_ID, [
+    occurrence("todo-duplicate", "2026-06-17"),
+  ]);
+  assert.equal(duplicate.status, "conflict");
+  assert.equal(duplicate.server_version?.id, "todo-existing-next");
+  assert.equal(await countTodos(), 2);
+
+  const [free] = await syncService.processPush(USER_ID, [
+    occurrence("todo-free", "2026-06-19"),
+  ]);
+  assert.equal(free.status, "applied");
+  assert.equal(await countTodos(), 3);
+
+  // A retried create of the same row is idempotent, not a conflict with itself.
+  const [retry] = await syncService.processPush(USER_ID, [
+    occurrence("todo-free", "2026-06-19"),
+  ]);
+  assert.equal(retry.status, "applied");
+  assert.equal(await countTodos(), 3);
+});
+
+test("sync push skips the cloned subtree of a refused duplicate occurrence", async () => {
+  await insertTodo("todo-template");
+  await insertTodo("todo-existing-next", {
+    scheduled_date: "2026-06-17",
+    recurrence_template_id: "todo-template",
+  });
+
+  const base = {
+    title: "Recurring todo",
+    status: "open",
+    position: 0,
+    created_at: "2026-06-18T00:00:00.000Z",
+    updated_at: "2026-06-18T00:00:00.000Z",
+  };
+  const results = await syncService.processPush(USER_ID, [
+    {
+      op: "create",
+      type: "todo",
+      payload: {
+        ...base,
+        id: "dup-parent",
+        scheduled_date: "2026-06-17",
+        recurrence_type: "daily",
+        recurrence_interval: 2,
+        recurrence_template_id: "todo-template",
+      },
+    },
+    {
+      op: "create",
+      type: "todo",
+      payload: { ...base, id: "dup-child", parent_id: "dup-parent" },
+    },
+    {
+      op: "create",
+      type: "todo",
+      payload: { ...base, id: "dup-grandchild", parent_id: "dup-child" },
+    },
+    {
+      op: "create",
+      type: "todo",
+      payload: {
+        ...base,
+        id: "dup-sibling",
+        parent_id: "dup-parent",
+        trigger_after_todo_id: "dup-child",
+      },
+    },
+    {
+      // Unrelated to the refused occurrence: must still be applied.
+      op: "create",
+      type: "todo",
+      payload: { ...base, id: "unrelated", scheduled_date: "2099-01-01" },
+    },
+  ]);
+
+  assert.deepEqual(
+    results.map((r) => [r.id, r.status]),
+    [
+      ["dup-parent", "conflict"],
+      ["dup-child", "applied"],
+      ["dup-grandchild", "applied"],
+      ["dup-sibling", "applied"],
+      ["unrelated", "applied"],
+    ]
+  );
+  assert.equal(results[0].server_version?.id, "todo-existing-next");
+
+  // Nothing of the refused subtree was written; the unrelated todo was.
+  const written = await turso.execute(
+    "SELECT id FROM todos WHERE id LIKE 'dup-%' OR id = 'unrelated' ORDER BY id"
+  );
+  assert.deepEqual(
+    (written.rows as unknown as { id: string }[]).map((r) => r.id),
+    ["unrelated"]
+  );
 });

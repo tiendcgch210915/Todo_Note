@@ -506,6 +506,13 @@ export const findRecurringOccurrenceByDate = async (
   return mapRow(res.rows[0] as unknown as Record<string, unknown>);
 };
 
+/**
+ * Insert the next occurrence of a recurring series unless a live canonical
+ * occurrence already holds that (series, date). The guard lives in the INSERT
+ * itself so two concurrent callers can never both create the row.
+ *
+ * Returns the new row, or the occurrence that already held the slot.
+ */
 export const createNextRecurringTodo = async (
   source: TodoRow,
   scheduledDate: string,
@@ -524,7 +531,15 @@ export const createNextRecurringTodo = async (
                recurrence_type, recurrence_interval, recurrence_days_of_week,
                recurrence_end_date, recurrence_template_id,
                created_at, updated_at)
-              VALUES (?, ?, ?, ?, ?, 'open', ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, ?)`,
+              SELECT ?, ?, ?, ?, ?, 'open', ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, ?
+              WHERE NOT EXISTS (
+                SELECT 1 FROM todos
+                WHERE user_id = ?
+                  AND deleted_at IS NULL
+                  AND recurrence_type IS NOT NULL
+                  AND COALESCE(recurrence_template_id, id) = ?
+                  AND scheduled_date = ?
+              )`,
         args: [
           id,
           source.user_id,
@@ -550,18 +565,121 @@ export const createNextRecurringTodo = async (
           recurrenceTemplateId,
           now,
           now,
+          source.user_id,
+          recurrenceTemplateId,
+          scheduledDate,
         ],
       },
       {
+        // Skipped together with the INSERT above when the slot was taken.
         sql: `INSERT INTO todo_tags (todo_id, tag_id)
-              SELECT ?, tag_id FROM todo_tags WHERE todo_id = ?`,
-        args: [id, source.id],
+              SELECT ?, tag_id FROM todo_tags
+              WHERE todo_id = ? AND EXISTS (SELECT 1 FROM todos WHERE id = ?)`,
+        args: [id, source.id, id],
       },
     ],
     "write"
   );
   const row = await getTodoById(id);
-  if (!row) throw new Error("createNextRecurringTodo: row missing after insert");
+  if (row) return row;
+
+  const existing = await findRecurringOccurrenceByDate(
+    source.user_id,
+    recurrenceTemplateId,
+    scheduledDate
+  );
+  if (!existing) {
+    throw new Error("createNextRecurringTodo: row missing after insert");
+  }
+  return existing;
+};
+
+// ── Parked successors ────────────────────────────────────────────────────────
+// When a done occurrence is reopened, the occurrence its completion generated is
+// "parked" (status = 'archived') instead of deleted: a soft-deleted occurrence is
+// a recurrence exception whose date gets skipped, so deleting it would make the
+// next completion jump a day ahead. `archived` is already excluded from every
+// list, score and reminder, and the parked row comes back on the next completion.
+
+const SERIES_OCCURRENCE_SQL = `user_id = ?
+            AND deleted_at IS NULL
+            AND parent_id IS NULL
+            AND recurrence_type IS NOT NULL
+            AND COALESCE(recurrence_template_id, id) = ?`;
+
+/**
+ * Earliest parked (archived) occurrence of the series, whatever its date: the
+ * schedule may have moved since it was parked, and the next completion moves it.
+ */
+export const findParkedOccurrence = async (
+  userId: string,
+  recurrenceTemplateId: string
+): Promise<TodoRow | null> => {
+  const res = await turso.execute({
+    sql: `SELECT ${TODO_COLUMNS} FROM todos
+          WHERE ${SERIES_OCCURRENCE_SQL} AND status = 'archived'
+          ORDER BY scheduled_date ASC, created_at ASC, id ASC
+          LIMIT 1`,
+    args: [userId, recurrenceTemplateId],
+  });
+  if (res.rows.length === 0) return null;
+  return mapRow(res.rows[0] as unknown as Record<string, unknown>);
+};
+
+/** Earliest actionable (open / in progress) occurrence of the series after `afterDate`. */
+export const findOpenSuccessor = async (
+  userId: string,
+  recurrenceTemplateId: string,
+  afterDate: string
+): Promise<TodoRow | null> => {
+  const res = await turso.execute({
+    sql: `SELECT ${TODO_COLUMNS} FROM todos
+          WHERE ${SERIES_OCCURRENCE_SQL}
+            AND status IN ('open', 'in_progress')
+            AND scheduled_date > ?
+          ORDER BY scheduled_date ASC, created_at ASC, id ASC
+          LIMIT 1`,
+    args: [userId, recurrenceTemplateId, afterDate],
+  });
+  if (res.rows.length === 0) return null;
+  return mapRow(res.rows[0] as unknown as Record<string, unknown>);
+};
+
+/** Park an open occurrence: hidden everywhere, but kept so it can be revived. */
+export const parkRecurringOccurrence = async (
+  id: string,
+  userId: string
+): Promise<void> => {
+  await turso.execute({
+    sql: `UPDATE todos SET status = 'archived', updated_at = ?
+          WHERE id = ? AND user_id = ? AND deleted_at IS NULL AND status = 'open'`,
+    args: [nowISO(), id, userId],
+  });
+};
+
+/**
+ * Bring a parked occurrence back as the actionable one, optionally moving it to
+ * `scheduledDate` (and `dueAt`) when the series date it was parked for changed.
+ */
+export const reviveRecurringOccurrence = async (
+  id: string,
+  userId: string,
+  move?: { scheduledDate: string; dueAt: string | null }
+): Promise<TodoRow> => {
+  const sets = ["status = 'open'", "completed_at = NULL", "updated_at = ?"];
+  const args: (string | null)[] = [nowISO()];
+  if (move) {
+    sets.push("scheduled_date = ?", "due_at = ?");
+    args.push(move.scheduledDate, move.dueAt);
+  }
+  args.push(id, userId);
+  await turso.execute({
+    sql: `UPDATE todos SET ${sets.join(", ")}
+          WHERE id = ? AND user_id = ? AND deleted_at IS NULL`,
+    args,
+  });
+  const row = await getTodoByIdScoped(id, userId);
+  if (!row) throw new TodoRepoError("not_found");
   return row;
 };
 

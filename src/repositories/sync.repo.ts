@@ -1321,6 +1321,34 @@ export const getHabitLogByNaturalKey = async (
 };
 
 /**
+ * §3.6 Recurring-occurrence natural key: a series holds at most one live
+ * occurrence per scheduled date. Returns the occurrence (other than `excludeId`)
+ * that already holds `(seriesId, scheduledDate)`, or null.
+ */
+export const getLiveOccurrenceBySeriesDate = async (
+  userId: string,
+  seriesId: string,
+  scheduledDate: string,
+  excludeId: string
+): Promise<{ id: string } | null> => {
+  const res = await turso.execute({
+    sql: `SELECT id FROM todos
+          WHERE user_id = ?
+            AND deleted_at IS NULL
+            AND parent_id IS NULL
+            AND recurrence_type IS NOT NULL
+            AND COALESCE(recurrence_template_id, id) = ?
+            AND scheduled_date = ?
+            AND id <> ?
+          ORDER BY created_at ASC, id ASC
+          LIMIT 1`,
+    args: [userId, seriesId, scheduledDate, excludeId],
+  });
+  if (res.rows.length === 0) return null;
+  return { id: (res.rows[0] as unknown as { id: string }).id };
+};
+
+/**
  * §3.3 Resurrect a dead tag row: clear deleted_at, apply new name/color/updated_at.
  * The server keeps its canonical id; the pushed id is different → caller returns conflict.
  */

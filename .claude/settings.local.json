@@ -16,7 +16,15 @@
       "Bash(curl -s -b /tmp/admin-cookies.txt -o /tmp/users.html http://localhost:3000/admin/users)",
       "Bash(curl -s -b /tmp/admin-cookies.txt -o /tmp/tpls.html http://localhost:3000/admin/system-templates)",
       "Bash(curl -s -b /tmp/admin-cookies.txt -o /tmp/user.html http://localhost:3000/admin/users/019e38f3-98b4-7514-86bb-da5ba28ba32f)",
-      "Bash(curl -s -b /tmp/admin-cookies.txt -o /tmp/dev.html -w 'HTTP %{http_code}\\\\n' http://localhost:3000/admin/users/019e38f3-98b4-7514-86bb-da5ba28ba32f/devices)"
+      "Bash(curl -s -b /tmp/admin-cookies.txt -o /tmp/dev.html -w 'HTTP %{http_code}\\\\n' http://localhost:3000/admin/users/019e38f3-98b4-7514-86bb-da5ba28ba32f/devices)",
+      "Bash(ls \"P:/Personal\" 2>&1 | head -50; echo ---; ls \"P:/\" 2>&1 | head -30; echo ---; find \"P:/Personal\" -maxdepth 3 -name pubspec.yaml -not -path \"*/node_modules/*\" 2>/dev/null | head)",
+      "Bash(flutter --version)",
+      "Bash(flutter pub *)",
+      "Bash(java -version)",
+      "Bash(dart format *)",
+      "Bash(flutter analyze *)",
+      "Bash(flutter test *)",
+      "Bash(flutter build *)"
     ]
   }
 }

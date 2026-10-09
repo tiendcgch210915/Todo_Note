@@ -8,6 +8,7 @@
  *  - Junction reconcile (§5.4)
  *  - Tag natural-key conflict (§3.3)
  *  - Habit-log natural-key conflict (§3.5)
+ *  - Recurring-occurrence (series, date) natural-key conflict (§3.6)
  *  - System-template protection (§8 read_only)
  *  - Soft-delete cascade (§6)
  */
@@ -27,6 +28,7 @@ import {
   isSystemCategory,
   getTagByNaturalKey,
   getHabitLogByNaturalKey,
+  getLiveOccurrenceBySeriesDate,
   resurrectTagRow,
   resurrectHabitLogRow,
   getFullEntity,
@@ -70,21 +72,44 @@ export const processPush = async (
   ops: SyncOp[]
 ): Promise<OpResult[]> => {
   const results: OpResult[] = [];
+  // Todos the server refused to create (§3.6). Their cloned subtree travels in
+  // the same batch; inserting it would break the parent_id foreign key and fail
+  // the whole request, so those operations are skipped instead.
+  const refused = new Set<string>();
   for (const op of ops) {
-    results.push(await processOp(userId, op));
+    results.push(await processOp(userId, op, refused));
   }
   return results;
 };
 
 // ── processOp (per-operation logic) ──────────────────────────────────────────
 
-async function processOp(userId: string, op: SyncOp): Promise<OpResult> {
+async function processOp(
+  userId: string,
+  op: SyncOp,
+  refused: Set<string>
+): Promise<OpResult> {
   const { op: opType, type, payload } = op;
 
   // id must be present and a string
   const id = payload.id;
   if (!id || typeof id !== "string") {
     return { id: "unknown", status: "error", error: "bad_input" };
+  }
+
+  // A child of a refused occurrence (or a trigger pointing into it) has nothing
+  // to attach to. Mobile already purged that local subtree when it processes the
+  // parent's conflict, so acknowledging the operation is what lets it clear it.
+  if (type === "todo" && opType !== "delete") {
+    const parentId = payload.parent_id;
+    const triggerId = payload.trigger_after_todo_id;
+    if (
+      (typeof parentId === "string" && refused.has(parentId)) ||
+      (typeof triggerId === "string" && refused.has(triggerId))
+    ) {
+      refused.add(id);
+      return { id, status: "applied" };
+    }
   }
 
   if (
@@ -241,6 +266,34 @@ async function processOp(userId: string, op: SyncOp): Promise<OpResult> {
           });
         }
         const sv = await getFullEntity("habit_log", nk.id, userId);
+        return { id, status: "conflict", server_version: sv ?? {} };
+      }
+    }
+  }
+
+  // ── §3.6 Recurring-occurrence natural key (series, date) ──────────────────
+  // Two devices completing the same todo offline each create "the next
+  // occurrence" under different ids. Only the first one in wins; the other gets
+  // the canonical row back and drops its local duplicate. Rows that already
+  // exist are left alone so a reschedule can never make an occurrence vanish.
+  if (type === "todo" && opType !== "delete" && entityInfo === null) {
+    const seriesId = payload.recurrence_template_id;
+    const scheduledDate = payload.scheduled_date;
+    if (
+      typeof seriesId === "string" &&
+      typeof scheduledDate === "string" &&
+      payload.recurrence_type != null &&
+      payload.parent_id == null
+    ) {
+      const canonical = await getLiveOccurrenceBySeriesDate(
+        userId,
+        seriesId,
+        scheduledDate,
+        id
+      );
+      if (canonical) {
+        refused.add(id);
+        const sv = await getFullEntity("todo", canonical.id, userId);
         return { id, status: "conflict", server_version: sv ?? {} };
       }
     }
