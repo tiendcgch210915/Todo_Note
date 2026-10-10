@@ -343,6 +343,18 @@ export const markMissed = async (
 };
 
 /**
+ * Đánh `missed` MỘT job pending quá ngưỡng trễ (đường nhanh kiểm tra từng ứng viên thay vì
+ * quét hàng loạt mỗi vài giây). Có điều kiện pending nên không đè lên job vừa bị giành quyền.
+ */
+export const markPendingMissed = async (id: string): Promise<boolean> => {
+  const res = await turso.execute({
+    sql: "UPDATE notification_jobs SET status = 'missed' WHERE id = ? AND status = 'pending'",
+    args: [id],
+  });
+  return res.rowsAffected === 1;
+};
+
+/**
  * Giành quyền xử lý một job: chuyển pending -> processing trong MỘT câu lệnh.
  * Hai tick đồng thời cùng gọi cho một id thì chỉ một bên thấy rowsAffected = 1.
  */

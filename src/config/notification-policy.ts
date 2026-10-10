@@ -97,6 +97,36 @@ export const DISPATCH = {
   plannerChunkSize: 200,
 } as const;
 
+/**
+ * Vòng lặp trong tiến trình (NOTIFY_INPROCESS_TICK=true).
+ *  - Vòng NHANH: chỉ gửi job đến hạn (runDispatch), chu kỳ NOTIFY_FAST_LOOP_SECONDS.
+ *  - Vòng CHẬM: planner + dọn dẹp (runMaintenance), 60 giây.
+ */
+export const LOOPS = {
+  fastDefaultSeconds: 3,
+  fastMinSeconds: 1,
+  /** Chặn trên để không vượt giới hạn setInterval (~24,8 ngày) khi gõ nhầm số quá lớn. */
+  fastMaxSeconds: 3600,
+  maintenanceSeconds: 60,
+  /** Lỗi lặp lại của một vòng chỉ được ghi log tối đa một lần trong khoảng này. */
+  errorLogIntervalMs: 60_000,
+  /** Khi tắt máy, chờ nhịp đang chạy xong tối đa chừng này rồi mới bỏ. */
+  stopTimeoutMs: 10_000,
+} as const;
+
+/**
+ * Chuẩn hóa NOTIFY_FAST_LOOP_SECONDS: trống/không phải số -> mặc định 3; nhỏ hơn 1 -> 1;
+ * lớn hơn 3600 -> 3600. Cố ý KHÔNG làm sập server vì gõ nhầm một tham số hiệu năng.
+ */
+export const normalizeFastLoopSeconds = (raw: unknown): number => {
+  if (raw === undefined || raw === null) return LOOPS.fastDefaultSeconds;
+  const text = String(raw).trim();
+  if (text === "") return LOOPS.fastDefaultSeconds;
+  const value = Number(text);
+  if (!Number.isFinite(value)) return LOOPS.fastDefaultSeconds;
+  return Math.min(LOOPS.fastMaxSeconds, Math.max(LOOPS.fastMinSeconds, value));
+};
+
 /** Job đã kết thúc (sent/cancelled/missed/failed) được xóa sau chừng này để bảng không phình mãi. */
 export const JOB_RETENTION_MS = 30 * 24 * 60 * MINUTE;
 

@@ -1,27 +1,35 @@
 import type { FastifyBaseLogger } from "fastify";
+import { LOOPS } from "../config/notification-policy.js";
 import { env } from "../config/env.js";
 import { isPushConfigured } from "./firebase.js";
-import { runTick } from "./notification-tick.js";
+import {
+  createNotificationLoops,
+  type NotificationLoops,
+} from "./notification-loops.js";
+import { runDispatch, runMaintenance } from "./notification-tick.js";
 
-let interval: NodeJS.Timeout | null = null;
-let running = false;
+let loops: NotificationLoops | null = null;
 
 /**
- * Bộ hẹn giờ trong tiến trình: gọi `runTick` mỗi 60 giây khi NOTIFY_INPROCESS_TICK=true.
- * Chỉ hoạt động khi instance đang thức; Render free ngủ khi rảnh nên vẫn cần cron bên ngoài
- * gọi POST /internal/notifications/tick. Chạy cả hai cùng lúc hoặc nhiều instance đều an toàn
- * vì mỗi job chỉ một bên giành được.
+ * Vòng lặp trong tiến trình khi NOTIFY_INPROCESS_TICK=true:
+ *  - vòng NHANH mỗi NOTIFY_FAST_LOOP_SECONDS (mặc định 3 s): chỉ gửi job đến hạn;
+ *  - vòng CHẬM mỗi 60 s: planner + dọn dẹp.
+ * Chỉ hoạt động khi instance đang thức; Render free ngủ khi rảnh nên cron ngoài gọi
+ * POST /internal/notifications/tick vẫn là dự phòng (tick làm cả hai việc). Chạy cùng cron ngoài
+ * hoặc nhiều instance đều an toàn vì mỗi job chỉ một bên giành được.
+ *
+ * Trả về true nếu vòng lặp đã được bật (để server đăng ký xử lý tín hiệu tắt máy).
  */
 export const startNotificationScheduler = (
   logger: FastifyBaseLogger
-): void => {
+): boolean => {
   if (!env.NOTIFY_INPROCESS_TICK) {
     logger.info(
-      "In-process notification tick disabled (set NOTIFY_INPROCESS_TICK=true or call POST /internal/notifications/tick)"
+      "In-process notification loops disabled (set NOTIFY_INPROCESS_TICK=true or call POST /internal/notifications/tick)"
     );
-    return;
+    return false;
   }
-  if (interval) return;
+  if (loops) return true;
 
   if (!env.NOTIFY_DRY_RUN && !isPushConfigured()) {
     logger.warn(
@@ -29,41 +37,45 @@ export const startNotificationScheduler = (
     );
   }
 
-  const tick = async (): Promise<void> => {
-    if (running) return;
-    running = true;
-    try {
-      const summary = await runTick({ dryRun: env.NOTIFY_DRY_RUN, logger });
+  const dryRun = env.NOTIFY_DRY_RUN;
+  loops = createNotificationLoops({
+    // Mỗi job gửi xong tự ghi một dòng "notification sent" (xem logSent), nên vòng nhanh không
+    // cần log tổng kết thêm.
+    dispatch: () => runDispatch({ dryRun, logger }),
+    maintain: async () => {
+      const summary = await runMaintenance({ dryRun, logger });
       const worked =
         summary.planned +
         summary.backfilled +
-        summary.claimed +
         summary.missed +
-        summary.recovered;
-      if (worked > 0) logger.info(summary, "Notification tick");
-    } catch (error) {
-      logger.error({ err: error }, "Notification scheduler tick failed");
-    } finally {
-      running = false;
-    }
-  };
-
-  interval = setInterval(() => {
-    void tick();
-  }, 60_000);
-  interval.unref();
-  void tick();
+        summary.recovered +
+        summary.stuck_failed +
+        summary.purged;
+      if (worked > 0) logger.info(summary, "Notification maintenance");
+    },
+    fastSeconds: env.NOTIFY_FAST_LOOP_SECONDS,
+    logger,
+  });
+  loops.start();
 
   logger.info(
-    { dryRun: env.NOTIFY_DRY_RUN },
-    "Notification in-process tick started"
+    {
+      dryRun,
+      fast_loop_seconds: env.NOTIFY_FAST_LOOP_SECONDS,
+      maintenance_seconds: LOOPS.maintenanceSeconds,
+    },
+    "Notification in-process loops started"
   );
+  return true;
+};
+
+/** Dừng sạch: ngừng hẹn giờ và chờ nhịp đang chạy kết thúc (tối đa LOOPS.stopTimeoutMs). */
+export const stopNotificationScheduler = async (): Promise<void> => {
+  const current = loops;
+  loops = null;
+  if (current) await current.stop();
 };
 
 export const stopNotificationSchedulerForTests = (): void => {
-  if (interval) {
-    clearInterval(interval);
-    interval = null;
-  }
-  running = false;
+  void stopNotificationScheduler();
 };

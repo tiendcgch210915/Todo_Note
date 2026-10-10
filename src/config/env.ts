@@ -1,5 +1,6 @@
 import "dotenv/config";
 import { z } from "zod";
+import { normalizeFastLoopSeconds } from "./notification-policy.js";
 
 const boolFromEnv = z
   .string()
@@ -40,6 +41,9 @@ const EnvSchema = z.object({
   NOTIFY_TICK_SECRET: optionalSecret(16),
   // Tự tick mỗi 60 s trong tiến trình (chỉ chạy khi instance đang thức).
   NOTIFY_INPROCESS_TICK: boolFromEnv,
+  // Chu kỳ (giây) của vòng NHANH gửi job đến hạn khi NOTIFY_INPROCESS_TICK=true.
+  // Mặc định 3, tối thiểu 1; giá trị sai được chuẩn hóa thay vì làm sập server.
+  NOTIFY_FAST_LOOP_SECONDS: z.string().optional().transform(normalizeFastLoopSeconds),
   // Chỉ ghi log, không gọi FCM (job vẫn được đánh sent).
   NOTIFY_DRY_RUN: boolFromEnv,
   // Application Default Credentials: path to the service-account JSON file

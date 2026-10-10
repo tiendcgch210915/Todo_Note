@@ -10,9 +10,13 @@ import adminRoutes from "./routes/admin/index.js";
 import apiRoutes from "./routes/api/v1/index.js";
 import notificationRoutes from "./routes/api/notifications.js";
 import internalNotificationRoutes from "./routes/internal/notifications.js";
-import { startNotificationScheduler } from "./services/notification-scheduler.js";
+import {
+  startNotificationScheduler,
+  stopNotificationScheduler,
+} from "./services/notification-scheduler.js";
 import { startDailyTodoLogScheduler } from "./services/daily-todo-log-scheduler.js";
 import { initFirebase } from "./services/firebase.js";
+import { createShutdownHandler } from "./utils/graceful-shutdown.js";
 
 const app: FastifyInstance = Fastify({
   logger: {
@@ -100,7 +104,22 @@ if (!env.NOTIFY_TICK_SECRET && !env.NOTIFY_INPROCESS_TICK) {
 // log a warning; the server keeps running with push disabled.
 await initFirebase(app.log);
 
-startNotificationScheduler(app.log);
+// With NOTIFY_INPROCESS_TICK=true the loops run inside this process, so SIGTERM (every Render
+// deploy) must let an in-flight send finish and be recorded before the process exits.
+// Without the loops nothing is registered and shutdown behaves exactly as before.
+if (startNotificationScheduler(app.log)) {
+  const shutdown = createShutdownHandler({
+    stop: stopNotificationScheduler,
+    close: async () => {
+      await app.close();
+    },
+    exit: (code) => process.exit(code),
+    log: app.log,
+  });
+  for (const signal of ["SIGTERM", "SIGINT"] as const) {
+    process.once(signal, () => void shutdown(signal));
+  }
+}
 startDailyTodoLogScheduler(app.log);
 
 // Start

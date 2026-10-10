@@ -1,7 +1,15 @@
 /**
- * Một lần "tick": lập lịch -> đánh dấu job trễ -> giành quyền từng job -> kiểm tra lại điều kiện
- * -> gửi -> ghi kết quả. Gọi được từ HTTP (POST /internal/notifications/tick) hoặc từ bộ hẹn giờ
- * trong tiến trình; nhiều tick chạy song song vẫn an toàn vì mỗi job chỉ một bên giành được.
+ * Hai đường xử lý, dùng chung một bộ quy tắc an toàn:
+ *
+ *  - `runDispatch` (ĐƯỜNG NHANH): chỉ lấy job pending đã đến hạn -> kiểm tra trễ -> giành quyền
+ *    nguyên tử -> kiểm tra lại điều kiện -> gửi -> ghi kết quả. Nhẹ, chạy mỗi vài giây.
+ *  - `runMaintenance` (PLANNER + DỌN DẸP): trả job kẹt về hàng đợi, tạo tổng kết hôm nay/ngày mai,
+ *    vá nhắc giờ còn thiếu, đánh `missed` hàng loạt, xóa job cũ. Chạy mỗi 60 giây.
+ *  - `runTick` = maintenance rồi dispatch. Đây là thứ POST /internal/notifications/tick gọi,
+ *    nên endpoint vẫn làm đủ cả hai việc (dự phòng + catch-up khi instance vừa thức dậy).
+ *
+ * Nhiều lần chạy song song (nhiều tiến trình, tick ngoài + vòng trong) vẫn an toàn vì mỗi job
+ * chỉ một bên giành được.
  */
 import {
   CHANNEL_ID,
@@ -206,6 +214,37 @@ const settleTransientFailure = async (
   return "retried";
 };
 
+/**
+ * Một dòng log có cấu trúc cho MỖI job đã gửi, dùng để đo độ trễ thật:
+ *  - claim_delay_ms = locked_at - run_at  (thời gian job chờ tới lượt vòng lặp)
+ *  - fcm_ms         = thời gian gọi FCM    (null khi chạy thử NOTIFY_DRY_RUN)
+ *  - lag_ms         = sent_at - run_at     (độ trễ tổng so với giờ hẹn)
+ * Chỉ có id job, loại và số liệu thời gian: không tên todo, không registrationId, không user_id.
+ */
+const logSent = (
+  logger: PushLogger,
+  job: jobsRepo.JobRow,
+  sentAt: string,
+  fcmMs: number | null
+): void => {
+  const runAtMs = Date.parse(job.run_at);
+  logger.info(
+    {
+      job_id: job.id,
+      kind: job.kind,
+      run_at: job.run_at,
+      locked_at: job.locked_at,
+      sent_at: sentAt,
+      fcm_ms: fcmMs,
+      lag_ms: Date.parse(sentAt) - runAtMs,
+      claim_delay_ms: job.locked_at ? Date.parse(job.locked_at) - runAtMs : null,
+      attempts: job.attempts,
+      ...(fcmMs === null ? { dry_run: true } : {}),
+    },
+    "notification sent"
+  );
+};
+
 const processClaimed = async (
   claimed: jobsRepo.JobRow,
   options: { dryRun: boolean; logger: PushLogger }
@@ -220,15 +259,14 @@ const processClaimed = async (
     }
 
     if (options.dryRun) {
-      options.logger.info(
-        { jobId: claimed.id, kind: claimed.kind, dryRun: true },
-        "notification dry run: would send"
-      );
-      await jobsRepo.markSent(claimed.id, claimed.run_at, new Date().toISOString());
+      const sentAt = new Date().toISOString();
+      await jobsRepo.markSent(claimed.id, claimed.run_at, sentAt);
+      logSent(options.logger, claimed, sentAt, null);
       await prepared.afterSent?.();
       return "sent";
     }
 
+    const fcmStartedAt = performance.now();
     const result = await notifyUser(
       claimed.user_id,
       {
@@ -248,8 +286,11 @@ const processClaimed = async (
       }
     );
 
+    const fcmMs = Math.round(performance.now() - fcmStartedAt);
     if (result.sent > 0) {
-      await jobsRepo.markSent(claimed.id, claimed.run_at, new Date().toISOString());
+      const sentAt = new Date().toISOString();
+      await jobsRepo.markSent(claimed.id, claimed.run_at, sentAt);
+      logSent(options.logger, claimed, sentAt, fcmMs);
       await prepared.afterSent?.();
       return "sent";
     }
@@ -295,15 +336,15 @@ const emptySummary = (dryRun: boolean): TickSummary => ({
   failed: 0,
 });
 
-export const runTick = async (
-  options: TickOptions = {}
-): Promise<TickSummary> => {
+/**
+ * PLANNER + DỌN DẸP. Mọi bước idempotent; ghi nhiều nên KHÔNG chạy mỗi vài giây.
+ */
+const maintain = async (
+  options: TickOptions,
+  summary: TickSummary
+): Promise<void> => {
   const now = options.now ?? new Date();
   const nowMs = now.getTime();
-  const nowIso = now.toISOString();
-  const dryRun = options.dryRun ?? false;
-  const logger = options.logger ?? pushLogger;
-  const summary = emptySummary(dryRun);
 
   // 0. Job kẹt ở processing (tiến trình chết giữa chừng).
   const stuck = await jobsRepo.recoverStuckJobs(
@@ -317,36 +358,59 @@ export const runTick = async (
   summary.planned = await planAllUsers(now);
   summary.backfilled = await backfillTodoReminders(now);
 
-  // 2. Chính sách trễ: job pending chạy muộn quá ngưỡng thì bỏ, KHÔNG gửi.
+  // 2. Chính sách trễ (quét hàng loạt): job pending chạy muộn quá ngưỡng thì bỏ, KHÔNG gửi.
+  //    Đường nhanh cũng tự kiểm tra từng ứng viên nên không phụ thuộc bước này.
   const cutoffs = Object.fromEntries(
     NOTIFICATION_KINDS.map((kind) => [
       kind,
       new Date(nowMs - LATENESS_MS[kind]).toISOString(),
     ])
   ) as Record<NotificationJobKind, string>;
-  summary.missed = await jobsRepo.markMissed(cutoffs);
+  summary.missed += await jobsRepo.markMissed(cutoffs);
 
   // Dọn job đã kết thúc từ lâu để bảng không phình mãi.
   summary.purged = await jobsRepo.purgeFinishedJobs(
     new Date(nowMs - JOB_RETENTION_MS).toISOString()
   );
+};
+
+/**
+ * ĐƯỜNG NHANH. Chỉ một SELECT nhẹ (chỉ mục idx_notification_jobs_due) khi không có gì đến hạn;
+ * không có câu lệnh ghi nào cho tới khi có job để giành quyền.
+ */
+const dispatchDue = async (
+  options: TickOptions,
+  summary: TickSummary
+): Promise<void> => {
+  const dryRun = options.dryRun ?? false;
+  const logger = options.logger ?? pushLogger;
 
   // FCM chưa cấu hình: để nguyên job (ngưỡng trễ sẽ tự dọn) thay vì đốt hết lượt thử.
   if (!dryRun && !isPushConfigured()) {
     summary.push_disabled = true;
-    return summary;
+    return;
   }
 
-  // 3. Lấy ứng viên, rồi giành quyền từng job bằng một câu UPDATE nguyên tử.
+  // Lấy ứng viên, rồi giành quyền từng job bằng một câu UPDATE nguyên tử.
+  const selectedAt = options.now ?? new Date();
   const candidates = await jobsRepo.listDueCandidates(
-    nowIso,
-    new Date(nowMs - DISPATCH.retrySpacingMs).toISOString(),
+    selectedAt.toISOString(),
+    new Date(selectedAt.getTime() - DISPATCH.retrySpacingMs).toISOString(),
     DISPATCH.maxAttempts,
     Math.min(options.maxJobs ?? DISPATCH.batchSize, DISPATCH.batchSize)
   );
 
   const handle = async (candidate: jobsRepo.JobRow): Promise<void> => {
-    if (!(await jobsRepo.claimJob(candidate.id, nowIso))) {
+    // Giờ THẬT lúc giành quyền (locked_at), để log đo claim_delay_ms chính xác.
+    const claimAt = options.now ?? new Date();
+
+    // Chính sách trễ: quá ngưỡng thì đánh missed, KHÔNG gửi (ví dụ sau khi khởi động lại).
+    if (claimAt.getTime() - Date.parse(candidate.run_at) > LATENESS_MS[candidate.kind]) {
+      if (await jobsRepo.markPendingMissed(candidate.id)) summary.missed++;
+      return;
+    }
+
+    if (!(await jobsRepo.claimJob(candidate.id, claimAt.toISOString()))) {
       summary.lost_claims++; // tick khác đã giành trước
       return;
     }
@@ -358,9 +422,36 @@ export const runTick = async (
     summary[outcome]++;
   };
 
-  // 4. Xử lý có giới hạn song song.
+  // Xử lý có giới hạn song song.
   for (let i = 0; i < candidates.length; i += DISPATCH.concurrency) {
     await Promise.all(candidates.slice(i, i + DISPATCH.concurrency).map(handle));
   }
+};
+
+/** Đường nhanh: chỉ gửi job đến hạn. */
+export const runDispatch = async (
+  options: TickOptions = {}
+): Promise<TickSummary> => {
+  const summary = emptySummary(options.dryRun ?? false);
+  await dispatchDue(options, summary);
+  return summary;
+};
+
+/** Planner + dọn dẹp, không gửi gì. */
+export const runMaintenance = async (
+  options: TickOptions = {}
+): Promise<TickSummary> => {
+  const summary = emptySummary(options.dryRun ?? false);
+  await maintain(options, summary);
+  return summary;
+};
+
+/** Cả hai đường theo thứ tự cũ (maintenance rồi dispatch): hợp đồng của endpoint tick. */
+export const runTick = async (
+  options: TickOptions = {}
+): Promise<TickSummary> => {
+  const summary = emptySummary(options.dryRun ?? false);
+  await maintain(options, summary);
+  await dispatchDue(options, summary);
   return summary;
 };
