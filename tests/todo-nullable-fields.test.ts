@@ -6,6 +6,7 @@ process.env.TURSO_AUTH_TOKEN = "";
 
 const { UpdateTodoSchema } = await import("../src/schemas/api/todos.js");
 const { turso } = await import("../src/config/db.js");
+const { createNotificationTables } = await import("./helpers/migrations.js");
 const todosRepo = await import("../src/repositories/todos.js");
 const todosService = await import("../src/services/todos.js");
 const { processPush } = await import("../src/services/sync.service.js");
@@ -124,6 +125,7 @@ const countTodoTags = async (todoId: string): Promise<number> => {
 };
 
 before(async () => {
+  await createNotificationTables(turso);
   await turso.execute(`
     CREATE TABLE IF NOT EXISTS todos (
       id TEXT PRIMARY KEY,

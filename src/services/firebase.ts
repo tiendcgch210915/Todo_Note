@@ -8,12 +8,20 @@ import {
 import { getMessaging, type Message } from "firebase-admin/messaging";
 import { env } from "../config/env.js";
 import type { DeviceKind } from "../repositories/notifications.js";
+import { pushLogger, setPushLogger } from "./push-logger.js";
+import type { PushLogger } from "./push-logger.js";
+
+// Re-exported so existing imports keep working; the logger itself lives in push-logger.ts.
+export { pushLogger, setPushLogger };
+export type { PushLogger };
 
 /** Android channel created by the mobile app (see AndroidManifest default_notification_channel_id). */
 export const ANDROID_CHANNEL_ID = "general_notifications";
 
 /** FCM: "Maximum payload for both message types is 4096 bytes". */
 const MAX_PAYLOAD_BYTES = 4096;
+/** FCM: lifespan from 0 to 2,419,200 seconds (4 weeks). */
+const MAX_TTL_MS = 2_419_200 * 1000;
 /** sendEach() accepts up to 500 messages per call. */
 const SEND_BATCH_SIZE = 500;
 /** FCM reserved data keys / prefixes (set-message-type docs). */
@@ -49,6 +57,13 @@ export type PushMessage = {
   title: string;
   body: string;
   data?: Record<string, string>;
+  /** Android notification channel; defaults to ANDROID_CHANNEL_ID. */
+  channelId?: string;
+  /**
+   * FCM message lifespan in MILLISECONDS (the Admin SDK converts it to the "3600s" string
+   * HTTP v1 expects). Omitted = FCM default (4 weeks).
+   */
+  ttlMs?: number;
 };
 
 export type PushResult = {
@@ -58,11 +73,6 @@ export type PushResult = {
   invalidDeviceIds: string[];
 };
 
-export type PushLogger = {
-  info: (obj: object, msg: string) => void;
-  warn: (obj: object, msg: string) => void;
-  error: (obj: object, msg: string) => void;
-};
 
 /** Minimal slice of firebase-admin's Messaging that we use (also what tests fake). */
 export type MessagingClient = {
@@ -73,31 +83,14 @@ export type MessagingClient = {
 
 export class PushPayloadError extends Error {}
 
-const consoleLogger: PushLogger = {
-  info: (obj, msg) => console.info(msg, obj),
-  warn: (obj, msg) => console.warn(msg, obj),
-  error: (obj, msg) => console.error(msg, obj),
-};
 
-let log: PushLogger = consoleLogger;
 let firebaseApp: App | null = null;
 let messagingOverride: MessagingClient | null = null;
-
-/** Logger that always forwards to the currently configured one (set by initFirebase / setPushLogger). */
-export const pushLogger: PushLogger = {
-  info: (obj, msg) => log.info(obj, msg),
-  warn: (obj, msg) => log.warn(obj, msg),
-  error: (obj, msg) => log.error(obj, msg),
-};
 
 export const setMessagingClientForTests = (
   client: MessagingClient | null
 ): void => {
   messagingOverride = client;
-};
-
-export const setPushLogger = (logger: PushLogger | null): void => {
-  log = logger ?? consoleLogger;
 };
 
 export const isPushConfigured = (): boolean =>
@@ -110,12 +103,12 @@ export const isPushConfigured = (): boolean =>
  * push stays disabled so the API keeps serving requests.
  */
 export const initFirebase = async (logger?: PushLogger): Promise<boolean> => {
-  if (logger) log = logger;
+  if (logger) setPushLogger(logger);
   if (firebaseApp) return true;
 
   const credentialsPath = env.GOOGLE_APPLICATION_CREDENTIALS;
   if (!credentialsPath) {
-    log.warn(
+    pushLogger.warn(
       {},
       "GOOGLE_APPLICATION_CREDENTIALS is not set; push notifications are disabled"
     );
@@ -125,7 +118,7 @@ export const initFirebase = async (logger?: PushLogger): Promise<boolean> => {
   try {
     await access(credentialsPath, constants.R_OK);
   } catch {
-    log.warn(
+    pushLogger.warn(
       { path: credentialsPath },
       "GOOGLE_APPLICATION_CREDENTIALS points to a file that does not exist or is not readable; push notifications are disabled"
     );
@@ -136,11 +129,11 @@ export const initFirebase = async (logger?: PushLogger): Promise<boolean> => {
     // Reuse an app created elsewhere (e.g. hot reload) instead of throwing on a duplicate.
     firebaseApp =
       getApps()[0] ?? initializeApp({ credential: applicationDefault() });
-    log.info({}, "Firebase Admin SDK initialised");
+    pushLogger.info({}, "Firebase Admin SDK initialised");
     return true;
   } catch (error) {
     // Log only the error type: the message may echo parts of the key file.
-    log.error(
+    pushLogger.error(
       { errorName: error instanceof Error ? error.name : "unknown" },
       "Could not initialise Firebase Admin SDK from GOOGLE_APPLICATION_CREDENTIALS; push notifications are disabled"
     );
@@ -150,8 +143,22 @@ export const initFirebase = async (logger?: PushLogger): Promise<boolean> => {
 
 /** Throws PushPayloadError unless the payload is one FCM will accept. */
 export const validatePushPayload = (
-  message: Pick<PushMessage, "title" | "body" | "data">
+  message: Pick<PushMessage, "title" | "body" | "data" | "channelId" | "ttlMs">
 ): void => {
+  if (
+    message.ttlMs !== undefined &&
+    (!Number.isFinite(message.ttlMs) ||
+      message.ttlMs < 0 ||
+      message.ttlMs > MAX_TTL_MS)
+  ) {
+    throw new PushPayloadError("ttlMs must be between 0 and 4 weeks");
+  }
+  if (
+    message.channelId !== undefined &&
+    (typeof message.channelId !== "string" || message.channelId.trim() === "")
+  ) {
+    throw new PushPayloadError("channelId must be a non-empty string");
+  }
   if (typeof message.title !== "string" || message.title.trim() === "") {
     throw new PushPayloadError("title must be a non-empty string");
   }
@@ -192,14 +199,15 @@ const chunksOf = <T>(items: T[], size: number): T[][] => {
 
 const buildMessage = (
   device: PushDevice,
-  payload: Pick<PushMessage, "title" | "body" | "data">
+  payload: Pick<PushMessage, "title" | "body" | "data" | "channelId" | "ttlMs">
 ): Message => {
   const common = {
     notification: { title: payload.title, body: payload.body },
     data: payload.data,
     android: {
       priority: "high" as const,
-      notification: { channelId: ANDROID_CHANNEL_ID },
+      ...(payload.ttlMs !== undefined ? { ttl: payload.ttlMs } : {}),
+      notification: { channelId: payload.channelId ?? ANDROID_CHANNEL_ID },
     },
   };
   // firebase-admin >= 14.1 targets a Firebase Installation ID with `fid`;
@@ -265,13 +273,13 @@ export const sendFirebasePush = async (
       const code = result.error?.code ?? "unknown";
       if (DEAD_REGISTRATION_CODES.has(code)) {
         invalidDeviceIds.push(device.id);
-        log.info(
+        pushLogger.info(
           { deviceId: device.id, kind: device.kind, code },
           "FCM reported a dead registration; it will be removed"
         );
       } else {
         // Transient (overload, quota) or configuration error: keep the device.
-        log.warn(
+        pushLogger.warn(
           { deviceId: device.id, kind: device.kind, code },
           "FCM send failed; device kept"
         );

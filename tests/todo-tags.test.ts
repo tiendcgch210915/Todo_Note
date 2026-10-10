@@ -5,6 +5,7 @@ process.env.TURSO_DATABASE_URL = "file::memory:";
 process.env.TURSO_AUTH_TOKEN = "";
 
 const { turso } = await import("../src/config/db.js");
+const { createNotificationTables } = await import("./helpers/migrations.js");
 const tagsService = await import("../src/services/tags.js");
 const todosService = await import("../src/services/todos.js");
 const dashboard = await import("../src/services/dashboard.js");
@@ -92,6 +93,7 @@ const getTodoRow = async (
 };
 
 before(async () => {
+  await createNotificationTables(turso);
   await turso.execute(`
     CREATE TABLE IF NOT EXISTS users (
       id TEXT PRIMARY KEY,

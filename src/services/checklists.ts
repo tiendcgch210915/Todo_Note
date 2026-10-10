@@ -1,6 +1,7 @@
 import * as tplRepo from "../repositories/checklist-templates.js";
 import * as catRepo from "../repositories/checklist-categories.js";
 import * as runsRepo from "../repositories/checklist-runs.js";
+import * as notificationTriggers from "./notification-triggers.js";
 import type {
   CreateCategoryInput,
   UpdateCategoryInput,
@@ -280,6 +281,7 @@ export const startRun = async (
     const run = await runsRepo.getRunById(runId, userId);
     if (!run) throw new ServiceError("not_found");
     const items = await runsRepo.listRunItems(runId);
+    await notificationTriggers.onChecklistRunChanged(userId, runId);
     return { run, items };
   } catch (e) {
     return wrapRun(e);
@@ -323,7 +325,9 @@ export const completeRun = async (
   body: CompleteRunInput
 ): Promise<runsRepo.RunRow> => {
   try {
-    return await runsRepo.completeRun(id, userId, body.duration_ms ?? null);
+    const run = await runsRepo.completeRun(id, userId, body.duration_ms ?? null);
+    await notificationTriggers.onChecklistRunChanged(userId, id);
+    return run;
   } catch (e) {
     return wrapRun(e);
   }
@@ -332,9 +336,11 @@ export const completeRun = async (
 export const abandonRun = async (userId: string, id: string): Promise<void> => {
   const ok = await runsRepo.abandonRun(id, userId);
   if (!ok) throw new ServiceError("not_found");
+  await notificationTriggers.onChecklistRunChanged(userId, id);
 };
 
 export const deleteRun = async (userId: string, id: string): Promise<void> => {
   const ok = await runsRepo.deleteRun(id, userId);
   if (!ok) throw new ServiceError("not_found");
+  await notificationTriggers.onChecklistRunChanged(userId, id);
 };

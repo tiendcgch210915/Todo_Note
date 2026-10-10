@@ -10,8 +10,13 @@ import {
   MoveToDaySchema,
   AttachTagSchema,
   ReplaceTodoTagsSchema,
+  TodoTimerSchema,
 } from "../../../schemas/api/todos.js";
 import * as todos from "../../../services/todos.js";
+import {
+  applyTimerEvent,
+  TimerServiceError,
+} from "../../../services/todo-timers.js";
 
 const mapErr = (e: unknown, reply: FastifyReply): FastifyReply => {
   if (e instanceof todos.ServiceError) {
@@ -255,6 +260,28 @@ export default async function todosRoutes(app: FastifyInstance) {
       }
     }
   );
+
+  // PUT /:id/timer — báo trạng thái đếm ngược để server hẹn thông báo hết giờ
+  app.put<{ Params: { id: string } }>("/:id/timer", async (req, reply) => {
+    const parsed = TodoTimerSchema.safeParse(req.body);
+    if (!parsed.success) {
+      return reply
+        .code(400)
+        .send({ error: "bad_input", issues: parsed.error.issues });
+    }
+    try {
+      return await applyTimerEvent(req.userId, req.params.id, parsed.data);
+    } catch (e) {
+      if (e instanceof TimerServiceError) {
+        if (e.code === "not_found") return reply.code(404).send({ error: "not_found" });
+        if (e.code === "device_not_found")
+          return reply.code(404).send({ error: "device_not_found" });
+        if (e.code === "todo_completed")
+          return reply.code(409).send({ error: "todo_completed" });
+      }
+      throw e;
+    }
+  });
 
   // GET /:id/subtasks
   app.get<{ Params: { id: string } }>("/:id/subtasks", async (req, reply) => {

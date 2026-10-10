@@ -23,16 +23,6 @@ export type DeviceTarget = {
   kind: DeviceKind;
 };
 
-export type TodoReminderRow = {
-  id: string;
-  user_id: string;
-  title: string;
-  scheduled_date: string;
-  time: string;
-};
-
-export type NotificationKind = "morning" | "evening" | "todo_reminder";
-
 const DEVICE_COLUMNS =
   "id, user_id, registration_id, kind, platform, last_seen_at, created_at, updated_at";
 
@@ -54,6 +44,15 @@ const isUniqueViolation = (error: unknown): boolean => {
   return /UNIQUE/i.test(message);
 };
 
+/**
+ * Job nhắm vào một thiết bị sắp bị xóa phải bị hủy, KHÔNG được chuyển thành "gửi mọi
+ * thiết bị". Câu lệnh này luôn chạy TRƯỚC câu DELETE trong cùng một batch.
+ */
+const cancelJobsForDevicesWhere = (where: string): string =>
+  `UPDATE notification_jobs SET status = 'cancelled'
+   WHERE status IN ('pending', 'processing')
+     AND target_device_id IN (SELECT id FROM user_devices WHERE ${where})`;
+
 export const activeUserExists = async (userId: string): Promise<boolean> => {
   const res = await turso.execute({
     sql: "SELECT id FROM users WHERE id = ? AND deleted_at IS NULL",
@@ -62,10 +61,41 @@ export const activeUserExists = async (userId: string): Promise<boolean> => {
   return res.rows.length > 0;
 };
 
+export const findDeviceByRegistration = async (
+  userId: string,
+  registrationId: string
+): Promise<UserDeviceRow | null> => {
+  const res = await turso.execute({
+    sql: `SELECT ${DEVICE_COLUMNS} FROM user_devices
+          WHERE user_id = ? AND registration_id = ?`,
+    args: [userId, registrationId],
+  });
+  if (res.rows.length === 0) return null;
+  return mapDeviceRow(res.rows[0] as unknown as Record<string, unknown>);
+};
+
+export const getUserDevice = async (
+  userId: string,
+  deviceId: string
+): Promise<UserDeviceRow | null> => {
+  const res = await turso.execute({
+    sql: `SELECT ${DEVICE_COLUMNS} FROM user_devices WHERE user_id = ? AND id = ?`,
+    args: [userId, deviceId],
+  });
+  if (res.rows.length === 0) return null;
+  return mapDeviceRow(res.rows[0] as unknown as Record<string, unknown>);
+};
+
 /**
  * Insert or refresh a device registration. Every call bumps `last_seen_at`.
  * A registration id belongs to one user at a time: re-registering it under a
  * different user (shared phone, new login) detaches it from the previous owner.
+ *
+ * `previousRegistrationId` (FID/token rotation): if it names one of THIS user's
+ * rows, that row is renamed in place so its `id` (what jobs and timers point to)
+ * survives. If the new registration already exists for the user, jobs/timers are
+ * re-pointed to that row and the old row is dropped. Unknown or foreign ids are
+ * ignored silently, so the response never reveals whether they exist.
  */
 export const upsertUserDevice = async (
   userId: string,
@@ -73,48 +103,105 @@ export const upsertUserDevice = async (
     registrationId: string;
     kind: DeviceKind;
     platform: DevicePlatform;
+    previousRegistrationId?: string | null;
   }
 ): Promise<UserDeviceRow> => {
   const id = newId();
   const now = nowISO();
+
   await turso.batch(
     [
       {
-        sql: "DELETE FROM user_devices WHERE registration_id = ? AND user_id <> ?",
+        sql: cancelJobsForDevicesWhere("registration_id = ? AND user_id <> ?"),
         args: [input.registrationId, userId],
       },
       {
-        sql: `INSERT INTO user_devices
-              (id, user_id, registration_id, kind, platform, last_seen_at, created_at, updated_at)
-              VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-              ON CONFLICT(user_id, registration_id)
-              DO UPDATE SET kind = excluded.kind,
-                            platform = excluded.platform,
-                            last_seen_at = excluded.last_seen_at,
-                            updated_at = excluded.updated_at`,
-        args: [
-          id,
-          userId,
-          input.registrationId,
-          input.kind,
-          input.platform,
-          now,
-          now,
-          now,
-        ],
+        sql: "DELETE FROM user_devices WHERE registration_id = ? AND user_id <> ?",
+        args: [input.registrationId, userId],
       },
     ],
     "write"
   );
 
-  const res = await turso.execute({
-    sql: `SELECT ${DEVICE_COLUMNS} FROM user_devices WHERE user_id = ? AND registration_id = ?`,
-    args: [userId, input.registrationId],
+  const previous = input.previousRegistrationId?.trim();
+  if (previous && previous !== input.registrationId) {
+    const previousRow = await findDeviceByRegistration(userId, previous);
+    if (previousRow) {
+      const currentRow = await findDeviceByRegistration(
+        userId,
+        input.registrationId
+      );
+      try {
+        if (!currentRow) {
+          await turso.execute({
+            sql: `UPDATE user_devices
+                  SET registration_id = ?, kind = ?, platform = ?,
+                      last_seen_at = ?, updated_at = ?
+                  WHERE id = ? AND user_id = ?`,
+            args: [
+              input.registrationId,
+              input.kind,
+              input.platform,
+              now,
+              now,
+              previousRow.id,
+              userId,
+            ],
+          });
+        } else {
+          await turso.batch(
+            [
+              {
+                sql: `UPDATE notification_jobs SET target_device_id = ?
+                      WHERE target_device_id = ? AND status IN ('pending', 'processing')`,
+                args: [currentRow.id, previousRow.id],
+              },
+              {
+                sql: "UPDATE todo_timers SET device_id = ? WHERE device_id = ?",
+                args: [currentRow.id, previousRow.id],
+              },
+              {
+                sql: "DELETE FROM user_devices WHERE id = ? AND user_id = ?",
+                args: [previousRow.id, userId],
+              },
+            ],
+            "write"
+          );
+        }
+      } catch (error) {
+        // Another request registered the new id between our read and write; the
+        // plain upsert below then just refreshes it.
+        if (!isUniqueViolation(error)) throw error;
+      }
+    }
+  }
+
+  await turso.execute({
+    sql: `INSERT INTO user_devices
+          (id, user_id, registration_id, kind, platform, last_seen_at, created_at, updated_at)
+          VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+          ON CONFLICT(user_id, registration_id)
+          DO UPDATE SET kind = excluded.kind,
+                        platform = excluded.platform,
+                        last_seen_at = excluded.last_seen_at,
+                        updated_at = excluded.updated_at`,
+    args: [
+      id,
+      userId,
+      input.registrationId,
+      input.kind,
+      input.platform,
+      now,
+      now,
+      now,
+    ],
   });
-  if (res.rows.length === 0) {
+
+  const row = await findDeviceByRegistration(userId, input.registrationId);
+  if (!row) {
     throw new Error("upsertUserDevice: row missing after upsert");
   }
-  return mapDeviceRow(res.rows[0] as unknown as Record<string, unknown>);
+  return row;
 };
 
 /** Remove one of the user's own registrations; returns how many rows were deleted. */
@@ -122,19 +209,20 @@ export const deleteUserDevice = async (
   userId: string,
   registrationId: string
 ): Promise<number> => {
-  const res = await turso.execute({
-    sql: "DELETE FROM user_devices WHERE user_id = ? AND registration_id = ?",
-    args: [userId, registrationId],
-  });
-  return res.rowsAffected;
-};
-
-export const listActiveUserIds = async (): Promise<string[]> => {
-  const res = await turso.execute({
-    sql: "SELECT id FROM users WHERE deleted_at IS NULL ORDER BY created_at ASC",
-    args: [],
-  });
-  return (res.rows as unknown as { id: string }[]).map((row) => row.id);
+  const results = await turso.batch(
+    [
+      {
+        sql: cancelJobsForDevicesWhere("user_id = ? AND registration_id = ?"),
+        args: [userId, registrationId],
+      },
+      {
+        sql: "DELETE FROM user_devices WHERE user_id = ? AND registration_id = ?",
+        args: [userId, registrationId],
+      },
+    ],
+    "write"
+  );
+  return results[1].rowsAffected;
 };
 
 export const listDevicesByUser = async (
@@ -159,10 +247,17 @@ export const deleteDevicesByIds = async (ids: string[]): Promise<void> => {
   const unique = [...new Set(ids)].filter((id) => id.length > 0);
   for (let i = 0; i < unique.length; i += DELETE_BATCH_SIZE) {
     const chunk = unique.slice(i, i + DELETE_BATCH_SIZE);
-    await turso.execute({
-      sql: `DELETE FROM user_devices WHERE id IN (${chunk.map(() => "?").join(", ")})`,
-      args: chunk,
-    });
+    const marks = chunk.map(() => "?").join(", ");
+    await turso.batch(
+      [
+        {
+          sql: cancelJobsForDevicesWhere(`id IN (${marks})`),
+          args: chunk,
+        },
+        { sql: `DELETE FROM user_devices WHERE id IN (${marks})`, args: chunk },
+      ],
+      "write"
+    );
   }
 };
 
@@ -176,102 +271,18 @@ export const countStaleDevices = async (cutoffISO: string): Promise<number> => {
 
 /** Delete registrations whose app has not checked in since `cutoffISO`. */
 export const deleteStaleDevices = async (cutoffISO: string): Promise<number> => {
-  const res = await turso.execute({
-    sql: "DELETE FROM user_devices WHERE last_seen_at < ?",
-    args: [cutoffISO],
-  });
-  return res.rowsAffected;
-};
-
-export const countImportantUrgentTodosForDate = async (
-  userId: string,
-  date: string
-): Promise<number> => {
-  const res = await turso.execute({
-    sql: `SELECT COUNT(*) AS c
-          FROM todos
-          WHERE user_id = ?
-            AND scheduled_date = ?
-            AND parent_id IS NULL
-            AND deleted_at IS NULL
-            AND status <> 'done'
-            AND status <> 'archived'
-            AND is_important = 1
-            AND is_urgent = 1`,
-    args: [userId, date],
-  });
-  return Number((res.rows[0] as unknown as Record<string, unknown>).c);
-};
-
-export const countRemainingTodosForDate = async (
-  userId: string,
-  date: string
-): Promise<number> => {
-  const res = await turso.execute({
-    sql: `SELECT COUNT(*) AS c
-          FROM todos
-          WHERE user_id = ?
-            AND scheduled_date = ?
-            AND parent_id IS NULL
-            AND deleted_at IS NULL
-            AND status <> 'done'
-            AND status <> 'archived'`,
-    args: [userId, date],
-  });
-  return Number((res.rows[0] as unknown as Record<string, unknown>).c);
-};
-
-export const listDueTodoReminders = async (
-  date: string,
-  hhmm: string
-): Promise<TodoReminderRow[]> => {
-  const res = await turso.execute({
-    sql: `SELECT id, user_id, title, scheduled_date, time
-          FROM todos
-          WHERE scheduled_date = ?
-            AND time = ?
-            AND parent_id IS NULL
-            AND deleted_at IS NULL
-            AND status <> 'done'
-            AND status <> 'archived'
-          ORDER BY user_id ASC, position ASC, created_at ASC`,
-    args: [date, hhmm],
-  });
-  return (res.rows as unknown as Record<string, unknown>[]).map((row) => ({
-    id: row.id as string,
-    user_id: row.user_id as string,
-    title: row.title as string,
-    scheduled_date: row.scheduled_date as string,
-    time: row.time as string,
-  }));
-};
-
-export const claimNotificationDelivery = async (input: {
-  userId: string;
-  todoId?: string | null;
-  kind: NotificationKind;
-  dedupeKey: string;
-  sentAt?: string;
-}): Promise<boolean> => {
-  const now = input.sentAt ?? nowISO();
-  try {
-    await turso.execute({
-      sql: `INSERT INTO notification_deliveries
-            (id, user_id, todo_id, kind, dedupe_key, sent_at, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?)`,
-      args: [
-        newId(),
-        input.userId,
-        input.todoId ?? null,
-        input.kind,
-        input.dedupeKey,
-        now,
-        now,
-      ],
-    });
-    return true;
-  } catch (error) {
-    if (isUniqueViolation(error)) return false;
-    throw error;
-  }
+  const results = await turso.batch(
+    [
+      {
+        sql: cancelJobsForDevicesWhere("last_seen_at < ?"),
+        args: [cutoffISO],
+      },
+      {
+        sql: "DELETE FROM user_devices WHERE last_seen_at < ?",
+        args: [cutoffISO],
+      },
+    ],
+    "write"
+  );
+  return results[1].rowsAffected;
 };

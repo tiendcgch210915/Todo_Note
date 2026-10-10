@@ -1,4 +1,5 @@
 import { z } from "zod";
+import { TIMER } from "../../config/notification-policy.js";
 
 const IsoDate = z.string().regex(/^\d{4}-\d{2}-\d{2}$/, "Expected YYYY-MM-DD");
 const IsoDT = z.iso.datetime();
@@ -108,3 +109,39 @@ export const ReplaceTodoTagsSchema = z.object({
   tags: z.array(z.string().trim().min(1).max(64)).max(20).optional(),
 });
 export type ReplaceTodoTagsInput = z.infer<typeof ReplaceTodoTagsSchema>;
+
+// ── Đếm ngược (PUT /todos/:id/timer) ─────────────────────────────────────────
+// Request camelCase như /devices; phản hồi snake_case như phần còn lại của API.
+export const TodoTimerSchema = z
+  .object({
+    action: z.enum(["start", "pause", "resume", "stop", "finish"]),
+    remainingSeconds: z.number().finite().min(0).max(TIMER.maxSeconds).optional(),
+    /** Thời gian ước lượng ban đầu; bắt buộc khi start. */
+    estimatedSeconds: z.number().finite().positive().max(TIMER.maxSeconds).optional(),
+    /** Đăng ký FCM của máy đang đếm; bắt buộc khi start và resume. */
+    registrationId: z.string().trim().min(1).max(4096).optional(),
+    /** Thời điểm sự kiện xảy ra trên app (ISO 8601, UTC). */
+    clientEventAt: z.iso.datetime({ offset: true }),
+  })
+  .superRefine((value, ctx) => {
+    const require = (field: "remainingSeconds" | "estimatedSeconds" | "registrationId") => {
+      if (value[field] === undefined) {
+        ctx.addIssue({
+          code: "custom",
+          path: [field],
+          message: `${field} is required for action "${value.action}"`,
+        });
+      }
+    };
+    if (value.action === "start") {
+      require("remainingSeconds");
+      require("estimatedSeconds");
+      require("registrationId");
+    } else if (value.action === "resume") {
+      require("remainingSeconds");
+      require("registrationId");
+    } else if (value.action === "pause") {
+      require("remainingSeconds");
+    }
+  });
+export type TodoTimerInput = z.infer<typeof TodoTimerSchema>;

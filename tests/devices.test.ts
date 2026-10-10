@@ -8,7 +8,6 @@ process.env.JWT_ADMIN_SECRET = "test-admin-secret-123";
 process.env.COOKIE_SECRET = "test-cookie-secret-123456789012345";
 process.env.ADMIN_USERNAME = "admin";
 process.env.ADMIN_PASSWORD_HASH = `$2b$12$${"a".repeat(53)}`;
-process.env.NOTIFICATIONS_ENABLED = "false";
 // Hermetic: a path that does not exist, so initFirebase() can never load real credentials
 // (even if a developer's .env defines GOOGLE_APPLICATION_CREDENTIALS).
 process.env.GOOGLE_APPLICATION_CREDENTIALS = "./does-not-exist-service-account.json";
@@ -25,6 +24,8 @@ const { default: deviceRoutes } = await import(
   "../src/routes/api/v1/devices.js"
 );
 const { signUserToken } = await import("../src/services/api-auth.js");
+const { applyAllMigrations } = await import("./helpers/migrations.js");
+const jobsRepo = await import("../src/repositories/notification-jobs.js");
 
 import type { Message } from "firebase-admin/messaging";
 import type { MessagingClient } from "../src/services/firebase.js";
@@ -107,37 +108,7 @@ const input = {
 const app = Fastify();
 
 before(async () => {
-  await turso.execute(`
-    CREATE TABLE IF NOT EXISTS users (
-      id TEXT PRIMARY KEY,
-      email TEXT UNIQUE NOT NULL,
-      password_hash TEXT NOT NULL,
-      display_name TEXT,
-      avatar_url TEXT,
-      timezone TEXT NOT NULL DEFAULT 'Asia/Ho_Chi_Minh',
-      settings TEXT,
-      is_admin INTEGER NOT NULL DEFAULT 0,
-      created_at TEXT NOT NULL,
-      updated_at TEXT NOT NULL,
-      deleted_at TEXT
-    )
-  `);
-  await turso.execute(`
-    CREATE TABLE IF NOT EXISTS user_devices (
-      id TEXT PRIMARY KEY,
-      user_id TEXT NOT NULL,
-      registration_id TEXT NOT NULL,
-      kind TEXT NOT NULL DEFAULT 'token' CHECK (kind IN ('fid', 'token')),
-      platform TEXT NOT NULL DEFAULT 'android' CHECK (platform IN ('android')),
-      last_seen_at TEXT NOT NULL DEFAULT '1970-01-01T00:00:00.000Z',
-      created_at TEXT NOT NULL,
-      updated_at TEXT NOT NULL
-    )
-  `);
-  await turso.execute(`
-    CREATE UNIQUE INDEX IF NOT EXISTS idx_user_devices_user_token
-      ON user_devices(user_id, registration_id)
-  `);
+  await applyAllMigrations(turso);
 
   await app.register(userAuth);
   await app.register(deviceRoutes, { prefix: "/devices" });
@@ -149,6 +120,8 @@ after(async () => {
 });
 
 beforeEach(async () => {
+  await turso.execute("DELETE FROM notification_jobs");
+  await turso.execute("DELETE FROM todo_timers");
   await turso.execute("DELETE FROM user_devices");
   await turso.execute("DELETE FROM users");
   await insertUser(USER_ID);

@@ -22,6 +22,7 @@ import * as todosService from "./todos.js";
 import * as notesService from "./notes.js";
 import { autoLogHabitForCompletedTodo } from "./todo-habit-logs.js";
 import { ensurePastTodoDayClosedForMutation } from "./daily-todo-logs.js";
+import * as notificationTriggers from "./notification-triggers.js";
 import {
   getEntityInfo,
   isSystemTemplate,
@@ -406,6 +407,9 @@ async function processOp(
       }
     } else {
       await softDeleteEntity(type, id, delAt);
+      if (type === "checklist_run") {
+        await notificationTriggers.onChecklistRunChanged(userId, id);
+      }
     }
   } else {
     await upsertEntity(userId, type, dbPayload, {
@@ -439,6 +443,16 @@ async function processOp(
       if (afterTodo?.status === "done" && beforeTodo?.status !== "done") {
         await autoLogHabitForCompletedTodo(userId, afterTodo);
       }
+      // Create / update / complete / reschedule / un-set reminder time: re-arm or cancel.
+      await notificationTriggers.onTodoChanged(userId, id);
+    }
+
+    if (type === "checklist_run") {
+      await notificationTriggers.onChecklistRunChanged(userId, id);
+    }
+    if (type === "user") {
+      // The pushed user entity can change `timezone`, which moves every digest.
+      await notificationTriggers.onUserSettingsChanged(userId);
     }
   }
 

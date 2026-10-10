@@ -9,6 +9,7 @@ import syncRoutes from "./sync.js";
 import tagsRoutes from "./tags.js";
 import notificationRoutes from "../notifications.js";
 import deviceRoutes from "./devices.js";
+import notificationSettingsRoutes from "./notification-settings.js";
 
 export default async function apiRoutes(app: FastifyInstance) {
   await app.register(authRoutes, { prefix: "/auth" });
@@ -21,4 +22,7 @@ export default async function apiRoutes(app: FastifyInstance) {
   await app.register(tagsRoutes, { prefix: "/tags" });
   await app.register(notificationRoutes, { prefix: "/notifications" });
   await app.register(deviceRoutes, { prefix: "/devices" });
+  await app.register(notificationSettingsRoutes, {
+    prefix: "/notification-settings",
+  });
 }

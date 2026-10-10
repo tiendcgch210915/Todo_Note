@@ -9,6 +9,7 @@ import userAuth from "./plugins/user-auth.js";
 import adminRoutes from "./routes/admin/index.js";
 import apiRoutes from "./routes/api/v1/index.js";
 import notificationRoutes from "./routes/api/notifications.js";
+import internalNotificationRoutes from "./routes/internal/notifications.js";
 import { startNotificationScheduler } from "./services/notification-scheduler.js";
 import { startDailyTodoLogScheduler } from "./services/daily-todo-log-scheduler.js";
 import { initFirebase } from "./services/firebase.js";
@@ -81,6 +82,19 @@ await app.register(apiRoutes, { prefix: "/api/v1" });
 
 // Notification API alias requested by mobile integrations.
 await app.register(notificationRoutes, { prefix: "/api/notifications" });
+
+// Notification tick for an external cron (Render sleeps when idle). Protected by
+// NOTIFY_TICK_SECRET in the x-notify-tick-secret header; without it every request is rejected.
+await app.register(internalNotificationRoutes, {
+  prefix: "/internal/notifications",
+  secret: env.NOTIFY_TICK_SECRET,
+  dryRun: env.NOTIFY_DRY_RUN,
+});
+if (!env.NOTIFY_TICK_SECRET && !env.NOTIFY_INPROCESS_TICK) {
+  app.log.warn(
+    "Neither NOTIFY_TICK_SECRET nor NOTIFY_INPROCESS_TICK is set; scheduled notifications will not be sent"
+  );
+}
 
 // Firebase Admin SDK (Application Default Credentials). Missing credentials only
 // log a warning; the server keeps running with push disabled.

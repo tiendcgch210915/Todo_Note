@@ -26,6 +26,8 @@ export type RegisterDeviceInput = {
   registrationId: string;
   kind: notificationsRepo.DeviceKind;
   platform: notificationsRepo.DevicePlatform;
+  /** Registration this device used before (FID/token rotation); see upsertUserDevice. */
+  previousRegistrationId?: string | null;
 };
 
 /** Create or refresh the caller's device registration (bumps last_seen_at). */
@@ -71,8 +73,16 @@ const sendToUser = async (input: {
   title: string;
   body: string;
   data?: Record<string, string>;
+  targetDeviceId?: string | null;
+  channelId?: string;
+  ttlMs?: number;
 }): Promise<PushResult & { deviceCount: number }> => {
-  const devices = await notificationsRepo.listDevicesByUser(input.userId);
+  const allDevices = await notificationsRepo.listDevicesByUser(input.userId);
+  // A message aimed at one device NEVER falls back to the user's other devices:
+  // if that row is gone, nothing is sent.
+  const devices = input.targetDeviceId
+    ? allDevices.filter((device) => device.id === input.targetDeviceId)
+    : allDevices;
   if (devices.length === 0) {
     return {
       successCount: 0,
@@ -91,6 +101,8 @@ const sendToUser = async (input: {
     title: input.title,
     body: input.body,
     data: input.data,
+    channelId: input.channelId,
+    ttlMs: input.ttlMs,
   });
 
   if (result.invalidDeviceIds.length > 0) {
@@ -105,6 +117,16 @@ export type NotifyUserInput = {
   body: string;
   /** Every value must be a string (FCM data payload); `type` and `id` are required. */
   data: { type: string; id: string } & Record<string, string>;
+};
+
+/** Per-message delivery options. */
+export type NotifyOptions = {
+  /** Send ONLY to this user_devices.id. Omitted/null = every device of the user. */
+  targetDeviceId?: string | null;
+  /** Android notification channel (defaults to the app's general channel). */
+  channelId?: string;
+  /** FCM lifespan in milliseconds. */
+  ttlMs?: number;
 };
 
 export type NotifyUserResult = {
@@ -125,14 +147,15 @@ export type NotifyUserResult = {
  */
 export const notifyUser = async (
   userId: string,
-  input: NotifyUserInput
+  input: NotifyUserInput,
+  options: NotifyOptions = {}
 ): Promise<NotifyUserResult> => {
   try {
     const { type, id } = input.data ?? {};
     if (!type || !id) {
       throw new NotificationServiceError("bad_input");
     }
-    const result = await sendToUser({ userId, ...input });
+    const result = await sendToUser({ userId, ...input, ...options });
     return {
       devices: result.deviceCount,
       sent: result.successCount,
@@ -161,9 +184,10 @@ export const notifyUser = async (
 /** Fire-and-forget variant of `notifyUser` for use inside request handlers. */
 export const notifyUserInBackground = (
   userId: string,
-  input: NotifyUserInput
+  input: NotifyUserInput,
+  options: NotifyOptions = {}
 ): void => {
-  void notifyUser(userId, input);
+  void notifyUser(userId, input, options);
 };
 
 const DAY_MS = 24 * 60 * 60 * 1000;
@@ -188,135 +212,4 @@ export const cleanupStaleDevices = async (
     ? await notificationsRepo.countStaleDevices(cutoff)
     : await notificationsRepo.deleteStaleDevices(cutoff);
   return { cutoff, count, dryRun };
-};
-
-const MORNING_PLAN_BODY =
-  "Hôm nay là một ngày mới. Hãy dành vài phút lên kế hoạch để bắt đầu thật chủ động nhé!";
-const EVENING_DONE_BODY =
-  "Tuyệt vời! Bạn đã hoàn thành toàn bộ todos hôm nay. Hãy tận hưởng một buổi tối nhẹ nhàng nhé!";
-
-export const sendMorningNotifications = async (
-  date: string
-): Promise<{ users: number; sent: number; skipped: number; failed: number }> => {
-  const userIds = await notificationsRepo.listActiveUserIds();
-  let sent = 0;
-  let skipped = 0;
-  let failed = 0;
-
-  for (const userId of userIds) {
-    const claimed = await notificationsRepo.claimNotificationDelivery({
-      userId,
-      kind: "morning",
-      dedupeKey: `morning:${userId}:${date}`,
-    });
-    if (!claimed) {
-      skipped++;
-      continue;
-    }
-
-    try {
-      const count = await notificationsRepo.countImportantUrgentTodosForDate(
-        userId,
-        date
-      );
-      const result = await sendToUser({
-        userId,
-        title: "Chào buổi sáng!",
-        body:
-          count > 0
-            ? `Bạn có ${count} todos quan trọng & khẩn cấp cần thực hiện ngay. Hãy bắt tay vào việc ngay thôi nào!`
-            : MORNING_PLAN_BODY,
-        data: { type: "morning", date, count: String(count) },
-      });
-      if (result.deviceCount > 0) sent++;
-    } catch {
-      failed++;
-    }
-  }
-
-  return { users: userIds.length, sent, skipped, failed };
-};
-
-export const sendEveningNotifications = async (
-  date: string
-): Promise<{ users: number; sent: number; skipped: number; failed: number }> => {
-  const userIds = await notificationsRepo.listActiveUserIds();
-  let sent = 0;
-  let skipped = 0;
-  let failed = 0;
-
-  for (const userId of userIds) {
-    const claimed = await notificationsRepo.claimNotificationDelivery({
-      userId,
-      kind: "evening",
-      dedupeKey: `evening:${userId}:${date}`,
-    });
-    if (!claimed) {
-      skipped++;
-      continue;
-    }
-
-    try {
-      const count = await notificationsRepo.countRemainingTodosForDate(
-        userId,
-        date
-      );
-      const result = await sendToUser({
-        userId,
-        title: "Tổng kết ngày",
-        body:
-          count > 0
-            ? `Bạn hiện còn ${count} todos cần hoàn thiện để có 1 ngày trọn vẹn và năng suất!`
-            : EVENING_DONE_BODY,
-        data: { type: "evening", date, count: String(count) },
-      });
-      if (result.deviceCount > 0) sent++;
-    } catch {
-      failed++;
-    }
-  }
-
-  return { users: userIds.length, sent, skipped, failed };
-};
-
-export const sendTodoReminderNotifications = async (
-  date: string,
-  hhmm: string
-): Promise<{ todos: number; sent: number; skipped: number; failed: number }> => {
-  const dueTodos = await notificationsRepo.listDueTodoReminders(date, hhmm);
-  let sent = 0;
-  let skipped = 0;
-  let failed = 0;
-
-  for (const todo of dueTodos) {
-    const claimed = await notificationsRepo.claimNotificationDelivery({
-      userId: todo.user_id,
-      todoId: todo.id,
-      kind: "todo_reminder",
-      dedupeKey: `todo_reminder:${todo.id}:${date}:${hhmm}`,
-    });
-    if (!claimed) {
-      skipped++;
-      continue;
-    }
-
-    try {
-      const result = await sendToUser({
-        userId: todo.user_id,
-        title: "Nhắc nhở todo",
-        body: `Đã đến giờ: ${todo.title}`,
-        data: {
-          type: "todo_reminder",
-          todo_id: todo.id,
-          scheduled_date: todo.scheduled_date,
-          time: todo.time,
-        },
-      });
-      if (result.deviceCount > 0) sent++;
-    } catch {
-      failed++;
-    }
-  }
-
-  return { todos: dueTodos.length, sent, skipped, failed };
 };

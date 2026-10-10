@@ -9,6 +9,16 @@ const boolFromEnv = z
     return ["1", "true", "yes", "on"].includes(value.trim().toLowerCase());
   });
 
+// Biến bí mật tùy chọn: để trống/không đặt = chưa cấu hình (không phải lỗi).
+const optionalSecret = (minLength: number) =>
+  z
+    .string()
+    .optional()
+    .transform((value) => (value && value.trim() !== "" ? value.trim() : undefined))
+    .refine((value) => value === undefined || value.length >= minLength, {
+      message: `must be at least ${minLength} chars when set`,
+    });
+
 const EnvSchema = z.object({
   NODE_ENV: z.enum(["development", "production", "test"]).default("development"),
   PORT: z.coerce.number().int().positive().default(3000),
@@ -25,7 +35,13 @@ const EnvSchema = z.object({
     .string()
     .regex(/^\$2[aby]\$\d{2}\$.{53}$/, "ADMIN_PASSWORD_HASH must be a bcrypt hash (run `npm run admin:hash <password>`)"),
 
-  NOTIFICATIONS_ENABLED: boolFromEnv,
+  // Thông báo theo lịch (notification_jobs). Tick ngoài: POST /internal/notifications/tick
+  // với header x-notify-tick-secret; thiếu NOTIFY_TICK_SECRET thì endpoint từ chối mọi yêu cầu.
+  NOTIFY_TICK_SECRET: optionalSecret(16),
+  // Tự tick mỗi 60 s trong tiến trình (chỉ chạy khi instance đang thức).
+  NOTIFY_INPROCESS_TICK: boolFromEnv,
+  // Chỉ ghi log, không gọi FCM (job vẫn được đánh sent).
+  NOTIFY_DRY_RUN: boolFromEnv,
   // Application Default Credentials: path to the service-account JSON file
   // (on Render: the Secret File, /etc/secrets/<name>).
   GOOGLE_APPLICATION_CREDENTIALS: z.string().trim().min(1).optional(),

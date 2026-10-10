@@ -27,7 +27,10 @@
       "Bash(flutter build *)",
       "Bash(npm -v)",
       "Bash(node -e \"const p=require\\('./node_modules/firebase-admin/package.json'\\);console.log\\(p.name,p.version,JSON.stringify\\(p.engines\\)\\)\")",
-      "Bash(npm view *)"
+      "Bash(npm view *)",
+      "Bash(cat)",
+      "Bash(npx tsx *)",
+      "Bash(sed -i 's#/p/GREENWICH/Todo_Note#P:/GREENWICH/Todo_Note#' /tmp/tzcheck.ts && npx tsx /tmp/tzcheck.ts)"
     ]
   }
 }

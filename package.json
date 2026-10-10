@@ -12,6 +12,7 @@
     "db:clean-test": "tsx src/scripts/clean-test-data.ts",
     "admin:hash": "tsx src/scripts/hash-password.ts",
     "notify:test": "tsx src/scripts/notify-test.ts",
+    "notify:job-test": "tsx src/scripts/notify-job-test.ts",
     "devices:cleanup": "tsx src/scripts/cleanup-stale-devices.ts"
   },
   "repository": {

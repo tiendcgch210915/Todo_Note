@@ -1,49 +1,31 @@
 import type { FastifyBaseLogger } from "fastify";
 import { env } from "../config/env.js";
-import {
-  getVietnamNowParts,
-  VIETNAM_TIME_ZONE,
-} from "../utils/vietnam-time.js";
 import { isPushConfigured } from "./firebase.js";
-import {
-  sendEveningNotifications,
-  sendMorningNotifications,
-  sendTodoReminderNotifications,
-} from "./notifications.js";
+import { runTick } from "./notification-tick.js";
 
 let interval: NodeJS.Timeout | null = null;
 let running = false;
 
-export const runNotificationTick = async (
-  now: Date = new Date()
-): Promise<void> => {
-  const { date, hhmm } = getVietnamNowParts(now);
-
-  if (hhmm === "08:00") {
-    await sendMorningNotifications(date);
-  }
-  if (hhmm === "17:00") {
-    await sendEveningNotifications(date);
-  }
-
-  await sendTodoReminderNotifications(date, hhmm);
-};
-
+/**
+ * Bộ hẹn giờ trong tiến trình: gọi `runTick` mỗi 60 giây khi NOTIFY_INPROCESS_TICK=true.
+ * Chỉ hoạt động khi instance đang thức; Render free ngủ khi rảnh nên vẫn cần cron bên ngoài
+ * gọi POST /internal/notifications/tick. Chạy cả hai cùng lúc hoặc nhiều instance đều an toàn
+ * vì mỗi job chỉ một bên giành được.
+ */
 export const startNotificationScheduler = (
   logger: FastifyBaseLogger
 ): void => {
-  if (!env.NOTIFICATIONS_ENABLED) {
+  if (!env.NOTIFY_INPROCESS_TICK) {
     logger.info(
-      { timezone: VIETNAM_TIME_ZONE },
-      "Notification scheduler disabled"
+      "In-process notification tick disabled (set NOTIFY_INPROCESS_TICK=true or call POST /internal/notifications/tick)"
     );
     return;
   }
   if (interval) return;
 
-  if (!isPushConfigured()) {
+  if (!env.NOTIFY_DRY_RUN && !isPushConfigured()) {
     logger.warn(
-      "NOTIFICATIONS_ENABLED=true but Firebase credentials are not loaded (check GOOGLE_APPLICATION_CREDENTIALS); pushes will be skipped"
+      "NOTIFY_INPROCESS_TICK=true but Firebase credentials are not loaded (check GOOGLE_APPLICATION_CREDENTIALS); jobs stay pending until push is configured"
     );
   }
 
@@ -51,7 +33,14 @@ export const startNotificationScheduler = (
     if (running) return;
     running = true;
     try {
-      await runNotificationTick();
+      const summary = await runTick({ dryRun: env.NOTIFY_DRY_RUN, logger });
+      const worked =
+        summary.planned +
+        summary.backfilled +
+        summary.claimed +
+        summary.missed +
+        summary.recovered;
+      if (worked > 0) logger.info(summary, "Notification tick");
     } catch (error) {
       logger.error({ err: error }, "Notification scheduler tick failed");
     } finally {
@@ -66,8 +55,8 @@ export const startNotificationScheduler = (
   void tick();
 
   logger.info(
-    { timezone: VIETNAM_TIME_ZONE },
-    "Notification scheduler started"
+    { dryRun: env.NOTIFY_DRY_RUN },
+    "Notification in-process tick started"
   );
 };
 

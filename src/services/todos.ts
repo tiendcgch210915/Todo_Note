@@ -3,6 +3,7 @@ import * as tagsRepo from "../repositories/tags.js";
 import { addDays } from "../utils/time.js";
 import { autoLogHabitForCompletedTodo } from "./todo-habit-logs.js";
 import { ensurePastTodoDayClosedForMutation } from "./daily-todo-logs.js";
+import * as notificationTriggers from "./notification-triggers.js";
 import type {
   CreateTodoInput,
   UpdateTodoInput,
@@ -212,6 +213,7 @@ const createNextRecurringTodo = (
       occurrence.id,
       userId
     );
+    await notificationTriggers.onTodoChanged(userId, occurrence.id);
     return occurrence;
   });
 
@@ -232,6 +234,7 @@ const parkGeneratedNextOccurrence = (
       const next = slot?.existing;
       if (next && next.status === "open" && next.parent_id === null) {
         await todosRepo.parkRecurringOccurrence(next.id, userId);
+        await notificationTriggers.onTodoChanged(userId, next.id);
       }
     }
   );
@@ -333,6 +336,8 @@ export const createTodo = async (
     const ok = await todosRepo.replaceTodoTags(todo.id, tagIds, userId);
     if (!ok) throw new ServiceError("not_found");
   }
+
+  await notificationTriggers.onTodoChanged(userId, todo.id);
 
   const detail = await todosRepo.getTodoWithRelations(todo.id, userId);
   if (!detail) throw new ServiceError("not_found");
@@ -445,6 +450,7 @@ export const updateTodo = async (
     }
     const withTags = await todosRepo.getTodoWithTags(id, userId);
     if (!withTags) throw new ServiceError("not_found");
+    await notificationTriggers.onTodoChanged(userId, id);
     return withTags;
   } catch (e) {
     return wrapRepo(e);
@@ -469,6 +475,7 @@ export const deleteTodo = async (
       deletedAt
     );
     if (!result) throw new ServiceError("not_found");
+    await notificationTriggers.onTodosRemoved(userId, result.deleted_ids);
 
     if (
       scope === "this" &&
@@ -505,6 +512,7 @@ export const completeTodo = async (
   if (completedNow) {
     await autoLogHabitForCompletedTodo(userId, todo);
   }
+  await notificationTriggers.onTodoChanged(userId, id);
   const triggered_todos = await todosRepo.listTriggeredTodos(id, userId);
   return { todo, triggered_todos, next_recurring_todo };
 };
@@ -519,6 +527,7 @@ export const uncompleteTodo = async (
 
   const todo = await todosRepo.uncompleteTodo(id, userId);
   if (!todo) throw new ServiceError("not_found");
+  await notificationTriggers.onTodoChanged(userId, id);
   if (
     before.status === "done" &&
     todo.recurrence_type !== null &&
@@ -597,6 +606,7 @@ export const moveToDay = async (
       row = await todosRepo.setSingleFrogForDay(id, userId, body.date);
       if (!row) throw new ServiceError("not_found");
     }
+    await notificationTriggers.onTodoChanged(userId, id);
     return row;
   } catch (e) {
     return wrapRepo(e);
