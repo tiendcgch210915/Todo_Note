@@ -2,6 +2,7 @@ import * as tplRepo from "../repositories/checklist-templates.js";
 import * as catRepo from "../repositories/checklist-categories.js";
 import * as runsRepo from "../repositories/checklist-runs.js";
 import * as notificationTriggers from "./notification-triggers.js";
+import { findScheduleView, type ScheduleView } from "./checklist-schedules.js";
 import type {
   CreateCategoryInput,
   UpdateCategoryInput,
@@ -149,6 +150,19 @@ export const getTemplateDetail = async (
   return { template, items };
 };
 
+/** Chi tiết checklist kèm lịch của người dùng (null nếu chưa đặt lịch). */
+export const getTemplateDetailWithSchedule = async (
+  userId: string,
+  id: string
+): Promise<{
+  template: tplRepo.TemplateRow;
+  items: tplRepo.ItemRow[];
+  schedule: ScheduleView | null;
+}> => {
+  const detail = await getTemplateDetail(userId, id);
+  return { ...detail, schedule: await findScheduleView(userId, id) };
+};
+
 export const createTemplate = async (
   userId: string,
   input: CreateTemplateInput
@@ -192,6 +206,8 @@ export const updateTemplate = async (
 export const deleteTemplate = async (userId: string, id: string): Promise<void> => {
   const ok = await tplRepo.softDeleteUserTemplate(id, userId);
   if (!ok) throw new ServiceError("not_found");
+  // Lịch của checklist bị xóa lan theo; job checklist_due còn chờ phải được hủy.
+  await notificationTriggers.onChecklistScheduleChanged(userId, id);
 };
 
 export const reorderTemplates = async (

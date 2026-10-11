@@ -34,6 +34,8 @@ const NOT_NULL: Record<string, string[]> = {
   checklist_template_items: ["id", "template_id", "position", "title", "created_at", "updated_at"],
   checklist_runs: ["id", "template_id", "user_id", "status", "started_at", "created_at", "updated_at"],
   checklist_run_items: ["id", "run_id", "template_item_id", "status", "created_at", "updated_at"],
+  checklist_schedules: ["id", "user_id", "template_id", "start_date", "time", "enabled", "created_at", "updated_at"],
+  checklist_schedule_overrides: ["id", "user_id", "template_id", "local_date", "time", "created_at", "updated_at"],
 };
 
 // ── REQUIRED KEYS per entity type (must be present even if null) ─────────────
@@ -57,6 +59,11 @@ const REQUIRED_KEYS: Record<string, string[]> = {
   checklist_template_items: ["id", "template_id", "position", "title", "description", "is_required", "created_at", "updated_at", "deleted_at"],
   checklist_runs: ["id", "template_id", "user_id", "name", "status", "started_at", "completed_at", "duration_ms", "created_at", "updated_at", "deleted_at"],
   checklist_run_items: ["id", "run_id", "template_item_id", "status", "completed_at", "note", "created_at", "updated_at", "deleted_at"],
+  checklist_schedules: [
+    "id", "user_id", "template_id", "start_date", "time", "recurrence_type", "recurrence_interval",
+    "recurrence_days_of_week", "recurrence_end_date", "enabled", "created_at", "updated_at", "deleted_at",
+  ],
+  checklist_schedule_overrides: ["id", "user_id", "template_id", "local_date", "time", "created_at", "updated_at", "deleted_at"],
 };
 
 async function createTestData(userId: string): Promise<void> {
@@ -131,6 +138,21 @@ async function createTestData(userId: string): Promise<void> {
           VALUES (?,?,?,?,?,?)`,
     args: [orderId, userId, tplId, 1, now, now],
   });
+  await turso.batch([
+    {
+      sql: `INSERT INTO checklist_schedules
+            (id, user_id, template_id, start_date, time, recurrence_type, recurrence_interval,
+             recurrence_days_of_week, recurrence_end_date, enabled, created_at, updated_at)
+            VALUES (?,?,?,?,?,'weekly',1,'1,3,5',NULL,1,?,?)`,
+      args: [newId(), userId, tplId, now.slice(0, 10), "07:30", now, now],
+    },
+    {
+      sql: `INSERT INTO checklist_schedule_overrides
+            (id, user_id, template_id, local_date, time, created_at, updated_at)
+            VALUES (?,?,?,?,?,?,?)`,
+      args: [newId(), userId, tplId, now.slice(0, 10), "08:15", now, now],
+    },
+  ], "write");
   const item1 = newId(); const item2 = newId();
   await turso.batch([
     {

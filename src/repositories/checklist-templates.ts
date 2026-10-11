@@ -164,10 +164,24 @@ export const updateSystemTemplate = async (
 
 export const softDeleteSystemTemplate = async (id: string): Promise<void> => {
   const now = nowISO();
-  await turso.execute({
-    sql: "UPDATE checklist_templates SET deleted_at = ?, updated_at = ? WHERE id = ? AND is_system = 1 AND deleted_at IS NULL",
-    args: [now, now, id],
-  });
+  // Lịch của mọi người dùng trên mẫu hệ thống này cũng hết nghĩa (job còn chờ sẽ tự bị hủy khi gửi).
+  await turso.batch(
+    [
+      {
+        sql: "UPDATE checklist_templates SET deleted_at = ?, updated_at = ? WHERE id = ? AND is_system = 1 AND deleted_at IS NULL",
+        args: [now, now, id],
+      },
+      {
+        sql: "UPDATE checklist_schedules SET deleted_at = ?, updated_at = ? WHERE template_id = ? AND deleted_at IS NULL",
+        args: [now, now, id],
+      },
+      {
+        sql: "UPDATE checklist_schedule_overrides SET deleted_at = ?, updated_at = ? WHERE template_id = ? AND deleted_at IS NULL",
+        args: [now, now, id],
+      },
+    ],
+    "write"
+  );
 };
 
 export const addItem = async (
@@ -454,6 +468,18 @@ export const softDeleteUserTemplate = async (
       },
       {
         sql: `UPDATE checklist_template_orders
+              SET deleted_at = ?, updated_at = ?
+              WHERE template_id = ? AND user_id = ? AND deleted_at IS NULL`,
+        args: [now, now, id, userId],
+      },
+      {
+        sql: `UPDATE checklist_schedules
+              SET deleted_at = ?, updated_at = ?
+              WHERE template_id = ? AND user_id = ? AND deleted_at IS NULL`,
+        args: [now, now, id, userId],
+      },
+      {
+        sql: `UPDATE checklist_schedule_overrides
               SET deleted_at = ?, updated_at = ?
               WHERE template_id = ? AND user_id = ? AND deleted_at IS NULL`,
         args: [now, now, id, userId],

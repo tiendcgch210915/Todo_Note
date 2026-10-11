@@ -5,10 +5,12 @@ import {
   DIGEST_KINDS,
   EVENT_KINDS,
   NOTIFICATION_KINDS,
+  OCCURRENCE_KINDS,
   type DigestKind,
   type EventKind,
   type NotificationJobKind,
   type NotificationJobStatus,
+  type OccurrenceKind,
 } from "../config/notification-policy.js";
 
 export type JobRow = {
@@ -37,6 +39,18 @@ const sqlList = (values: readonly string[]): string =>
 // Các giá trị này là hằng số trong mã nguồn, không phải dữ liệu người dùng.
 const EVENT_KIND_SQL = sqlList(EVENT_KINDS);
 const DIGEST_KIND_SQL = sqlList(DIGEST_KINDS);
+const OCCURRENCE_KIND_SQL = sqlList(OCCURRENCE_KINDS);
+
+/**
+ * Khi upsert đè lên một dòng có sẵn: giữ nguyên trạng thái nếu run_at (và đích) không đổi và job
+ * đã sent/failed/missed, hoặc job đang processing. Còn lại thì đặt lại pending.
+ */
+const KEEP_STATE_SQL = `(
+      (notification_jobs.run_at = excluded.run_at
+        AND COALESCE(notification_jobs.target_device_id, '') = COALESCE(excluded.target_device_id, '')
+        AND notification_jobs.status IN ('sent', 'processing', 'failed', 'missed'))
+      OR notification_jobs.status = 'processing'
+    )`;
 
 const placeholders = (n: number): string =>
   Array.from({ length: n }, () => "?").join(", ");
@@ -140,12 +154,7 @@ export const upsertEventJob = async (input: {
   targetDeviceId?: string | null;
   localDate?: string | null;
 }): Promise<void> => {
-  const keep = `(
-      (notification_jobs.run_at = excluded.run_at
-        AND COALESCE(notification_jobs.target_device_id, '') = COALESCE(excluded.target_device_id, '')
-        AND notification_jobs.status IN ('sent', 'processing', 'failed', 'missed'))
-      OR notification_jobs.status = 'processing'
-    )`;
+  const keep = KEEP_STATE_SQL;
   await turso.execute({
     sql: `INSERT INTO notification_jobs
           (id, user_id, kind, ref_id, target_device_id, local_date, run_at,
@@ -282,6 +291,118 @@ export const updatePendingRunAt = async (
     args: [runAt, id],
   });
   return res.rowsAffected > 0;
+};
+
+// ── Job theo lần xuất hiện của lịch (checklist_due) ─────────────────────────
+
+/**
+ * Tạo hoặc sửa job của MỘT lần xuất hiện: duy nhất theo (user, kind, ref_id, local_date).
+ * Quy tắc giữ trạng thái giống `upsertEventJob`.
+ */
+export const upsertOccurrenceJob = async (input: {
+  userId: string;
+  kind: OccurrenceKind;
+  refId: string;
+  localDate: string;
+  runAt: string;
+}): Promise<void> => {
+  const keep = KEEP_STATE_SQL;
+  await turso.execute({
+    sql: `INSERT INTO notification_jobs
+          (id, user_id, kind, ref_id, target_device_id, local_date, run_at,
+           status, attempts, created_at)
+          VALUES (?, ?, ?, ?, NULL, ?, ?, 'pending', 0, ?)
+          ON CONFLICT(user_id, kind, ref_id, local_date) WHERE kind IN (${OCCURRENCE_KIND_SQL})
+          DO UPDATE SET
+            status = CASE WHEN ${keep} THEN notification_jobs.status ELSE 'pending' END,
+            attempts = CASE WHEN ${keep} THEN notification_jobs.attempts ELSE 0 END,
+            locked_at = CASE WHEN ${keep} THEN notification_jobs.locked_at ELSE NULL END,
+            sent_at = CASE WHEN ${keep} THEN notification_jobs.sent_at ELSE NULL END,
+            run_at = excluded.run_at`,
+    args: [
+      newId(),
+      input.userId,
+      input.kind,
+      input.refId,
+      input.localDate,
+      input.runAt,
+      nowISO(),
+    ],
+  });
+};
+
+export const getOccurrenceJob = async (
+  userId: string,
+  kind: OccurrenceKind,
+  refId: string,
+  localDate: string
+): Promise<JobRow | null> => {
+  const res = await turso.execute({
+    sql: `SELECT ${COLUMNS} FROM notification_jobs
+          WHERE user_id = ? AND kind = ? AND ref_id = ? AND local_date = ?`,
+    args: [userId, kind, refId, localDate],
+  });
+  if (res.rows.length === 0) return null;
+  return mapJob(res.rows[0] as unknown as Record<string, unknown>);
+};
+
+export type ExistingOccurrenceJob = {
+  user_id: string;
+  ref_id: string;
+  local_date: string;
+  run_at: string;
+  status: NotificationJobStatus;
+};
+
+/** Job `kind` đã có của các người dùng trong các ngày địa phương `dates` (planner đọc trước khi ghi). */
+export const listOccurrenceJobsForUsers = async (
+  userIds: readonly string[],
+  kind: OccurrenceKind,
+  dates: readonly string[]
+): Promise<ExistingOccurrenceJob[]> => {
+  const out: ExistingOccurrenceJob[] = [];
+  if (userIds.length === 0 || dates.length === 0) return out;
+  for (const part of chunks(userIds, 200)) {
+    const res = await turso.execute({
+      sql: `SELECT user_id, ref_id, local_date, run_at, status FROM notification_jobs
+            WHERE kind = ? AND local_date IN (${placeholders(dates.length)})
+              AND user_id IN (${placeholders(part.length)})`,
+      args: [kind, ...dates, ...part],
+    });
+    for (const row of res.rows as unknown as Record<string, unknown>[]) {
+      out.push({
+        user_id: row.user_id as string,
+        ref_id: row.ref_id as string,
+        local_date: row.local_date as string,
+        run_at: row.run_at as string,
+        status: row.status as NotificationJobStatus,
+      });
+    }
+  }
+  return out;
+};
+
+/**
+ * Hủy job pending/processing của một checklist TRỪ các ngày còn hợp lệ (`keepDates`).
+ * Dùng cách này thay vì hủy hết rồi tạo lại để không có khoảng hở mà vòng nhanh có thể lọt vào.
+ */
+export const cancelOccurrenceJobsExcept = async (
+  userId: string,
+  kind: OccurrenceKind,
+  refId: string,
+  keepDates: readonly string[]
+): Promise<number> => {
+  const keep =
+    keepDates.length > 0
+      ? `AND local_date NOT IN (${placeholders(keepDates.length)})`
+      : "";
+  const res = await turso.execute({
+    sql: `UPDATE notification_jobs SET status = 'cancelled'
+          WHERE user_id = ? AND kind = ? AND ref_id = ?
+            AND status IN ('pending', 'processing') ${keep}`,
+    args: [userId, kind, refId, ...keepDates],
+  });
+  return res.rowsAffected;
 };
 
 // ── Hủy ──────────────────────────────────────────────────────────────────────

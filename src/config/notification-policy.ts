@@ -17,9 +17,20 @@ export const DIGEST_KINDS = [
   "digest_habits",
 ] as const;
 
-export const NOTIFICATION_KINDS = [...EVENT_KINDS, ...DIGEST_KINDS] as const;
+/**
+ * Job theo LẦN XUẤT HIỆN của lịch checklist: mỗi checklist có thể có một job cho mỗi ngày địa
+ * phương, nên duy nhất theo (user, kind, ref_id = id checklist, local_date).
+ */
+export const OCCURRENCE_KINDS = ["checklist_due"] as const;
+
+export const NOTIFICATION_KINDS = [
+  ...EVENT_KINDS,
+  ...OCCURRENCE_KINDS,
+  ...DIGEST_KINDS,
+] as const;
 
 export type EventKind = (typeof EVENT_KINDS)[number];
+export type OccurrenceKind = (typeof OCCURRENCE_KINDS)[number];
 export type DigestKind = (typeof DIGEST_KINDS)[number];
 export type NotificationJobKind = (typeof NOTIFICATION_KINDS)[number];
 
@@ -42,6 +53,7 @@ export const LATENESS_MS: Record<NotificationJobKind, number> = {
   todo_reminder: 30 * MINUTE,
   todo_timer_end: 5 * MINUTE,
   checklist_30m: 15 * MINUTE,
+  checklist_due: 30 * MINUTE,
   digest_morning: 2 * HOUR,
   digest_todos: 2 * HOUR,
   digest_habits: 1 * HOUR,
@@ -52,6 +64,7 @@ export const TTL_MS: Record<NotificationJobKind, number> = {
   todo_reminder: 3_600_000,
   todo_timer_end: 900_000,
   checklist_30m: 1_800_000,
+  checklist_due: 3_600_000,
   digest_morning: 7_200_000,
   digest_todos: 7_200_000,
   digest_habits: 3_600_000,
@@ -62,6 +75,7 @@ export const CHANNEL_ID: Record<NotificationJobKind, string> = {
   todo_reminder: "todo_reminders",
   todo_timer_end: "todo_timer",
   checklist_30m: "checklist_reminders",
+  checklist_due: "checklist_reminders",
   digest_morning: "daily_digest",
   digest_todos: "daily_digest",
   digest_habits: "daily_digest",
@@ -72,6 +86,7 @@ export const DATA_TYPE: Record<NotificationJobKind, string> = {
   todo_reminder: "todo",
   todo_timer_end: "todo_timer_end",
   checklist_30m: "checklist",
+  checklist_due: "checklist_due",
   digest_morning: "digest_morning",
   digest_todos: "digest_todos",
   digest_habits: "digest_habits",

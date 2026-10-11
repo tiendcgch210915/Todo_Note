@@ -15,9 +15,21 @@ import {
   UpdateRunItemSchema,
   ListRunsQuerySchema,
 } from "../../../schemas/api/checklists.js";
+import {
+  OccurrenceDateParamSchema,
+  OccurrencesQuerySchema,
+  PutChecklistScheduleSchema,
+  PutOccurrenceSchema,
+} from "../../../schemas/api/checklist-schedules.js";
 import * as checklists from "../../../services/checklists.js";
+import * as schedules from "../../../services/checklist-schedules.js";
 
 const mapErr = (e: unknown, reply: FastifyReply): FastifyReply => {
+  if (e instanceof schedules.ScheduleServiceError) {
+    if (e.code === "not_found") return reply.code(404).send({ error: "not_found" });
+    if (e.code === "not_an_occurrence")
+      return reply.code(400).send({ error: "not_an_occurrence" });
+  }
   if (e instanceof checklists.ServiceError) {
     if (e.code === "not_found") return reply.code(404).send({ error: "not_found" });
     if (e.code === "duplicate") return reply.code(409).send({ error: "duplicate" });
@@ -126,7 +138,7 @@ export default async function checklistsRoutes(app: FastifyInstance) {
 
   app.get<{ Params: { id: string } }>("/templates/:id", async (req, reply) => {
     try {
-      return await checklists.getTemplateDetail(req.userId, req.params.id);
+      return await checklists.getTemplateDetailWithSchedule(req.userId, req.params.id);
     } catch (e) {
       return mapErr(e, reply);
     }
@@ -250,6 +262,95 @@ export default async function checklistsRoutes(app: FastifyInstance) {
       }
     }
   );
+
+  // ===== Schedules (lịch lặp + thông báo đúng giờ) =====
+
+  app.get<{ Params: { id: string } }>("/templates/:id/schedule", async (req, reply) => {
+    try {
+      return { schedule: await schedules.getSchedule(req.userId, req.params.id) };
+    } catch (e) {
+      return mapErr(e, reply);
+    }
+  });
+
+  app.put<{ Params: { id: string } }>("/templates/:id/schedule", async (req, reply) => {
+    const parsed = PutChecklistScheduleSchema.safeParse(req.body);
+    if (!parsed.success) {
+      return reply
+        .code(400)
+        .send({ error: "bad_input", issues: parsed.error.issues });
+    }
+    try {
+      const schedule = await schedules.putSchedule(req.userId, req.params.id, parsed.data);
+      return { schedule };
+    } catch (e) {
+      return mapErr(e, reply);
+    }
+  });
+
+  app.delete<{ Params: { id: string } }>("/templates/:id/schedule", async (req, reply) => {
+    try {
+      await schedules.deleteSchedule(req.userId, req.params.id);
+      return reply.code(204).send();
+    } catch (e) {
+      return mapErr(e, reply);
+    }
+  });
+
+  app.put<{ Params: { id: string; date: string } }>(
+    "/templates/:id/occurrences/:date",
+    async (req, reply) => {
+      const date = OccurrenceDateParamSchema.safeParse(req.params);
+      const body = PutOccurrenceSchema.safeParse(req.body);
+      if (!date.success || !body.success) {
+        const issues = [
+          ...(date.success ? [] : date.error.issues),
+          ...(body.success ? [] : body.error.issues),
+        ];
+        return reply.code(400).send({ error: "bad_input", issues });
+      }
+      try {
+        return await schedules.putOccurrence(
+          req.userId,
+          req.params.id,
+          date.data.date,
+          body.data.time
+        );
+      } catch (e) {
+        return mapErr(e, reply);
+      }
+    }
+  );
+
+  app.delete<{ Params: { id: string; date: string } }>(
+    "/templates/:id/occurrences/:date",
+    async (req, reply) => {
+      const date = OccurrenceDateParamSchema.safeParse(req.params);
+      if (!date.success) {
+        return reply
+          .code(400)
+          .send({ error: "bad_input", issues: date.error.issues });
+      }
+      try {
+        await schedules.deleteOccurrence(req.userId, req.params.id, date.data.date);
+        return reply.code(204).send();
+      } catch (e) {
+        return mapErr(e, reply);
+      }
+    }
+  );
+
+  // Nguồn sự thật duy nhất cho việc mở rộng lịch (tối đa 62 ngày).
+  app.get("/occurrences", async (req, reply) => {
+    const parsed = OccurrencesQuerySchema.safeParse(req.query);
+    if (!parsed.success) {
+      return reply
+        .code(400)
+        .send({ error: "bad_input", issues: parsed.error.issues });
+    }
+    const items = await schedules.listOccurrences(req.userId, parsed.data.from, parsed.data.to);
+    return { items };
+  });
 
   // ===== Runs =====
 

@@ -22,6 +22,8 @@ export type EntityType =
   | "checklist_template_item"
   | "checklist_run"
   | "checklist_run_item"
+  | "checklist_schedule"
+  | "checklist_schedule_override"
   | "user";
 
 // ── Association bundles (pre-fetched in bulk by sync.repo) ──────────────────
@@ -223,6 +225,35 @@ export type SyncChecklistRunItem = {
   deleted_at: string | null;
 };
 
+/** Lịch lặp của một checklist cho một người dùng; tên trường lặp giống hệt todo. */
+export type SyncChecklistSchedule = {
+  id: string;
+  user_id: string;
+  template_id: string;
+  start_date: string;
+  time: string;
+  recurrence_type: "daily" | "weekly" | "custom" | null;
+  recurrence_interval: number | null;
+  recurrence_days_of_week: string | null;
+  recurrence_end_date: string | null;
+  enabled: boolean;
+  created_at: string;
+  updated_at: string;
+  deleted_at: string | null;
+};
+
+/** Đổi giờ của MỘT ngày trong lịch. */
+export type SyncChecklistScheduleOverride = {
+  id: string;
+  user_id: string;
+  template_id: string;
+  local_date: string;
+  time: string;
+  created_at: string;
+  updated_at: string;
+  deleted_at: string | null;
+};
+
 export type SyncUser = {
   id: string;
   email: string;
@@ -355,6 +386,13 @@ export function toSyncEntity(
       };
     }
 
+    case "checklist_schedule": {
+      return {
+        ...row,
+        enabled: toBool(row.enabled),
+      };
+    }
+
     case "checklist_template_item": {
       // Defensive: created_at/updated_at existed before 0005 but may be
       // null on rows where the original INSERT omitted them (very old data).
@@ -467,6 +505,11 @@ export function fromSyncEntity(
     case "checklist_template": {
       // is_system already stripped as server-only — defensive: remove if somehow present
       if ("is_required" in stripped) stripped.is_required = fromBool(stripped.is_required);
+      break;
+    }
+
+    case "checklist_schedule": {
+      if ("enabled" in stripped) stripped.enabled = fromBool(stripped.enabled);
       break;
     }
 

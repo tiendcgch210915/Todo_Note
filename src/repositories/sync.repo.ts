@@ -31,6 +31,8 @@ export type SyncChanges = {
   checklist_template_items: Record<string, unknown>[];
   checklist_runs: Record<string, unknown>[];
   checklist_run_items: Record<string, unknown>[];
+  checklist_schedules: Record<string, unknown>[];
+  checklist_schedule_overrides: Record<string, unknown>[];
 };
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
@@ -186,6 +188,7 @@ export const getChangesSince = async (
     habitsRes, habitLogsRes, categoriesRes, templatesRes, templateOrdersRes,
     templateItemsRes,
     runsRes, runItemsRes,
+    schedulesRes, scheduleOverridesRes,
   ] = await Promise.all([
     runSyncQuery("users", turso.execute({
       sql: isInitial
@@ -291,6 +294,26 @@ export const getChangesSince = async (
            JOIN checklist_runs r ON r.id = ri.run_id
            WHERE r.user_id = ? AND ri.updated_at > ?
            ORDER BY ri.updated_at DESC`,
+      args: a1,
+    })),
+    runSyncQuery("checklist_schedules", turso.execute({
+      sql: isInitial
+        ? `SELECT * FROM checklist_schedules
+           WHERE user_id = ? AND deleted_at IS NULL
+           ORDER BY updated_at DESC`
+        : `SELECT * FROM checklist_schedules
+           WHERE user_id = ? AND updated_at > ?
+           ORDER BY updated_at DESC`,
+      args: a1,
+    })),
+    runSyncQuery("checklist_schedule_overrides", turso.execute({
+      sql: isInitial
+        ? `SELECT * FROM checklist_schedule_overrides
+           WHERE user_id = ? AND deleted_at IS NULL
+           ORDER BY updated_at DESC`
+        : `SELECT * FROM checklist_schedule_overrides
+           WHERE user_id = ? AND updated_at > ?
+           ORDER BY updated_at DESC`,
       args: a1,
     })),
   ]);
@@ -421,6 +444,13 @@ export const getChangesSince = async (
     (r) => toSyncEntity(r, "checklist_run_item")
   );
 
+  const checklist_schedules = (
+    schedulesRes.rows as unknown as Record<string, unknown>[]
+  ).map((r) => toSyncEntity(r, "checklist_schedule"));
+  const checklist_schedule_overrides = (
+    scheduleOverridesRes.rows as unknown as Record<string, unknown>[]
+  ).map((r) => toSyncEntity(r, "checklist_schedule_override"));
+
   return {
     users,
     tags,
@@ -434,6 +464,8 @@ export const getChangesSince = async (
     checklist_template_items,
     checklist_runs,
     checklist_run_items,
+    checklist_schedules,
+    checklist_schedule_overrides,
   };
 };
 
@@ -453,6 +485,8 @@ export const getEntityUpdatedAt = async (
     checklist_category: "checklist_categories",
     checklist_template: "checklist_templates",
     checklist_template_order: "checklist_template_orders",
+    checklist_schedule: "checklist_schedules",
+    checklist_schedule_override: "checklist_schedule_overrides",
     checklist_template_item: "checklist_template_items",
     checklist_run: "checklist_runs",
     checklist_run_item: "checklist_run_items",
@@ -756,6 +790,89 @@ export const upsertEntity = async (
       break;
     }
 
+    case "checklist_schedule": {
+      // Chỉ lên lịch cho checklist nhìn thấy được (của người dùng hoặc mẫu hệ thống).
+      const visible = await turso.execute({
+        sql: `SELECT 1 FROM checklist_templates
+              WHERE id = ? AND deleted_at IS NULL
+                AND (is_system = 1 OR (is_system = 0 AND user_id = ?))`,
+        args: dbArgs([p.template_id, userId]),
+      });
+      if (visible.rows.length === 0) break;
+
+      // Mỗi (user, checklist) tối đa một lịch: gộp vào dòng sẵn có (kể cả khác id), nhưng chỉ khi
+      // bản đẩy lên không cũ hơn dòng đó (Last-Write-Wins).
+      const existing = await turso.execute({
+        sql: `SELECT id, updated_at FROM checklist_schedules
+              WHERE user_id = ? AND (id = ? OR template_id = ?)
+              ORDER BY (id = ?) DESC LIMIT 1`,
+        args: dbArgs([userId, p.id, p.template_id, p.id]),
+      });
+      const fields = [
+        p.start_date, p.time, p.recurrence_type ?? null, p.recurrence_interval ?? null,
+        p.recurrence_days_of_week ?? null, p.recurrence_end_date ?? null, p.enabled ?? 1,
+      ];
+
+      if (existing.rows.length > 0) {
+        const row = existing.rows[0] as unknown as { id: string; updated_at: string };
+        if (row.updated_at > updatedAt) break;
+        await turso.execute({
+          sql: `UPDATE checklist_schedules
+                SET template_id = ?, start_date = ?, time = ?, recurrence_type = ?,
+                    recurrence_interval = ?, recurrence_days_of_week = ?,
+                    recurrence_end_date = ?, enabled = ?, updated_at = ?, deleted_at = ?
+                WHERE id = ? AND user_id = ?`,
+          args: dbArgs([p.template_id, ...fields, updatedAt, deletedAt, row.id, userId]),
+        });
+      } else {
+        await turso.execute({
+          sql: `INSERT INTO checklist_schedules
+                (id, user_id, template_id, start_date, time, recurrence_type,
+                 recurrence_interval, recurrence_days_of_week, recurrence_end_date, enabled,
+                 created_at, updated_at, deleted_at)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+          args: dbArgs([p.id, userId, p.template_id, ...fields, createdAt, updatedAt, deletedAt]),
+        });
+      }
+      break;
+    }
+
+    case "checklist_schedule_override": {
+      const visible = await turso.execute({
+        sql: `SELECT 1 FROM checklist_templates
+              WHERE id = ? AND deleted_at IS NULL
+                AND (is_system = 1 OR (is_system = 0 AND user_id = ?))`,
+        args: dbArgs([p.template_id, userId]),
+      });
+      if (visible.rows.length === 0) break;
+
+      const existing = await turso.execute({
+        sql: `SELECT id, updated_at FROM checklist_schedule_overrides
+              WHERE user_id = ? AND (id = ? OR (template_id = ? AND local_date = ?))
+              ORDER BY (id = ?) DESC LIMIT 1`,
+        args: dbArgs([userId, p.id, p.template_id, p.local_date, p.id]),
+      });
+
+      if (existing.rows.length > 0) {
+        const row = existing.rows[0] as unknown as { id: string; updated_at: string };
+        if (row.updated_at > updatedAt) break;
+        await turso.execute({
+          sql: `UPDATE checklist_schedule_overrides
+                SET template_id = ?, local_date = ?, time = ?, updated_at = ?, deleted_at = ?
+                WHERE id = ? AND user_id = ?`,
+          args: dbArgs([p.template_id, p.local_date, p.time, updatedAt, deletedAt, row.id, userId]),
+        });
+      } else {
+        await turso.execute({
+          sql: `INSERT INTO checklist_schedule_overrides
+                (id, user_id, template_id, local_date, time, created_at, updated_at, deleted_at)
+                VALUES (?,?,?,?,?,?,?,?)`,
+          args: dbArgs([p.id, userId, p.template_id, p.local_date, p.time, createdAt, updatedAt, deletedAt]),
+        });
+      }
+      break;
+    }
+
     case "checklist_template_item": {
       await turso.execute({
         sql: `INSERT INTO checklist_template_items
@@ -921,12 +1038,43 @@ export const softDeleteEntity = async (
           sql: "UPDATE checklist_template_orders SET deleted_at = ?, updated_at = ? WHERE template_id = ? AND deleted_at IS NULL",
           args: [deletedAt, deletedAt, id],
         },
+        {
+          sql: "UPDATE checklist_schedules SET deleted_at = ?, updated_at = ? WHERE template_id = ? AND deleted_at IS NULL",
+          args: [deletedAt, deletedAt, id],
+        },
+        {
+          sql: "UPDATE checklist_schedule_overrides SET deleted_at = ?, updated_at = ? WHERE template_id = ? AND deleted_at IS NULL",
+          args: [deletedAt, deletedAt, id],
+        },
       ], "write");
       break;
     }
     case "checklist_template_order": {
       await turso.execute({
         sql: "UPDATE checklist_template_orders SET deleted_at = ?, updated_at = ? WHERE id = ?",
+        args: [deletedAt, deletedAt, id],
+      });
+      break;
+    }
+    case "checklist_schedule": {
+      // Xóa lịch thì ghi đè của nó cũng hết nghĩa.
+      await turso.batch([
+        {
+          sql: "UPDATE checklist_schedules SET deleted_at = ?, updated_at = ? WHERE id = ?",
+          args: [deletedAt, deletedAt, id],
+        },
+        {
+          sql: `UPDATE checklist_schedule_overrides SET deleted_at = ?, updated_at = ?
+                WHERE deleted_at IS NULL AND (user_id, template_id) IN
+                  (SELECT user_id, template_id FROM checklist_schedules WHERE id = ?)`,
+          args: [deletedAt, deletedAt, id],
+        },
+      ], "write");
+      break;
+    }
+    case "checklist_schedule_override": {
+      await turso.execute({
+        sql: "UPDATE checklist_schedule_overrides SET deleted_at = ?, updated_at = ? WHERE id = ?",
         args: [deletedAt, deletedAt, id],
       });
       break;
@@ -1241,6 +1389,12 @@ export const getEntityInfo = async (
     case "checklist_template_order":
       sql = "SELECT user_id, updated_at FROM checklist_template_orders WHERE id = ?";
       break;
+    case "checklist_schedule":
+      sql = "SELECT user_id, updated_at FROM checklist_schedules WHERE id = ?";
+      break;
+    case "checklist_schedule_override":
+      sql = "SELECT user_id, updated_at FROM checklist_schedule_overrides WHERE id = ?";
+      break;
     case "checklist_template_item":
       sql = `SELECT ct.user_id, cti.updated_at
              FROM checklist_template_items cti
@@ -1412,6 +1566,8 @@ export const getFullEntity = async (
     checklist_category: "checklist_categories",
     checklist_template: "checklist_templates",
     checklist_template_order: "checklist_template_orders",
+    checklist_schedule: "checklist_schedules",
+    checklist_schedule_override: "checklist_schedule_overrides",
     checklist_template_item: "checklist_template_items",
     checklist_run: "checklist_runs",
     checklist_run_item: "checklist_run_items",

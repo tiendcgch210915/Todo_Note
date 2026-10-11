@@ -18,6 +18,10 @@ import * as timersRepo from "../repositories/todo-timers.js";
 import * as todosRepo from "../repositories/todos.js";
 import { localDateTimeToUtc } from "../utils/time.js";
 import { pushLogger } from "./push-logger.js";
+import {
+  reconcileAllChecklistDue,
+  reconcileChecklistDue,
+} from "./checklist-due.js";
 import { recomputePendingDigests, planUser } from "./notification-planner.js";
 import { resolveSettings } from "./notification-schedule.js";
 
@@ -111,11 +115,19 @@ export const onTodosRemoved = (
  * Checklist run bắt đầu / hoàn thành / dừng / xóa (REST hoặc sync):
  * đang chạy -> job nhắc sau 30 phút kể từ started_at; ngược lại -> hủy.
  */
-export const onChecklistRunChanged = (
+export const onChecklistRunChanged = async (
   userId: string,
   runId: string
-): Promise<void> =>
-  safely("checklist_run_changed", async () => {
+): Promise<void> => {
+  await safely("checklist_run_changed", () => syncChecklist30m(userId, runId));
+  // Một run hoàn thành (hoặc bị xóa/hủy) trong ngày đổi việc lần xuất hiện của lịch đã xong hay chưa.
+  await safely("checklist_run_due", async () => {
+    const templateId = await sourcesRepo.getRunTemplateId(userId, runId);
+    if (templateId) await reconcileChecklistDue(userId, templateId);
+  });
+};
+
+const syncChecklist30m = async (userId: string, runId: string): Promise<void> => {
     const run = await sourcesRepo.getChecklistRunInfo(userId, runId);
     if (!run || run.status !== "in_progress") {
       await jobsRepo.cancelEventJobs("checklist_30m", [runId]);
@@ -132,11 +144,24 @@ export const onChecklistRunChanged = (
       refId: runId,
       runAt: new Date(runAtMs).toISOString(),
     });
-  });
+};
+
+/**
+ * Lịch của một checklist đổi (tạo/sửa/xóa/tắt, ghi đè đổi/xóa), hoặc checklist bị xóa: hủy job
+ * `checklist_due` không còn hợp lệ rồi tạo/sửa lại phần còn hợp lệ.
+ */
+export const onChecklistScheduleChanged = (
+  userId: string,
+  templateId: string
+): Promise<void> =>
+  safely("checklist_schedule_changed", () => reconcileChecklistDue(userId, templateId));
 
 /** Đổi múi giờ (API, sync, admin): dời tổng kết chưa gửi và bổ sung job còn thiếu. */
-export const onUserSettingsChanged = (userId: string): Promise<void> =>
-  safely("user_settings_changed", async () => {
+export const onUserSettingsChanged = async (userId: string): Promise<void> => {
+  await safely("user_settings_changed", async () => {
     await recomputePendingDigests(userId);
     await planUser(userId);
   });
+  // Giờ chạy của job lịch checklist phụ thuộc múi giờ nên cũng phải tính lại.
+  await safely("user_settings_checklist_due", () => reconcileAllChecklistDue(userId));
+};

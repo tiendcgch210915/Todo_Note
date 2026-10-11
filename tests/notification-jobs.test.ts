@@ -162,13 +162,37 @@ test("todo reminder is sent when the todo is still open and the time still match
 
   assert.equal(summary.sent >= 1, true);
   assert.equal(await fx.statusOf(turso, "job-reminder"), "sent");
-  const message = fake.messages.find((m) => m.notification?.title === "Đến giờ thực hiện");
+  const message = fake.messages.find((m) => m.data?.type === "todo");
   assert.ok(message);
-  assert.equal(message.notification?.body, "Uống nước");
+  assert.equal(message.notification?.title, "Uống nước");
+  // the seeded todo has no importance/urgency, so the generic body is used
+  assert.equal(message.notification?.body, "Đến giờ thực hiện");
   assert.deepEqual(message.data, { type: "todo", id: "todo-1", date: "2026-06-20" });
   assert.equal(message.android?.priority, "high");
   assert.equal(message.android?.ttl, 3_600_000);
   assert.equal(message.android?.notification?.channelId, "todo_reminders");
+});
+
+test("todo reminder body follows the todo's importance and urgency", async () => {
+  const cases: Array<[number, number, string]> = [
+    [1, 1, "Quan trọng, khẩn cấp → Làm ngay!"],
+    [1, 0, "Quan trọng → Dành thời gian làm thật tốt."],
+    [0, 1, "Khẩn cấp → Xử lý nhanh rồi chuyển việc."],
+    [0, 0, "Việc nhẹ → Làm gọn rồi tiếp tục nhé."],
+  ];
+  for (const [important, urgent, expected] of cases) {
+    await turso.execute("DELETE FROM notification_jobs");
+    await turso.execute("DELETE FROM todos");
+    await turso.execute("DELETE FROM user_devices");
+    fake.messages.length = 0;
+    await seedReminder({ id: "todo-1", isImportant: important, isUrgent: urgent });
+
+    await tick(AFTER_REMINDER);
+
+    const message = fake.messages.find((m) => m.data?.type === "todo");
+    assert.equal(message?.notification?.title, "Uống nước");
+    assert.equal(message?.notification?.body, expected, `${important}/${urgent}`);
+  }
 });
 
 test("todo reminder is cancelled, not sent, if the todo was completed, deleted or re-timed", async () => {
@@ -192,7 +216,7 @@ test("todo reminder is cancelled, not sent, if the todo was completed, deleted o
 
     assert.equal(await fx.statusOf(turso, "job-reminder"), "cancelled", label);
     assert.equal(
-      fake.messages.some((m) => m.notification?.title === "Đến giờ thực hiện"),
+      fake.messages.some((m) => m.data?.type === "todo"),
       false,
       label
     );
@@ -224,9 +248,10 @@ test("checklist reminder reports unticked steps and is cancelled when all are ti
   assert.equal(await fx.statusOf(turso, "job-cl"), "sent");
   const message = fake.messages.find((m) => m.data?.type === "checklist");
   assert.ok(message);
+  assert.equal(message.notification?.title, "Rời nhà");
   assert.equal(
     message.notification?.body,
-    "Checklist “Rời nhà” đã chạy 30 phút. Còn 2 bước chưa tick, hãy kiểm tra lại cho đầy đủ nhé."
+    "Đã chạy 30 phút · còn 2 bước chưa tick. Rà lại cho đủ nhé!"
   );
   assert.equal(message.android?.notification?.channelId, "checklist_reminders");
   assert.equal(message.android?.ttl, 1_800_000);
@@ -288,8 +313,8 @@ test("digests use live data: todo counts and habit progress for the job's local 
   await tick(QUIET);
 
   const bodies = Object.fromEntries(fake.messages.map((m) => [m.data?.type, m.notification?.body]));
-  assert.equal(bodies.digest_todos, "Bạn đã hoàn thành 1 todo rồi, còn lại 2 todo nữa vẫn đang chờ bạn.");
-  assert.equal(bodies.digest_habits, "Hôm nay bạn đã duy trì được 1/2 thói quen.");
+  assert.equal(bodies.digest_todos, "📋 Tiến độ: Bạn đã hoàn thành 1 todo rồi, còn lại 2 todo nữa vẫn đang chờ bạn.");
+  assert.equal(bodies.digest_habits, "📋 Thói quen: Hôm nay bạn đã duy trì được 1/2 thói quen.");
 });
 
 test("a job of a disabled user is cancelled, not sent", async () => {
@@ -345,6 +370,7 @@ test("the documented lateness thresholds are the configured ones", () => {
     todo_reminder: 30 * MINUTE,
     todo_timer_end: 5 * MINUTE,
     checklist_30m: 15 * MINUTE,
+    checklist_due: 30 * MINUTE,
     digest_morning: 2 * MIN,
     digest_todos: 2 * MIN,
     digest_habits: 1 * MIN,

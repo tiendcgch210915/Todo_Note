@@ -3,11 +3,12 @@
  *
  *   npm run notify:job-test -- <userId>                         # mọi loại (todo_timer_end cần --device)
  *   npm run notify:job-test -- <userId> digest_morning
+ *   npm run notify:job-test -- <userId> checklist_due           # checklist có lịch hôm nay, đúng giờ chạy
  *   npm run notify:job-test -- <userId> todo_timer_end --device <user_devices.id>
  *   npm run notify:job-test -- <userId> --cleanup               # xóa đồ thử "[TEST]"
  *
  * Vì tick kiểm tra lại điều kiện trước khi gửi, mỗi job cần dữ liệu thật phía sau. Script dựng
- * đồ thử tối thiểu tiêu đề bắt đầu bằng "[TEST]" (todo, đếm ngược, checklist) trong tài khoản đó; chúng
+ * đồ thử tối thiểu tiêu đề bắt đầu bằng "[TEST]" (todo, đếm ngược, checklist, checklist có lịch) trong tài khoản đó; chúng
  * sẽ đồng bộ xuống app như dữ liệu bình thường cho tới khi chạy --cleanup. Tổng kết hôm nay
  * (digest_*) dùng lại dòng job sẵn có của ngày hôm nay và dời nó lên +1 phút.
  *
@@ -22,6 +23,7 @@ import {
   isDigestKind,
   type NotificationJobKind,
 } from "../config/notification-policy.js";
+import * as schedulesRepo from "../repositories/checklist-schedules.js";
 import * as jobsRepo from "../repositories/notification-jobs.js";
 import * as settingsRepo from "../repositories/notification-settings.js";
 import * as devicesRepo from "../repositories/notifications.js";
@@ -95,6 +97,43 @@ const insertTestTodo = async (
   return id;
 };
 
+/** Checklist thử có 2 bước và một lịch không lặp vào `date` lúc `time` (giờ địa phương). */
+const createScheduledChecklist = async (
+  userId: string,
+  date: string,
+  time: string
+): Promise<string> => {
+  const now = nowISO();
+  const templateId = newId();
+  await turso.batch(
+    [
+      {
+        sql: `INSERT INTO checklist_templates
+              (id, user_id, title, is_system, times_used, sort_order, created_at, updated_at)
+              VALUES (?, ?, ?, 0, 0, 0, ?, ?)`,
+        args: [templateId, userId, `${TEST_PREFIX} Checklist hẹn giờ`, now, now],
+      },
+      ...[1, 2].map((n) => ({
+        sql: `INSERT INTO checklist_template_items
+              (id, template_id, position, title, is_required, created_at, updated_at)
+              VALUES (?, ?, ?, ?, 0, ?, ?)`,
+        args: [`${templateId}-${n}`, templateId, n, `Bước ${n}`, now, now],
+      })),
+    ],
+    "write"
+  );
+  await schedulesRepo.upsertSchedule(userId, templateId, {
+    start_date: date,
+    time,
+    recurrence_type: null,
+    recurrence_interval: null,
+    recurrence_days_of_week: null,
+    recurrence_end_date: null,
+    enabled: true,
+  });
+  return templateId;
+};
+
 const createChecklistRun = async (userId: string, startedAt: Date): Promise<string> => {
   const now = nowISO();
   const templateId = newId();
@@ -147,6 +186,15 @@ const cleanup = async (userId: string): Promise<void> => {
   });
   const runIds = (runs.rows as unknown as { id: string }[]).map((r) => r.id);
   await jobsRepo.cancelEventJobs("checklist_30m", runIds);
+  const templates = await turso.execute({
+    sql: "SELECT id FROM checklist_templates WHERE user_id = ? AND deleted_at IS NULL AND title LIKE ?",
+    args: [userId, `${TEST_PREFIX}%`],
+  });
+  const templateIds = (templates.rows as unknown as { id: string }[]).map((r) => r.id);
+  for (const templateId of templateIds) {
+    await jobsRepo.cancelOccurrenceJobsExcept(userId, "checklist_due", templateId, []);
+    await schedulesRepo.softDeleteSchedule(userId, templateId);
+  }
   await turso.batch(
     [
       {
@@ -259,6 +307,12 @@ const main = async (): Promise<number> => {
         const runId = await createChecklistRun(userId, new Date(target.getTime() - 30 * 60_000));
         await jobsRepo.upsertEventJob({ userId, kind, refId: runId, runAt });
         console.log(`✓ ${kind}: run thử đang chạy, còn 2 bước chưa tick.`);
+        break;
+      }
+      case "checklist_due": {
+        const templateId = await createScheduledChecklist(userId, today, time);
+        await jobsRepo.upsertOccurrenceJob({ userId, kind, refId: templateId, localDate: today, runAt });
+        console.log(`✓ ${kind}: checklist thử 2 bước, lịch một lần hôm nay lúc ${time}.`);
         break;
       }
       default: {

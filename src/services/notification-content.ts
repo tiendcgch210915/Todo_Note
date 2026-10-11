@@ -5,7 +5,18 @@
  * Quy ước: hàm trả `null` nghĩa là "không có gì để gửi" (job sẽ được hủy, không gửi).
  * Với ngày D theo múi giờ người dùng: T = số todo của ngày D, Done = số đã xong, R = T - Done,
  * H = số thói quen cần duy trì, x = số đã duy trì.
+ *
+ * Nhãn, biểu tượng và câu chữ cố định nằm ở config/notification-labels.ts.
  */
+import {
+  CHECKLIST_30M_BODY,
+  CHECKLIST_DUE_BODY,
+  DIGEST_LABELS,
+  FALLBACK_TITLE,
+  PUSH_TITLE_MAX_CHARS,
+  QUOTE,
+  TODO_REMINDER_BODY,
+} from "../config/notification-labels.js";
 import { cheerForDate, philosophyForDate } from "./notification-phrases.js";
 
 export type DigestStats = {
@@ -22,11 +33,27 @@ export type DigestStats = {
 export type NotificationText = { title: string; body: string };
 
 const MAX_TITLE_IN_BODY = 80;
-const MAX_REMINDER_BODY = 200;
 
 const clip = (text: string, max: number): string => {
   const trimmed = text.trim();
   return trimmed.length <= max ? trimmed : `${trimmed.slice(0, max - 1).trimEnd()}…`;
+};
+
+/**
+ * Chuẩn hóa tiêu đề dùng cho thông báo: Unicode NFC, bỏ xuống dòng/tab, thu gọn khoảng trắng,
+ * cắt tối đa `max` ký tự (kể cả dấu "…" khi bị cắt). Cắt theo ký tự Unicode nên không làm
+ * vỡ emoji; rỗng thì dùng `fallback`.
+ */
+export const normalizePushTitle = (
+  text: string | null | undefined,
+  fallback: string,
+  max: number = PUSH_TITLE_MAX_CHARS
+): string => {
+  const collapsed = (text ?? "").normalize("NFC").replace(/\s+/g, " ").trim();
+  const base = collapsed === "" ? fallback : collapsed;
+  const chars = Array.from(base);
+  if (chars.length <= max) return base;
+  return `${chars.slice(0, max - 1).join("").trimEnd()}…`;
 };
 
 const nonNegativeInt = (value: number): number =>
@@ -43,7 +70,17 @@ const normalize = (stats: DigestStats): DigestStats => {
   };
 };
 
-/** digest_morning: luôn gửi. Số liệu + 1 câu cổ vũ + 1 câu triết lý (chọn theo ngày). */
+/** Nối các dòng bằng "\n", bỏ qua dòng không có. */
+const lines = (...parts: Array<string | null>): string =>
+  parts.filter((part): part is string => part !== null).join("\n");
+
+/**
+ * digest_morning: luôn gửi. Hai khối cách nhau MỘT dòng trống:
+ *   📋 Nhiệm vụ: <số liệu todo + thói quen, một dòng>
+ *   (dòng trống)
+ *   💪 Động lực: “<câu cổ vũ>”
+ *   💡 Suy ngẫm: <câu triết lý>
+ */
 export const buildMorningDigest = (
   rawStats: DigestStats,
   localDate: string
@@ -65,11 +102,20 @@ export const buildMorningDigest = (
 
   return {
     title: "Chào buổi sáng",
-    body: [summary, cheerForDate(localDate), philosophyForDate(localDate)].join("\n"),
+    body: lines(
+      `${DIGEST_LABELS.tasks}${summary}`,
+      "",
+      `${DIGEST_LABELS.motivation}${QUOTE.open}${cheerForDate(localDate)}${QUOTE.close}`,
+      `${DIGEST_LABELS.reflection}${philosophyForDate(localDate)}`
+    ),
   };
 };
 
-/** digest_todos: bỏ qua (null) nếu hôm nay không có todo nào. */
+/**
+ * digest_todos: bỏ qua (null) nếu hôm nay không có todo nào.
+ *   📋 Tiến độ: <số liệu>
+ *   💪 <phần khích lệ>      (chỉ khi có)
+ */
 export const buildTodosDigest = (
   rawStats: DigestStats
 ): NotificationText | null => {
@@ -77,39 +123,84 @@ export const buildTodosDigest = (
   if (t === 0) return null;
   const remaining = t - done;
 
-  let body: string;
+  let progress: string;
+  let encouragement: string | null = null;
   if (done === 0) {
-    body = `Hôm nay chưa có todo nào hoàn thành, còn ${remaining} todo đang chờ bạn. Hãy bắt đầu bằng việc nhỏ nhất!`;
+    progress = `Hôm nay chưa có todo nào hoàn thành, còn ${remaining} todo đang chờ bạn.`;
+    encouragement = "Hãy bắt đầu bằng việc nhỏ nhất!";
   } else if (remaining > 0) {
-    body = `Bạn đã hoàn thành ${done} todo rồi, còn lại ${remaining} todo nữa vẫn đang chờ bạn.`;
+    progress = `Bạn đã hoàn thành ${done} todo rồi, còn lại ${remaining} todo nữa vẫn đang chờ bạn.`;
   } else {
-    body = `Tuyệt vời! Bạn đã hoàn thành cả ${done} todo hôm nay.`;
+    progress = `Bạn đã hoàn thành cả ${done} todo hôm nay.`;
+    encouragement = "Tuyệt vời!";
   }
-  return { title: "Tổng kết todo hôm nay", body };
+  return {
+    title: "Tổng kết todo hôm nay",
+    body: lines(
+      `${DIGEST_LABELS.progress}${progress}`,
+      encouragement === null ? null : `${DIGEST_LABELS.encouragement}${encouragement}`
+    ),
+  };
 };
 
-/** digest_habits: bỏ qua (null) nếu hôm nay không có thói quen nào cần duy trì. */
+/**
+ * digest_habits: bỏ qua (null) nếu hôm nay không có thói quen nào cần duy trì.
+ *   📋 Thói quen: <số liệu>
+ *   💪 <phần khích lệ>      (chỉ khi có)
+ */
 export const buildHabitsDigest = (
   rawStats: DigestStats
 ): NotificationText | null => {
   const { habitsTotal: h, habitsDone: x } = normalize(rawStats);
   if (h === 0) return null;
 
-  let body: string;
+  let progress: string;
+  let encouragement: string | null = null;
   if (x === 0) {
-    body =
-      "Hôm nay bạn chưa duy trì thói quen nào, vẫn còn thời gian để làm một thói quen nhỏ trước khi hết ngày!";
+    progress = "Hôm nay bạn chưa duy trì thói quen nào.";
+    encouragement = "Vẫn còn thời gian để làm một thói quen nhỏ trước khi hết ngày!";
   } else if (x < h) {
-    body = `Hôm nay bạn đã duy trì được ${x}/${h} thói quen.`;
+    progress = `Hôm nay bạn đã duy trì được ${x}/${h} thói quen.`;
   } else {
-    body = `Tuyệt vời! Bạn đã duy trì đủ ${h}/${h} thói quen hôm nay.`;
+    progress = `Bạn đã duy trì đủ ${h}/${h} thói quen hôm nay.`;
+    encouragement = "Tuyệt vời!";
   }
-  return { title: "Tổng kết thói quen", body };
+  return {
+    title: "Tổng kết thói quen",
+    body: lines(
+      `${DIGEST_LABELS.habits}${progress}`,
+      encouragement === null ? null : `${DIGEST_LABELS.encouragement}${encouragement}`
+    ),
+  };
 };
 
-export const buildTodoReminder = (todoTitle: string): NotificationText => ({
-  title: "Đến giờ thực hiện",
-  body: clip(todoTitle, MAX_REMINDER_BODY),
+type Flag = number | boolean | null | undefined;
+
+const toKnownFlag = (value: Flag): boolean | null => {
+  if (value === 1 || value === true) return true;
+  if (value === 0 || value === false) return false;
+  return null;
+};
+
+/** Nội dung nhắc todo theo (quan trọng, khẩn cấp); thiếu một trong hai thì không đoán. */
+export const todoPriorityBody = (isImportant: Flag, isUrgent: Flag): string => {
+  const important = toKnownFlag(isImportant);
+  const urgent = toKnownFlag(isUrgent);
+  if (important === null || urgent === null) return TODO_REMINDER_BODY.unknown;
+  if (important && urgent) return TODO_REMINDER_BODY.importantUrgent;
+  if (important) return TODO_REMINDER_BODY.importantOnly;
+  if (urgent) return TODO_REMINDER_BODY.urgentOnly;
+  return TODO_REMINDER_BODY.neither;
+};
+
+/** todo_reminder: tiêu đề = tiêu đề todo; nội dung = mức quan trọng/khẩn cấp. */
+export const buildTodoReminder = (
+  todoTitle: string,
+  isImportant: Flag,
+  isUrgent: Flag
+): NotificationText => ({
+  title: normalizePushTitle(todoTitle, FALLBACK_TITLE.todo),
+  body: todoPriorityBody(isImportant, isUrgent),
 });
 
 /** N = thời gian ước lượng ban đầu của đếm ngược, làm tròn theo phút (tối thiểu 1). */
@@ -132,15 +223,30 @@ export const buildTimerEnd = (
   };
 };
 
+/** checklist_due: tiêu đề = tiêu đề checklist; nội dung kèm số bước (không có bước thì bỏ phần đó). */
+export const buildChecklistDue = (
+  checklistTitle: string,
+  stepCount: number
+): NotificationText => {
+  const n = nonNegativeInt(stepCount);
+  return {
+    title: normalizePushTitle(checklistTitle, FALLBACK_TITLE.checklist),
+    body:
+      n === 0
+        ? CHECKLIST_DUE_BODY.base
+        : `${CHECKLIST_DUE_BODY.base}${CHECKLIST_DUE_BODY.stepsSeparator}${n}${CHECKLIST_DUE_BODY.stepsSuffix}`,
+  };
+};
+
 /** checklist_30m: null nếu đã tick hết (n = số bước chưa tick, tính lúc gửi). */
 export const buildChecklist30m = (
-  checklistName: string,
+  checklistTitle: string,
   pendingSteps: number
 ): NotificationText | null => {
   const n = nonNegativeInt(pendingSteps);
   if (n === 0) return null;
   return {
-    title: "Checklist đang chạy",
-    body: `Checklist “${clip(checklistName, MAX_TITLE_IN_BODY)}” đã chạy 30 phút. Còn ${n} bước chưa tick, hãy kiểm tra lại cho đầy đủ nhé.`,
+    title: normalizePushTitle(checklistTitle, FALLBACK_TITLE.checklist),
+    body: `${CHECKLIST_30M_BODY.prefix}${n}${CHECKLIST_30M_BODY.suffix}`,
   };
 };

@@ -11,6 +11,7 @@ import {
 import * as jobsRepo from "../repositories/notification-jobs.js";
 import * as settingsRepo from "../repositories/notification-settings.js";
 import { addDays, isValidTimeZone, localDateOf, localDateTimeToUtc } from "../utils/time.js";
+import { planChecklistDueForUsers } from "./checklist-due.js";
 import { digestRunAt, resolveSettings } from "./notification-schedule.js";
 
 /** Tổng kết hôm nay và ngày mai (theo múi giờ người dùng) cho một người dùng. */
@@ -76,6 +77,7 @@ export const planAllUsers = async (now: Date = new Date()): Promise<number> => {
     );
     if (users.length === 0) break;
     created += await insertMissingDigests(users, now);
+    created += await planChecklistDueForUsers(users, now);
     afterId = users[users.length - 1].user_id;
     if (users.length < DISPATCH.plannerChunkSize) break;
   }

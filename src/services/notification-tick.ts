@@ -30,8 +30,10 @@ import * as timersRepo from "../repositories/todo-timers.js";
 import * as todosRepo from "../repositories/todos.js";
 import { localDateOf, localDateTimeToUtc } from "../utils/time.js";
 import { isPushConfigured, pushLogger, type PushLogger } from "./firebase.js";
+import { checkDueForSend } from "./checklist-due.js";
 import {
   buildChecklist30m,
+  buildChecklistDue,
   buildHabitsDigest,
   buildMorningDigest,
   buildTimerEnd,
@@ -141,7 +143,11 @@ const prepare = async (job: jobsRepo.JobRow): Promise<Prepared> => {
         settings.timezone
       );
       if (expected.getTime() !== runAtMs) return CANCEL;
-      return { text: buildTodoReminder(todo.title), id: todo.id, date };
+      return {
+        text: buildTodoReminder(todo.title, todo.is_important, todo.is_urgent),
+        id: todo.id,
+        date,
+      };
     }
 
     case "todo_timer_end": {
@@ -177,11 +183,30 @@ const prepare = async (job: jobsRepo.JobRow): Promise<Prepared> => {
       if (!job.ref_id) return CANCEL;
       const run = await sourcesRepo.getChecklistRunInfo(job.user_id, job.ref_id);
       if (!run || run.status !== "in_progress") return CANCEL;
+      // Tiêu đề thông báo là tiêu đề của chính checklist (mẫu), không phải tên đặt cho lần chạy.
       const text = buildChecklist30m(
-        run.name ?? run.template_title ?? "Checklist",
+        run.template_title ?? run.name ?? "",
         run.pending_steps
       );
       return text ? { text, id: run.id, date } : CANCEL;
+    }
+
+    case "checklist_due": {
+      if (!job.ref_id || !job.local_date) return CANCEL;
+      // Checklist còn, lịch bật và còn hiệu lực cho đúng ngày, giờ khớp run_at, chưa có run xong.
+      const due = await checkDueForSend(
+        job.user_id,
+        job.ref_id,
+        job.local_date,
+        settings.timezone,
+        job.run_at
+      );
+      if (!due) return CANCEL;
+      return {
+        text: buildChecklistDue(due.template.title, due.stepCount),
+        id: due.template.id,
+        date: job.local_date,
+      };
     }
 
     case "digest_morning": {

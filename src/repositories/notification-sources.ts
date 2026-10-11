@@ -36,3 +36,16 @@ export const getChecklistRunInfo = async (
     pending_steps: Number(row.pending_steps),
   };
 };
+
+/** Checklist của một run, kể cả run vừa bị xóa mềm (hook cần biết để tính lại job theo lịch). */
+export const getRunTemplateId = async (
+  userId: string,
+  runId: string
+): Promise<string | null> => {
+  const res = await turso.execute({
+    sql: "SELECT template_id FROM checklist_runs WHERE id = ? AND user_id = ?",
+    args: [runId, userId],
+  });
+  if (res.rows.length === 0) return null;
+  return (res.rows[0] as unknown as { template_id: string }).template_id;
+};

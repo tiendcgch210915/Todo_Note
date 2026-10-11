@@ -23,6 +23,12 @@ import * as notesService from "./notes.js";
 import { autoLogHabitForCompletedTodo } from "./todo-habit-logs.js";
 import { ensurePastTodoDayClosedForMutation } from "./daily-todo-logs.js";
 import * as notificationTriggers from "./notification-triggers.js";
+import * as schedulesRepo from "../repositories/checklist-schedules.js";
+import {
+  normalizeScheduleFields,
+  ScheduleFieldsSchema,
+  ScheduleOverrideFieldsSchema,
+} from "../schemas/api/checklist-schedules.js";
 import {
   getEntityInfo,
   isSystemTemplate,
@@ -51,6 +57,48 @@ const todoDeleteScope = (
   if (raw === "future" || raw === "this_and_future") return "future";
   if (raw === "all") return "all";
   return null;
+};
+
+/**
+ * Kiểm tra và chuẩn hóa payload lịch/ghi đè checklist từ sync (cùng quy tắc với REST). Trả null
+ * nếu không hợp lệ -> thao tác báo `bad_input`.
+ */
+const normalizeSyncSchedulePayload = (
+  type: "checklist_schedule" | "checklist_schedule_override",
+  payload: Record<string, unknown>
+): Record<string, unknown> | null => {
+  if (type === "checklist_schedule") {
+    if (typeof payload.template_id !== "string" || payload.template_id === "") return null;
+    const parsed = ScheduleFieldsSchema.safeParse(payload);
+    if (!parsed.success) return null;
+    const fields = normalizeScheduleFields(parsed.data);
+    return { ...fields, enabled: fields.enabled ? 1 : 0 };
+  }
+  const parsed = ScheduleOverrideFieldsSchema.safeParse(payload);
+  return parsed.success ? parsed.data : null;
+};
+
+/** Sau khi lịch/ghi đè/checklist đổi qua sync: hủy và tạo lại job checklist_due bị ảnh hưởng. */
+const afterScheduleEntityChange = async (
+  userId: string,
+  type: string,
+  id: string,
+  payload: Record<string, unknown>
+): Promise<void> => {
+  if (type === "checklist_template") {
+    await notificationTriggers.onChecklistScheduleChanged(userId, id);
+    return;
+  }
+  if (type !== "checklist_schedule" && type !== "checklist_schedule_override") return;
+  const row =
+    type === "checklist_schedule"
+      ? await schedulesRepo.getScheduleById(id)
+      : await schedulesRepo.getOverrideById(id);
+  // Gộp theo khóa tự nhiên có thể giữ id khác id đã đẩy lên: lấy checklist từ payload nếu cần.
+  const templateId =
+    row?.template_id ??
+    (typeof payload.template_id === "string" ? payload.template_id : null);
+  if (templateId) await notificationTriggers.onChecklistScheduleChanged(userId, templateId);
 };
 
 // ── Result type ───────────────────────────────────────────────────────────────
@@ -165,6 +213,15 @@ async function processOp(
   // fromSyncEntity does NOT strip junction fields (tag_ids, note_links, etc.)
   // so we can pass the original `payload` to reconcileJunctions later.
   const dbPayload = fromSyncEntity(payload, type);
+
+  if (
+    (type === "checklist_schedule" || type === "checklist_schedule_override") &&
+    opType !== "delete"
+  ) {
+    const normalized = normalizeSyncSchedulePayload(type, payload);
+    if (!normalized) return { id, status: "error", error: "bad_input" };
+    Object.assign(dbPayload, normalized);
+  }
 
   // ── §8 System-template protection ────────────────────────────────────────
   // system templates are read-only for mobile (create is also blocked
@@ -410,6 +467,7 @@ async function processOp(
       if (type === "checklist_run") {
         await notificationTriggers.onChecklistRunChanged(userId, id);
       }
+      await afterScheduleEntityChange(userId, type, id, payload);
     }
   } else {
     await upsertEntity(userId, type, dbPayload, {
@@ -449,6 +507,13 @@ async function processOp(
 
     if (type === "checklist_run") {
       await notificationTriggers.onChecklistRunChanged(userId, id);
+    }
+    if (
+      type === "checklist_schedule" ||
+      type === "checklist_schedule_override" ||
+      (type === "checklist_template" && payload.deleted_at)
+    ) {
+      await afterScheduleEntityChange(userId, type, id, payload);
     }
     if (type === "user") {
       // The pushed user entity can change `timezone`, which moves every digest.

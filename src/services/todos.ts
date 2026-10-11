@@ -1,6 +1,6 @@
 import * as todosRepo from "../repositories/todos.js";
 import * as tagsRepo from "../repositories/tags.js";
-import { addDays } from "../utils/time.js";
+import { nextRecurrenceDateAfter } from "../utils/recurrence.js";
 import { autoLogHabitForCompletedTodo } from "./todo-habit-logs.js";
 import { ensurePastTodoDayClosedForMutation } from "./daily-todo-logs.js";
 import * as notificationTriggers from "./notification-triggers.js";
@@ -38,71 +38,24 @@ const wrapRepo = (e: unknown): never => {
   throw e;
 };
 
-const ISO_DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
-
 const hasOwn = <K extends PropertyKey>(
   obj: object,
   key: K
 ): obj is object & Record<K, unknown> =>
   Object.prototype.hasOwnProperty.call(obj, key);
 
-const safeInterval = (interval: number | null): number =>
-  interval !== null && interval > 0 ? interval : 1;
-
-const isoWeekday = (date: string): number | null => {
-  if (!ISO_DATE_RE.test(date)) return null;
-  const d = new Date(`${date}T00:00:00.000Z`);
-  if (Number.isNaN(d.getTime())) return null;
-  const day = d.getUTCDay();
-  return day === 0 ? 7 : day;
-};
-
-const parseWeekdays = (raw: string | null): number[] => {
-  if (!raw) return [];
-  return [...new Set(
-    raw
-      .split(",")
-      .map((v) => Number(v.trim()))
-      .filter((v) => Number.isInteger(v) && v >= 1 && v <= 7)
-  )].sort((a, b) => a - b);
-};
-
+// Quy tắc lặp nằm ở utils/recurrence.ts, dùng chung với lịch checklist.
 const nextRecurrenceDate = (todo: todosRepo.TodoRow): string | null => {
   if (!todo.recurrence_type || !todo.scheduled_date) return null;
-  if (!ISO_DATE_RE.test(todo.scheduled_date)) return null;
-
-  const interval = safeInterval(todo.recurrence_interval);
-  let nextDate: string;
-  if (todo.recurrence_type === "weekly") {
-    const weekdays = parseWeekdays(todo.recurrence_days_of_week);
-    const currentWeekday = isoWeekday(todo.scheduled_date);
-    if (currentWeekday === null) return null;
-
-    if (weekdays.length === 0) {
-      nextDate = addDays(todo.scheduled_date, interval * 7);
-    } else {
-      const laterThisWeek = weekdays.find((day) => day > currentWeekday);
-      if (laterThisWeek !== undefined) {
-        nextDate = addDays(todo.scheduled_date, laterThisWeek - currentWeekday);
-      } else {
-        nextDate = addDays(
-          todo.scheduled_date,
-          7 - currentWeekday + (interval - 1) * 7 + weekdays[0]
-        );
-      }
-    }
-  } else {
-    nextDate = addDays(todo.scheduled_date, interval);
-  }
-
-  if (
-    todo.recurrence_end_date &&
-    ISO_DATE_RE.test(todo.recurrence_end_date) &&
-    nextDate > todo.recurrence_end_date
-  ) {
-    return null;
-  }
-  return nextDate;
+  return nextRecurrenceDateAfter(
+    {
+      type: todo.recurrence_type,
+      interval: todo.recurrence_interval,
+      daysOfWeek: todo.recurrence_days_of_week,
+      endDate: todo.recurrence_end_date,
+    },
+    todo.scheduled_date
+  );
 };
 
 // Serialises work per recurrence series inside this process, so two requests

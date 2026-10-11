@@ -83,15 +83,33 @@ export const createNotificationTables = async (db: TestDb): Promise<void> => {
       deleted_at TEXT
     )
   `);
-  const existing = await db.execute(
-    "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'notification_jobs'"
-  );
+  await applyMigrationFileOnce(db, "0016_notification_jobs.sql", "notification_jobs");
+  // 0017 thêm bảng lịch checklist và dựng lại notification_jobs (kind checklist_due).
+  await applyMigrationFileOnce(db, "0017_checklist_schedules.sql", "checklist_schedules");
+};
+
+/**
+ * Áp dụng một migration nếu bảng `probeTable` chưa có. Test dùng DDL tay có thể thiếu bảng mà
+ * migration tham chiếu (ví dụ chỉ mục trên checklist_runs): bỏ qua riêng câu lệnh "no such table".
+ */
+const applyMigrationFileOnce = async (
+  db: TestDb,
+  file: string,
+  probeTable: string
+): Promise<void> => {
+  const existing = await db.execute({
+    sql: "SELECT name FROM sqlite_master WHERE type = 'table' AND name = ?",
+    args: [probeTable],
+  });
   if (existing.rows.length > 0) return;
-  const sql = await readFile(
-    join(MIGRATIONS_DIR, "0016_notification_jobs.sql"),
-    "utf-8"
-  );
+  const sql = await readFile(join(MIGRATIONS_DIR, file), "utf-8");
   for (const statement of parseStatements(sql)) {
-    await db.execute(statement);
+    try {
+      await db.execute(statement);
+    } catch (error) {
+      if (!/no such table/i.test(error instanceof Error ? error.message : String(error))) {
+        throw error;
+      }
+    }
   }
 };

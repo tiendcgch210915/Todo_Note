@@ -155,6 +155,62 @@ export const insertTemplateWithItems = async (
   return itemIds;
 };
 
+export const SYSTEM_USER = "00000000-0000-0000-0000-000000000001";
+
+/** Mẫu hệ thống dùng chung (is_system = 1), nhìn thấy được với mọi người dùng. */
+export const insertSystemTemplate = async (
+  db: Db,
+  row: { id: string; title?: string; itemCount?: number }
+): Promise<void> => {
+  await db.execute({
+    sql: `INSERT INTO checklist_templates
+          (id, user_id, title, is_system, times_used, sort_order, created_at, updated_at)
+          VALUES (?, ?, ?, 1, 0, 0, ?, ?)`,
+    args: [row.id, SYSTEM_USER, row.title ?? "Mẫu hệ thống", SEED_TIME, SEED_TIME],
+  });
+  for (let i = 0; i < (row.itemCount ?? 0); i++) {
+    await db.execute({
+      sql: `INSERT INTO checklist_template_items
+            (id, template_id, position, title, is_required, created_at, updated_at)
+            VALUES (?, ?, ?, ?, 0, ?, ?)`,
+      args: [`${row.id}-item-${i + 1}`, row.id, i, `Bước ${i + 1}`, SEED_TIME, SEED_TIME],
+    });
+  }
+};
+
+/** Một lần chạy checklist đã kết thúc (mặc định hoàn thành) vào thời điểm `completedAt`. */
+export const insertRun = async (
+  db: Db,
+  row: {
+    id: string;
+    templateId: string;
+    userId?: string;
+    status?: "in_progress" | "completed" | "abandoned";
+    startedAt?: string;
+    completedAt?: string | null;
+    deletedAt?: string | null;
+  }
+): Promise<void> => {
+  const status = row.status ?? "completed";
+  await db.execute({
+    sql: `INSERT INTO checklist_runs
+          (id, template_id, user_id, name, status, started_at, completed_at,
+           created_at, updated_at, deleted_at)
+          VALUES (?, ?, ?, NULL, ?, ?, ?, ?, ?, ?)`,
+    args: [
+      row.id,
+      row.templateId,
+      row.userId ?? USER_ID,
+      status,
+      row.startedAt ?? SEED_TIME,
+      row.completedAt === undefined && status !== "in_progress" ? SEED_TIME : (row.completedAt ?? null),
+      SEED_TIME,
+      SEED_TIME,
+      row.deletedAt ?? null,
+    ],
+  });
+};
+
 type Outcome = { ok: true } | { ok: false; code: string };
 
 /** Giả của Admin SDK Messaging: ghi lại mọi tin nhận được. */
