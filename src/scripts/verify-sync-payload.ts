@@ -26,7 +26,7 @@ const NOT_NULL: Record<string, string[]> = {
     "created_at",
     "updated_at",
   ],
-  habits: ["id", "user_id", "title", "frequency_type", "target_per_period", "start_date", "created_at", "updated_at"],
+  habits: ["id", "user_id", "title", "frequency_type", "target_per_period", "start_date", "checklist_template_id", "created_at", "updated_at"],
   habit_logs: ["id", "habit_id", "log_date", "created_at", "updated_at"],
   checklist_categories: ["id", "user_id", "name", "slug", "color", "sort_order", "created_at", "updated_at"],
   checklist_templates: ["id", "user_id", "title", "sort_order", "created_at", "updated_at"],

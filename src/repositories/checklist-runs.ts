@@ -247,14 +247,19 @@ export const updateRunItem = async (
   return res.rowsAffected > 0;
 };
 
+/**
+ * `completedNow` = lần gọi này mới chuyển run sang completed (không phải gọi lại trên run đã xong),
+ * để chỗ gọi chỉ chạy hiệu ứng phụ (tự tick habit...) đúng một lần — cùng ý với todosRepo.completeTodo.
+ */
 export const completeRun = async (
   id: string,
   userId: string,
   durationMs: number | null = null
-): Promise<RunRow> => {
+): Promise<{ run: RunRow; completedNow: boolean }> => {
   const run = await getRunById(id, userId);
   if (!run) throw new RunRepoError("not_found");
-  if (run.status === "completed") return run; // idempotent; do not overwrite duration
+  // idempotent; do not overwrite duration
+  if (run.status === "completed") return { run, completedNow: false };
   // Check required items chưa pending
   const check = await turso.execute({
     sql: `SELECT COUNT(*) AS c FROM checklist_run_items ri
@@ -267,15 +272,16 @@ export const completeRun = async (
   );
   if (pendingRequired > 0) throw new RunRepoError("incomplete_required");
   const now = nowISO();
-  await turso.execute({
+  // `status <> 'completed'` làm bước chuyển nguyên tử: hai request đồng thời chỉ một bên thắng.
+  const res = await turso.execute({
     sql: `UPDATE checklist_runs
           SET status = 'completed', completed_at = ?, duration_ms = ?, updated_at = ?
-          WHERE id = ? AND user_id = ?`,
+          WHERE id = ? AND user_id = ? AND status <> 'completed'`,
     args: [now, durationMs, now, id, userId],
   });
   const updated = await getRunById(id, userId);
   if (!updated) throw new RunRepoError("not_found");
-  return updated;
+  return { run: updated, completedNow: res.rowsAffected > 0 };
 };
 
 export const abandonRun = async (

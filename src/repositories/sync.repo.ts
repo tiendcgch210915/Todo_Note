@@ -645,13 +645,15 @@ export const upsertEntity = async (
     case "habit": {
       // current_streak + longest_streak: server-only, already stripped by fromSyncEntity
       // We preserve the server values by not including them in SET
+      // checklist_template_id: field absent keeps the stored link (older app builds do not
+      // send it), explicit null clears it. The trailing bind is that "was it sent" flag.
       await turso.execute({
         sql: `INSERT INTO habits
               (id, user_id, title, description, icon, color, frequency_type,
                target_per_period, active_weekdays, start_date, end_date,
-               current_streak, longest_streak, is_archived,
+               checklist_template_id, current_streak, longest_streak, is_archived,
                created_at, updated_at, deleted_at)
-              VALUES (?,?,?,?,?,?,?,?,?,?,?,0,0,?,?,?,?)
+              VALUES (?,?,?,?,?,?,?,?,?,?,?,?,0,0,?,?,?,?)
               ON CONFLICT(id) DO UPDATE SET
                 title = excluded.title,
                 description = excluded.description,
@@ -662,6 +664,9 @@ export const upsertEntity = async (
                 active_weekdays = excluded.active_weekdays,
                 start_date = excluded.start_date,
                 end_date = excluded.end_date,
+                checklist_template_id = CASE WHEN ? = 1
+                  THEN excluded.checklist_template_id
+                  ELSE habits.checklist_template_id END,
                 is_archived = excluded.is_archived,
                 updated_at = excluded.updated_at,
                 deleted_at = excluded.deleted_at`,
@@ -670,8 +675,10 @@ export const upsertEntity = async (
           p.color ?? "#4CAF50", p.frequency_type ?? "daily",
           p.target_per_period ?? 1, p.active_weekdays ?? null,
           p.start_date, p.end_date ?? null,
+          p.checklist_template_id ?? null,
           p.is_archived ?? 0,
           createdAt, updatedAt, deletedAt,
+          hasOwn(p, "checklist_template_id") ? 1 : 0,
         ]),
       });
       break;
@@ -686,7 +693,8 @@ export const upsertEntity = async (
                 completed = excluded.completed,
                 note = excluded.note,
                 updated_at = excluded.updated_at,
-                deleted_at = excluded.deleted_at`,
+                deleted_at = excluded.deleted_at,
+                auto_closed = 0`,
         args: dbArgs([
           p.id, p.habit_id, p.log_date, p.completed ?? 0, p.note ?? null,
           createdAt, updatedAt, deletedAt,
@@ -742,6 +750,14 @@ export const upsertEntity = async (
           createdAt, updatedAt, deletedAt,
         ]),
       });
+      if (deletedAt !== null) {
+        // Mẫu bị xóa bằng tombstone: habit gắn vào nó mất liên kết (bump updated_at để client nhận).
+        await turso.execute({
+          sql: `UPDATE habits SET checklist_template_id = NULL, updated_at = ?
+                WHERE checklist_template_id = ? AND user_id = ? AND deleted_at IS NULL`,
+          args: [nowISO(), p.id as string, userId],
+        });
+      }
       break;
     }
 
@@ -1045,6 +1061,10 @@ export const softDeleteEntity = async (
         {
           sql: "UPDATE checklist_schedule_overrides SET deleted_at = ?, updated_at = ? WHERE template_id = ? AND deleted_at IS NULL",
           args: [deletedAt, deletedAt, id],
+        },
+        {
+          sql: "UPDATE habits SET checklist_template_id = NULL, updated_at = ? WHERE checklist_template_id = ? AND deleted_at IS NULL",
+          args: [deletedAt, id],
         },
       ], "write");
       break;
@@ -1461,17 +1481,21 @@ export const getHabitLogByNaturalKey = async (
   habitId: string,
   logDate: string,
   userId: string
-): Promise<{ id: string; deleted_at: string | null } | null> => {
+): Promise<{ id: string; deleted_at: string | null; auto_closed: boolean } | null> => {
   const res = await turso.execute({
-    sql: `SELECT hl.id, hl.deleted_at
+    sql: `SELECT hl.id, hl.deleted_at, hl.auto_closed
           FROM habit_logs hl
           JOIN habits h ON h.id = hl.habit_id
           WHERE hl.habit_id = ? AND hl.log_date = ? AND h.user_id = ?`,
     args: [habitId, logDate, userId],
   });
   if (res.rows.length === 0) return null;
-  const row = res.rows[0] as unknown as { id: string; deleted_at: string | null };
-  return { id: row.id, deleted_at: row.deleted_at };
+  const row = res.rows[0] as unknown as {
+    id: string;
+    deleted_at: string | null;
+    auto_closed: number | null;
+  };
+  return { id: row.id, deleted_at: row.deleted_at, auto_closed: Number(row.auto_closed) === 1 };
 };
 
 /**
@@ -1531,20 +1555,17 @@ export const resurrectHabitLogRow = async (
   serverLogId: string,
   patch: { completed?: unknown; note?: unknown; updated_at?: unknown }
 ): Promise<void> => {
-  const now = nowISO();
   // completed comes in as boolean from push payload; store as 0/1
   const completed = patch.completed === true || patch.completed === 1 ? 1 : 0;
+  // updated_at is the SERVER time, not the client's: this row was already delivered to other
+  // devices (as a tombstone or as the midnight job's zero), and a client timestamp older than
+  // their `since` cursor would keep the change from ever reaching them in a delta pull.
   await turso.execute({
     sql: `UPDATE habit_logs
           SET completed = ?, note = COALESCE(?, note),
-              deleted_at = NULL, updated_at = ?
+              deleted_at = NULL, updated_at = ?, auto_closed = 0
           WHERE id = ?`,
-    args: [
-      completed,
-      (patch.note as string | null) ?? null,
-      (patch.updated_at as string) ?? now,
-      serverLogId,
-    ],
+    args: [completed, (patch.note as string | null) ?? null, nowISO(), serverLogId],
   });
 };
 

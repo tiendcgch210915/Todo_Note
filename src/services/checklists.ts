@@ -2,6 +2,7 @@ import * as tplRepo from "../repositories/checklist-templates.js";
 import * as catRepo from "../repositories/checklist-categories.js";
 import * as runsRepo from "../repositories/checklist-runs.js";
 import * as notificationTriggers from "./notification-triggers.js";
+import { autoLogHabitsForCompletedRunSafely } from "./checklist-habit-logs.js";
 import { findScheduleView, type ScheduleView } from "./checklist-schedules.js";
 import type {
   CreateCategoryInput,
@@ -341,7 +342,12 @@ export const completeRun = async (
   body: CompleteRunInput
 ): Promise<runsRepo.RunRow> => {
   try {
-    const run = await runsRepo.completeRun(id, userId, body.duration_ms ?? null);
+    const { run, completedNow } = await runsRepo.completeRun(
+      id,
+      userId,
+      body.duration_ms ?? null
+    );
+    if (completedNow) await autoLogHabitsForCompletedRunSafely(userId, run);
     await notificationTriggers.onChecklistRunChanged(userId, id);
     return run;
   } catch (e) {

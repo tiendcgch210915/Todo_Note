@@ -1,4 +1,5 @@
 import { getChangesSince, type SyncChanges } from "../repositories/sync.repo.js";
+import { ensureHabitDaysClosedSafe } from "./habit-day-close.js";
 
 const DEFAULT_RETRY_DELAYS_MS = [100, 300] as const;
 
@@ -74,5 +75,9 @@ export const withSyncPullRetry = async <T>(
 export const pullSyncChanges = async (
   userId: string,
   since: string | null
-): Promise<SyncChanges> =>
-  withSyncPullRetry(() => getChangesSince(userId, since));
+): Promise<SyncChanges> => {
+  // Trước khi đọc: nếu ngày địa phương của người dùng vừa sang ngày mới và job nền chưa kịp
+  // chạy (instance mới thức dậy), điền dòng completed=0 để chúng nằm ngay trong lần pull này.
+  await ensureHabitDaysClosedSafe(userId);
+  return withSyncPullRetry(() => getChangesSince(userId, since));
+};

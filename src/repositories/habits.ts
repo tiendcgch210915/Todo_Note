@@ -14,6 +14,7 @@ export type HabitRow = {
   active_weekdays: string | null;
   start_date: string;
   end_date: string | null;
+  checklist_template_id: string | null;
   current_streak: number;
   longest_streak: number;
   is_archived: number;
@@ -35,8 +36,8 @@ export type HabitLogRow = {
 
 const HABIT_COLUMNS =
   "id, user_id, title, description, icon, color, frequency_type, target_per_period, " +
-  "active_weekdays, start_date, end_date, current_streak, longest_streak, is_archived, " +
-  "created_at, updated_at, deleted_at";
+  "active_weekdays, start_date, end_date, checklist_template_id, current_streak, " +
+  "longest_streak, is_archived, created_at, updated_at, deleted_at";
 
 const LOG_COLUMNS = "id, habit_id, log_date, completed, note, created_at, updated_at, deleted_at";
 
@@ -52,6 +53,7 @@ const mapHabit = (row: Record<string, unknown>): HabitRow => ({
   active_weekdays: (row.active_weekdays as string | null) ?? null,
   start_date: row.start_date as string,
   end_date: (row.end_date as string | null) ?? null,
+  checklist_template_id: (row.checklist_template_id as string | null) ?? null,
   current_streak: Number(row.current_streak),
   longest_streak: Number(row.longest_streak),
   is_archived: Number(row.is_archived),
@@ -92,6 +94,7 @@ export type CreateHabitDb = {
   active_weekdays?: string | null;
   start_date: string;
   end_date?: string | null;
+  checklist_template_id?: string | null;
 };
 
 export const createHabit = async (input: CreateHabitDb): Promise<HabitRow> => {
@@ -101,8 +104,9 @@ export const createHabit = async (input: CreateHabitDb): Promise<HabitRow> => {
     sql: `INSERT INTO habits
           (id, user_id, title, description, icon, color, frequency_type,
            target_per_period, active_weekdays, start_date, end_date,
+           checklist_template_id,
            current_streak, longest_streak, is_archived, created_at, updated_at)
-          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 0, 0, ?, ?)`,
+          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 0, 0, ?, ?)`,
     args: [
       id,
       input.user_id,
@@ -115,6 +119,7 @@ export const createHabit = async (input: CreateHabitDb): Promise<HabitRow> => {
       input.active_weekdays ?? null,
       input.start_date,
       input.end_date ?? null,
+      input.checklist_template_id ?? null,
       now,
       now,
     ],
@@ -156,6 +161,7 @@ export type UpdateHabitPatch = Partial<{
   active_weekdays: string | null;
   start_date: string;
   end_date: string | null;
+  checklist_template_id: string | null;
   is_archived: boolean;
 }>;
 
@@ -181,6 +187,8 @@ export const updateHabit = async (
     push("active_weekdays = ?", patch.active_weekdays);
   if (patch.start_date !== undefined) push("start_date = ?", patch.start_date);
   if (patch.end_date !== undefined) push("end_date = ?", patch.end_date);
+  if (patch.checklist_template_id !== undefined)
+    push("checklist_template_id = ?", patch.checklist_template_id);
   if (patch.is_archived !== undefined)
     push("is_archived = ?", patch.is_archived ? 1 : 0);
 
@@ -237,6 +245,23 @@ export const listHabitsByUser = async (
   return (res.rows as unknown as Record<string, unknown>[]).map(mapHabit);
 };
 
+/**
+ * Habit đang hoạt động (chưa xóa, chưa archive) của `userId` gắn với checklist
+ * `templateId` — những habit được tự tick khi một run của checklist đó hoàn thành.
+ */
+export const listLinkedHabits = async (
+  userId: string,
+  templateId: string
+): Promise<HabitRow[]> => {
+  const res = await turso.execute({
+    sql: `SELECT ${HABIT_COLUMNS} FROM habits
+          WHERE user_id = ? AND checklist_template_id = ?
+            AND deleted_at IS NULL AND is_archived = 0`,
+    args: [userId, templateId],
+  });
+  return (res.rows as unknown as Record<string, unknown>[]).map(mapHabit);
+};
+
 // ============================================================
 // Logs
 // ============================================================
@@ -257,7 +282,8 @@ export const upsertLog = async (
             completed = excluded.completed,
             note = excluded.note,
             updated_at = excluded.updated_at,
-            deleted_at = NULL`,
+            deleted_at = NULL,
+            auto_closed = 0`,
     args: [newId(), habitId, logDate, completed ? 1 : 0, note, now, now],
   });
   const row = await getLog(habitId, logDate);
@@ -277,7 +303,8 @@ export const upsertAutoLog = async (
           ON CONFLICT(habit_id, log_date) DO UPDATE SET
             completed = excluded.completed,
             updated_at = excluded.updated_at,
-            deleted_at = NULL`,
+            deleted_at = NULL,
+            auto_closed = 0`,
     args: [newId(), habitId, logDate, completed ? 1 : 0, now, now],
   });
   const row = await getLog(habitId, logDate);

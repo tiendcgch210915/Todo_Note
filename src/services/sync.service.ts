@@ -16,11 +16,14 @@ import { nowISO } from "../utils/time.js";
 import { fromSyncEntity } from "../sync/sync-serializer.js";
 import type { SyncOp } from "../schemas/api/sync.js";
 import * as habitsRepo from "../repositories/habits.js";
+import { getTemplateForUser } from "../repositories/checklist-templates.js";
 import * as todosRepo from "../repositories/todos.js";
 import * as notesRepo from "../repositories/notes.js";
 import * as todosService from "./todos.js";
 import * as notesService from "./notes.js";
 import { autoLogHabitForCompletedTodo } from "./todo-habit-logs.js";
+import { autoLogHabitsForCompletedRunSafely } from "./checklist-habit-logs.js";
+import * as runsRepo from "../repositories/checklist-runs.js";
 import { ensurePastTodoDayClosedForMutation } from "./daily-todo-logs.js";
 import * as notificationTriggers from "./notification-triggers.js";
 import * as schedulesRepo from "../repositories/checklist-schedules.js";
@@ -201,6 +204,21 @@ async function processOp(
     if (!habit) return { id, status: "error", error: "invalid_habit" };
   }
 
+  // Habit → checklist link: absent preserves, null clears, anything else must be a
+  // checklist template this user can see (their own or a system template).
+  if (
+    type === "habit" &&
+    opType !== "delete" &&
+    hasOwn(payload, "checklist_template_id") &&
+    payload.checklist_template_id !== null
+  ) {
+    if (typeof payload.checklist_template_id !== "string") {
+      return { id, status: "error", error: "bad_input" };
+    }
+    const template = await getTemplateForUser(payload.checklist_template_id, userId);
+    if (!template) return { id, status: "error", error: "invalid_checklist" };
+  }
+
   const deleteScope =
     type === "todo" && opType === "delete"
       ? todoDeleteScope(payload)
@@ -315,8 +333,12 @@ async function processOp(
     if (habitId && logDate) {
       const nk = await getHabitLogByNaturalKey(habitId, logDate, userId);
       if (nk && nk.id !== id) {
-        if (nk.deleted_at !== null) {
-          // Resurrect
+        // A tombstone, or the zero row the midnight job wrote for a day nobody logged
+        // (auto_closed), carries no user intent: the client's log takes over that row.
+        // Without this a tick made offline at 23:50 and pushed after midnight would lose
+        // to the job's 00:00 row.
+        if (nk.deleted_at !== null || nk.auto_closed) {
+          // Resurrect / take over
           await resurrectHabitLogRow(nk.id, {
             completed: payload.completed,
             note: payload.note,
@@ -380,6 +402,11 @@ async function processOp(
   const beforeTodo =
     type === "todo" && opType !== "delete"
       ? await todosRepo.getTodoByIdScoped(id, userId)
+      : null;
+  // Trạng thái run trước khi áp, để chỉ tự tick habit khi run THỰC SỰ chuyển sang completed.
+  const beforeRun =
+    type === "checklist_run" && opType !== "delete"
+      ? await runsRepo.getRunById(id, userId)
       : null;
   let frogDateToEnforce: string | null = null;
   let frogUpdatedAt: string | undefined;
@@ -506,6 +533,10 @@ async function processOp(
     }
 
     if (type === "checklist_run") {
+      const afterRun = await runsRepo.getRunById(id, userId);
+      if (afterRun?.status === "completed" && beforeRun?.status !== "completed") {
+        await autoLogHabitsForCompletedRunSafely(userId, afterRun);
+      }
       await notificationTriggers.onChecklistRunChanged(userId, id);
     }
     if (
