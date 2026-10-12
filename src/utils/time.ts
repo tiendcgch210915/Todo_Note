@@ -17,8 +17,14 @@ export type LocalNowParts = {
   timezone: string;
 };
 
-const localPartsFormatter = (timeZone: string): Intl.DateTimeFormat =>
-  new Intl.DateTimeFormat("en-CA", {
+// Tạo Intl.DateTimeFormat khá tốn; quét mọi người dùng mỗi phút nên dùng lại theo múi giờ.
+// Số múi giờ hợp lệ là hữu hạn nên cache không phình vô hạn.
+const localPartsFormatters = new Map<string, Intl.DateTimeFormat>();
+
+const localPartsFormatter = (timeZone: string): Intl.DateTimeFormat => {
+  const cached = localPartsFormatters.get(timeZone);
+  if (cached) return cached;
+  const formatter = new Intl.DateTimeFormat("en-CA", {
     timeZone,
     hourCycle: "h23",
     year: "numeric",
@@ -27,6 +33,9 @@ const localPartsFormatter = (timeZone: string): Intl.DateTimeFormat =>
     hour: "2-digit",
     minute: "2-digit",
   });
+  localPartsFormatters.set(timeZone, formatter);
+  return formatter;
+};
 
 const formatLocalNowParts = (timeZone: string, now: Date): LocalNowParts => {
   const formatter = localPartsFormatter(timeZone);
@@ -156,6 +165,10 @@ export const localDateTimeToUtc = (
   const second = wallAsUtc - zoneOffsetMs(first, timeZone);
   return new Date(second);
 };
+
+/** `timeZone` nếu hợp lệ, ngược lại múi giờ mặc định (Asia/Ho_Chi_Minh). */
+export const effectiveTimeZone = (timeZone: string | null | undefined): string =>
+  timeZone && isValidTimeZone(timeZone) ? timeZone : DEFAULT_TIME_ZONE;
 
 /** Ngày địa phương (YYYY-MM-DD) của một thời điểm UTC trong `timeZone`. */
 export const localDateOf = (at: Date, timeZone: string): string =>

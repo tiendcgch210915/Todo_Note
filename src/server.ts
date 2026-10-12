@@ -15,6 +15,7 @@ import {
   stopNotificationScheduler,
 } from "./services/notification-scheduler.js";
 import { startDailyTodoLogScheduler } from "./services/daily-todo-log-scheduler.js";
+import { startHabitDayCloseScheduler } from "./services/habit-day-close-scheduler.js";
 import { initFirebase } from "./services/firebase.js";
 import { createShutdownHandler } from "./utils/graceful-shutdown.js";
 
@@ -121,6 +122,7 @@ if (startNotificationScheduler(app.log)) {
   }
 }
 startDailyTodoLogScheduler(app.log);
+startHabitDayCloseScheduler(app.log);
 
 // Start
 try {

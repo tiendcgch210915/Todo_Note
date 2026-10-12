@@ -18,6 +18,8 @@ export const CreateHabitSchema = z.object({
     .optional(),
   start_date: IsoDate,
   end_date: IsoDate.nullable().optional(),
+  // Checklist mà habit được tự tick khi một run của nó hoàn thành. null = bỏ liên kết.
+  checklist_template_id: z.uuid().nullable().optional(),
 });
 export type CreateHabitInput = z.infer<typeof CreateHabitSchema>;
 

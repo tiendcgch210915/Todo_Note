@@ -140,6 +140,20 @@ before(async () => {
     CREATE TABLE IF NOT EXISTS habits (
       id TEXT PRIMARY KEY,
       user_id TEXT NOT NULL,
+      title TEXT NOT NULL DEFAULT '',
+      description TEXT,
+      icon TEXT,
+      color TEXT NOT NULL DEFAULT '#4CAF50',
+      frequency_type TEXT NOT NULL DEFAULT 'daily',
+      target_per_period INTEGER NOT NULL DEFAULT 1,
+      active_weekdays TEXT,
+      start_date TEXT NOT NULL DEFAULT '1970-01-01',
+      end_date TEXT,
+      checklist_template_id TEXT,
+      current_streak INTEGER NOT NULL DEFAULT 0,
+      longest_streak INTEGER NOT NULL DEFAULT 0,
+      is_archived INTEGER NOT NULL DEFAULT 0,
+      created_at TEXT NOT NULL DEFAULT '1970-01-01T00:00:00.000Z',
       updated_at TEXT NOT NULL,
       deleted_at TEXT
     )
@@ -153,8 +167,13 @@ before(async () => {
       note TEXT,
       created_at TEXT NOT NULL,
       updated_at TEXT NOT NULL,
+      auto_closed INTEGER NOT NULL DEFAULT 0,
       deleted_at TEXT
     )
+  `);
+  await turso.execute(`
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_habit_logs_unique
+      ON habit_logs(habit_id, log_date)
   `);
   await turso.execute(`
     CREATE TABLE IF NOT EXISTS checklist_categories (
