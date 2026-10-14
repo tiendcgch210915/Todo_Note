@@ -121,6 +121,13 @@ export type SyncHabit = {
   active_weekdays: string | null;
   start_date: string;
   end_date: string | null;
+  /**
+   * Checklist template whose completed runs auto-tick this habit (the user's own or a
+   * system template). On push: field absent keeps the stored link, `null` clears it,
+   * an unknown/foreign/deleted template is rejected with op error `invalid_checklist`.
+   * The server clears it (and bumps `updated_at`) when the template is deleted.
+   */
+  checklist_template_id: string | null;
   /** server-only: read-only on pull, STRIPPED on push */
   current_streak: number;
   /** server-only: read-only on pull, STRIPPED on push */
@@ -301,6 +308,8 @@ const fromBoolNullable = (v: unknown): number | null => {
 
 const SERVER_ONLY: Partial<Record<EntityType, string[]>> = {
   habit: ["current_streak", "longest_streak"],
+  // auto_closed: provenance flag of the midnight job, never set or shown by clients
+  habit_log: ["auto_closed"],
   checklist_category: ["is_system"],
   checklist_template: ["times_used", "last_used_at", "is_system"],
   user: ["email", "password_hash", "is_admin"],
@@ -364,8 +373,10 @@ export function toSyncEntity(
       // Defensive: migration 0005 backfilled updated_at from created_at;
       // if created_at was also NULL on an old row, both timestamps can be null.
       const hl_now = nowISO();
+      // getFullEntity (server_version in conflicts) reads SELECT *, so drop the server-only flag here.
+      const { auto_closed: _autoClosed, ...logRow } = row;
       return {
-        ...row,
+        ...logRow,
         completed: toBool(row.completed),
         created_at: (row.created_at as string | null) ?? hl_now,
         updated_at: (row.updated_at as string | null) ?? hl_now,

@@ -21,6 +21,7 @@ export const createDailyTodoLogTables = async (db: TestDb): Promise<void> => {
       is_archived INTEGER NOT NULL DEFAULT 0,
       created_at TEXT NOT NULL DEFAULT '1970-01-01T00:00:00.000Z',
       updated_at TEXT NOT NULL DEFAULT '1970-01-01T00:00:00.000Z',
+      checklist_template_id TEXT,
       deleted_at TEXT
     )
   `);
@@ -33,6 +34,7 @@ export const createDailyTodoLogTables = async (db: TestDb): Promise<void> => {
       note TEXT,
       created_at TEXT NOT NULL DEFAULT '1970-01-01T00:00:00.000Z',
       updated_at TEXT NOT NULL DEFAULT '1970-01-01T00:00:00.000Z',
+      auto_closed INTEGER NOT NULL DEFAULT 0,
       deleted_at TEXT
     )
   `);

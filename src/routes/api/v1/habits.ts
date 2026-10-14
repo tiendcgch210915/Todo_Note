@@ -8,6 +8,7 @@ import {
   CalendarRangeQuerySchema,
 } from "../../../schemas/api/habits.js";
 import * as habits from "../../../services/habits.js";
+import { ensureHabitDaysClosedSafe } from "../../../services/habit-day-close.js";
 
 const IsoDateRegex = /^\d{4}-\d{2}-\d{2}$/;
 
@@ -17,12 +18,21 @@ const mapErr = (e: unknown, reply: FastifyReply): FastifyReply => {
     if (e.code === "archived") return reply.code(400).send({ error: "archived" });
     if (e.code === "invalid_range")
       return reply.code(400).send({ error: "invalid_range" });
+    if (e.code === "invalid_checklist")
+      return reply.code(400).send({ error: "invalid_checklist" });
   }
   throw e;
 };
 
 export default async function habitsRoutes(app: FastifyInstance) {
   app.addHook("preHandler", app.requireUser);
+  // Đọc habit/log/lịch sau nửa đêm phải thấy ngay các dòng "không hoàn thành" của ngày vừa qua,
+  // kể cả khi job nền chưa kịp chạy. Chỉ cho GET; ghi không cần.
+  app.addHook("preHandler", async (req) => {
+    if (req.method === "GET" && req.userId) {
+      await ensureHabitDaysClosedSafe(req.userId);
+    }
+  });
 
   // POST /
   app.post("/", async (req, reply) => {
@@ -32,8 +42,12 @@ export default async function habitsRoutes(app: FastifyInstance) {
         .code(400)
         .send({ error: "bad_input", issues: parsed.error.issues });
     }
-    const habit = await habits.createHabit(req.userId, parsed.data);
-    return reply.code(201).send({ habit });
+    try {
+      const habit = await habits.createHabit(req.userId, parsed.data);
+      return reply.code(201).send({ habit });
+    } catch (e) {
+      return mapErr(e, reply);
+    }
   });
 
   // GET /

@@ -1,4 +1,5 @@
 import * as habitsRepo from "../repositories/habits.js";
+import { getTemplateForUser } from "../repositories/checklist-templates.js";
 import { dayDiff } from "../utils/time.js";
 import type {
   CreateHabitInput,
@@ -9,17 +10,30 @@ import type {
 } from "../schemas/api/habits.js";
 
 export class ServiceError extends Error {
-  constructor(public code: "not_found" | "archived" | "invalid_range") {
+  constructor(
+    public code: "not_found" | "archived" | "invalid_range" | "invalid_checklist"
+  ) {
     super(code);
   }
 }
 
 const MAX_RANGE_DAYS = 90;
 
+// Checklist gắn vào habit phải còn sống và người dùng thấy được (của mình hoặc mẫu hệ thống).
+const assertChecklistVisible = async (
+  userId: string,
+  templateId: string | null | undefined
+): Promise<void> => {
+  if (!templateId) return;
+  const template = await getTemplateForUser(templateId, userId);
+  if (!template) throw new ServiceError("invalid_checklist");
+};
+
 export const createHabit = async (
   userId: string,
   input: CreateHabitInput
 ): Promise<habitsRepo.HabitRow> => {
+  await assertChecklistVisible(userId, input.checklist_template_id);
   return habitsRepo.createHabit({
     user_id: userId,
     title: input.title,
@@ -31,6 +45,7 @@ export const createHabit = async (
     active_weekdays: input.active_weekdays ?? null,
     start_date: input.start_date,
     end_date: input.end_date ?? null,
+    checklist_template_id: input.checklist_template_id ?? null,
   });
 };
 
@@ -59,6 +74,7 @@ export const updateHabit = async (
   id: string,
   patch: UpdateHabitInput
 ): Promise<habitsRepo.HabitRow> => {
+  await assertChecklistVisible(userId, patch.checklist_template_id);
   const row = await habitsRepo.updateHabit(id, userId, patch);
   if (!row) throw new ServiceError("not_found");
   return row;
