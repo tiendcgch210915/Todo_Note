@@ -49,3 +49,21 @@ export const getRunTemplateId = async (
   if (res.rows.length === 0) return null;
   return (res.rows[0] as unknown as { template_id: string }).template_id;
 };
+
+/**
+ * Id các todo cấp trên cùng còn làm dở của người dùng có ngày và giờ hẹn từ `fromDate` trở đi.
+ * Dùng khi đổi múi giờ để tính lại mốc nhắc.
+ */
+export const listTimedTodoIds = async (
+  userId: string,
+  fromDate: string
+): Promise<string[]> => {
+  const res = await turso.execute({
+    sql: `SELECT id FROM todos
+          WHERE user_id = ? AND deleted_at IS NULL AND parent_id IS NULL
+            AND status IN ('open', 'in_progress')
+            AND time IS NOT NULL AND scheduled_date IS NOT NULL AND scheduled_date >= ?`,
+    args: [userId, fromDate],
+  });
+  return (res.rows as unknown as { id: string }[]).map((row) => row.id);
+};

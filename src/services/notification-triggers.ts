@@ -22,8 +22,10 @@ import {
   reconcileAllChecklistDue,
   reconcileChecklistDue,
 } from "./checklist-due.js";
+import { finishSchedulesForUserSafely } from "./checklist-schedule-expiry.js";
 import { recomputePendingDigests, planUser } from "./notification-planner.js";
 import { resolveSettings } from "./notification-schedule.js";
+import { reconcileAllTodoOverdue, reconcileTodoOverdue } from "./overdue-nudges.js";
 
 const safely = async (op: string, fn: () => Promise<void>): Promise<void> => {
   try {
@@ -43,12 +45,16 @@ const safely = async (op: string, fn: () => Promise<void>): Promise<void> => {
 const isLive = (status: string): boolean =>
   status === "open" || status === "in_progress";
 
-/** Hủy nhắc giờ + đếm ngược của các todo; `dropTimerRows` xóa hẳn trạng thái đếm ngược. */
+/**
+ * Hủy nhắc giờ + nhắc lặp + đếm ngược của các todo; `dropTimerRows` xóa hẳn trạng thái đếm
+ * ngược.
+ */
 const clearTodoArtifacts = async (
   todoIds: readonly string[],
   dropTimerRows: boolean
 ): Promise<void> => {
   await jobsRepo.cancelEventJobs("todo_reminder", todoIds);
+  await jobsRepo.cancelEventJobs("todo_overdue", todoIds);
   await jobsRepo.cancelEventJobs("todo_timer_end", todoIds);
   if (dropTimerRows) {
     await timersRepo.deleteTimers(todoIds);
@@ -59,7 +65,7 @@ const clearTodoArtifacts = async (
 
 /**
  * Gọi sau MỌI thay đổi của một todo (tạo, sửa, dời ngày, hoàn thành, bỏ hoàn thành, hồi sinh
- * bản lặp, sync). Đọc trạng thái hiện tại rồi tạo/sửa/hủy job nhắc giờ cho khớp.
+ * bản lặp, sync). Đọc trạng thái hiện tại rồi tạo/sửa/hủy job nhắc giờ và nhắc lặp cho khớp.
  */
 export const onTodoChanged = (userId: string, todoId: string): Promise<void> =>
   safely("todo_changed", async () => {
@@ -78,6 +84,7 @@ export const onTodoChanged = (userId: string, todoId: string): Promise<void> =>
 
     if (!todo.time || !todo.scheduled_date || todo.parent_id !== null) {
       await jobsRepo.cancelEventJobs("todo_reminder", [todo.id]);
+      await jobsRepo.cancelEventJobs("todo_overdue", [todo.id]);
       return;
     }
 
@@ -85,6 +92,13 @@ export const onTodoChanged = (userId: string, todoId: string): Promise<void> =>
     const { timezone } = resolveSettings(
       ctx ?? { timezone: null, morning_time: null, evening_time: null }
     );
+
+    // Nhắc lặp tính trước: nó cần cả khi giờ hẹn đã qua (đó chính là lúc bắt đầu nhắc), còn nhắc
+    // đúng giờ bên dưới thì chỉ dành cho giờ ở tương lai và có thể return sớm.
+    await safely("todo_overdue_changed", () =>
+      reconcileTodoOverdue(userId, todo, timezone)
+    );
+
     const runAt = localDateTimeToUtc(todo.scheduled_date, todo.time, timezone);
     if (runAt.getTime() <= Date.now()) {
       // Chỉ nhắc giờ ở TƯƠNG LAI; giờ đã qua thì bỏ job đang chờ (nếu có).
@@ -120,6 +134,8 @@ export const onChecklistRunChanged = async (
   runId: string
 ): Promise<void> => {
   await safely("checklist_run_changed", () => syncChecklist30m(userId, runId));
+  // Hoàn thành đúng ngày của lịch KHÔNG lặp thì lịch hết nhiệm vụ: xóa như chưa từng đặt.
+  await finishSchedulesForUserSafely(userId);
   // Một run hoàn thành (hoặc bị xóa/hủy) trong ngày đổi việc lần xuất hiện của lịch đã xong hay chưa.
   await safely("checklist_run_due", async () => {
     const templateId = await sourcesRepo.getRunTemplateId(userId, runId);
@@ -164,4 +180,6 @@ export const onUserSettingsChanged = async (userId: string): Promise<void> => {
   });
   // Giờ chạy của job lịch checklist phụ thuộc múi giờ nên cũng phải tính lại.
   await safely("user_settings_checklist_due", () => reconcileAllChecklistDue(userId));
+  // Mốc nhắc lặp của todo tính từ giờ hẹn theo múi giờ nên cũng vậy.
+  await safely("user_settings_todo_overdue", () => reconcileAllTodoOverdue(userId));
 };

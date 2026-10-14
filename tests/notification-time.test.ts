@@ -82,18 +82,31 @@ test("settings default to 07:00 / 17:00 / Asia/Ho_Chi_Minh and survive bad store
     morningTime: "07:00",
     eveningTime: "17:00",
     habitSummaryTime: "17:30",
+    reviewTime: "21:30",
   });
   const garbage = resolveSettings({ timezone: "Nope/Nope", morning_time: "7am", evening_time: "99:99" });
   assert.equal(garbage.timezone, "Asia/Ho_Chi_Minh");
   assert.equal(garbage.morningTime, "07:00");
   assert.equal(garbage.eveningTime, "17:00");
+  assert.equal(
+    resolveSettings({ timezone: null, morning_time: null, evening_time: null, review_time: "25:99" }).reviewTime,
+    "21:30",
+    "a bad stored review time falls back to the default"
+  );
+  assert.equal(
+    resolveSettings({ timezone: null, morning_time: null, evening_time: null, review_time: "22:15" }).reviewTime,
+    "22:15"
+  );
 });
 
-test("digest run_at follows the user's zone and the three digest times", () => {
+test("digest run_at follows the user's zone and the four digest times", () => {
   const vn = resolveSettings({ timezone: "Asia/Ho_Chi_Minh", morning_time: "06:30", evening_time: "21:00" });
   assert.equal(digestRunAt("digest_morning", "2026-06-20", vn).toISOString(), "2026-06-19T23:30:00.000Z");
   assert.equal(digestRunAt("digest_todos", "2026-06-20", vn).toISOString(), "2026-06-20T14:00:00.000Z");
   assert.equal(digestRunAt("digest_habits", "2026-06-20", vn).toISOString(), "2026-06-20T14:30:00.000Z");
+  assert.equal(digestRunAt("digest_review", "2026-06-20", vn).toISOString(), "2026-06-20T14:30:00.000Z");
+  const late = resolveSettings({ timezone: "Asia/Ho_Chi_Minh", morning_time: null, evening_time: null, review_time: "22:00" });
+  assert.equal(digestRunAt("digest_review", "2026-06-20", late).toISOString(), "2026-06-20T15:00:00.000Z");
 });
 
 test("the settings schema validates format, evening limit and time zone", () => {

@@ -1,4 +1,5 @@
 import { turso } from "../config/db.js";
+import { DEFAULT_NOTIFICATION_SETTINGS } from "../config/notification-policy.js";
 import { nowISO } from "../utils/time.js";
 
 /** Ngữ cảnh gửi thông báo của một người dùng (đã ghép users + notification_settings). */
@@ -9,6 +10,7 @@ export type UserNotificationContext = {
   /** null = chưa từng lưu cài đặt, dùng mặc định. */
   morning_time: string | null;
   evening_time: string | null;
+  review_time: string | null;
 };
 
 const mapContext = (row: Record<string, unknown>): UserNotificationContext => ({
@@ -17,9 +19,11 @@ const mapContext = (row: Record<string, unknown>): UserNotificationContext => ({
   timezone: row.timezone as string,
   morning_time: (row.morning_time as string | null) ?? null,
   evening_time: (row.evening_time as string | null) ?? null,
+  review_time: (row.review_time as string | null) ?? null,
 });
 
-const CONTEXT_SELECT = `SELECT u.id, u.timezone, u.deleted_at, s.morning_time, s.evening_time
+const CONTEXT_SELECT = `SELECT u.id, u.timezone, u.deleted_at, s.morning_time, s.evening_time,
+                               s.review_time
                         FROM users u
                         LEFT JOIN notification_settings s ON s.user_id = u.id`;
 
@@ -51,20 +55,35 @@ export const listPlannerUsers = async (
   return (res.rows as unknown as Record<string, unknown>[]).map(mapContext);
 };
 
+/**
+ * `reviewTime` bỏ trống (undefined/null) = giữ giờ rà soát đã lưu (hoặc mặc định nếu chưa có
+ * dòng), để app bản cũ chưa gửi trường này không vô tình đặt lại giờ của người dùng.
+ */
 export const upsertSettings = async (
   userId: string,
   morningTime: string,
-  eveningTime: string
+  eveningTime: string,
+  reviewTime?: string | null
 ): Promise<void> => {
   const now = nowISO();
   await turso.execute({
     sql: `INSERT INTO notification_settings
-          (user_id, morning_time, evening_time, created_at, updated_at)
-          VALUES (?, ?, ?, ?, ?)
+          (user_id, morning_time, evening_time, review_time, created_at, updated_at)
+          VALUES (?, ?, ?, COALESCE(?, ?), ?, ?)
           ON CONFLICT(user_id) DO UPDATE SET
             morning_time = excluded.morning_time,
             evening_time = excluded.evening_time,
+            review_time = COALESCE(?, notification_settings.review_time),
             updated_at = excluded.updated_at`,
-    args: [userId, morningTime, eveningTime, now, now],
+    args: [
+      userId,
+      morningTime,
+      eveningTime,
+      reviewTime ?? null,
+      DEFAULT_NOTIFICATION_SETTINGS.reviewTime,
+      now,
+      now,
+      reviewTime ?? null,
+    ],
   });
 };

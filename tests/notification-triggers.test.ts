@@ -135,8 +135,10 @@ test("changing or removing the reminder time re-times or cancels the job", async
   await todosService.updateTodo(USER_ID, todo.id, { time: "11:00" });
   assert.equal((await reminder(todo.id))?.status, "pending", "setting a time again re-arms the same job");
   assert.equal((await reminder(todo.id))?.run_at, runAtVn(DATE, "11:00"));
-  const count = await turso.execute("SELECT COUNT(*) AS c FROM notification_jobs WHERE ref_id = '" + todo.id + "'");
-  assert.equal(Number((count.rows[0] as unknown as { c: number }).c), 1, "still one job per todo");
+  const count = await turso.execute(
+    "SELECT COUNT(*) AS c FROM notification_jobs WHERE kind = 'todo_reminder' AND ref_id = '" + todo.id + "'"
+  );
+  assert.equal(Number((count.rows[0] as unknown as { c: number }).c), 1, "still one reminder job per todo");
 });
 
 test("editing an unrelated field after the reminder was sent does not send it again", async () => {
@@ -240,8 +242,13 @@ test("an admin timezone edit moves the pending digests", async () => {
   await usersService.updateUserProfile(USER_ID, { timezone: "America/New_York" });
 
   for (const job of await fx.jobsFor(turso, USER_ID, "AND status = 'pending'")) {
-    const kind = job.kind as "digest_morning" | "digest_todos" | "digest_habits";
-    const hhmm = { digest_morning: "07:00", digest_todos: "17:00", digest_habits: "17:30" }[kind];
+    const kind = job.kind as "digest_morning" | "digest_todos" | "digest_habits" | "digest_review";
+    const hhmm = {
+      digest_morning: "07:00",
+      digest_todos: "17:00",
+      digest_habits: "17:30",
+      digest_review: "21:30",
+    }[kind];
     assert.equal(
       job.run_at,
       localDateTimeToUtc(String(job.local_date), hhmm, "America/New_York").toISOString()
@@ -408,6 +415,7 @@ test("GET /notification-settings returns the defaults and the derived habit time
     morningTime: "07:00",
     eveningTime: "17:00",
     habitSummaryTime: "17:30",
+    reviewTime: "21:30",
     timezone: "Asia/Ho_Chi_Minh",
   });
 });
@@ -427,6 +435,7 @@ test("PUT /notification-settings saves, changes users.timezone and moves pending
     morningTime: "06:15",
     eveningTime: "20:00",
     habitSummaryTime: "20:30",
+    reviewTime: "21:30",
     timezone: "America/New_York",
   });
 
@@ -437,7 +446,12 @@ test("PUT /notification-settings saves, changes users.timezone and moves pending
   const again = await app.inject({ method: "GET", url: "/notification-settings", headers: authHeader() });
   assert.equal(again.json().morningTime, "06:15");
 
-  const times = { digest_morning: "06:15", digest_todos: "20:00", digest_habits: "20:30" } as const;
+  const times = {
+    digest_morning: "06:15",
+    digest_todos: "20:00",
+    digest_habits: "20:30",
+    digest_review: "21:30",
+  } as const;
   const pending = await fx.jobsFor(turso, USER_ID, "AND status = 'pending'");
   assert.ok(pending.length > 0);
   for (const job of pending) {

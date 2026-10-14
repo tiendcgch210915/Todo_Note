@@ -347,3 +347,30 @@ export const listCompletedRuns = async (
   }
   return out;
 };
+
+// ── Dọn lịch hết hạn ─────────────────────────────────────────────────────────
+
+export type ExpiryCandidate = ScheduleRow & { timezone: string };
+
+/**
+ * Lịch còn hiệu lực của người dùng còn hoạt động mà ngày kết thúc hiệu lực (ngày kết thúc, hoặc
+ * chính start_date với lịch không lặp) <= `utcToday`. Chỉ là danh sách ứng viên: múi giờ của từng
+ * người quyết định lịch đã qua hạn thật chưa. Sắp theo ngày kết thúc tăng dần để lịch chắc chắn
+ * đã hết hạn được xử lý trước.
+ */
+export const listExpiryCandidates = async (
+  utcToday: string,
+  limit: number
+): Promise<ExpiryCandidate[]> => {
+  const end = "COALESCE(s.recurrence_end_date, CASE WHEN s.recurrence_type IS NULL THEN s.start_date END)";
+  const res = await turso.execute({
+    sql: `SELECT ${SCHEDULE_COLUMNS.split(", ").map((c) => `s.${c}`).join(", ")}, u.timezone
+          FROM checklist_schedules s
+          JOIN users u ON u.id = s.user_id AND u.deleted_at IS NULL
+          WHERE s.deleted_at IS NULL AND ${end} <= ?
+          ORDER BY ${end} ASC, s.user_id ASC, s.template_id ASC
+          LIMIT ?`,
+    args: [utcToday, limit],
+  });
+  return rowsOf(res).map((row) => ({ ...mapSchedule(row), timezone: row.timezone as string }));
+};

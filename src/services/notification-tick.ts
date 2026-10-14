@@ -30,13 +30,17 @@ import * as timersRepo from "../repositories/todo-timers.js";
 import * as todosRepo from "../repositories/todos.js";
 import { localDateOf, localDateTimeToUtc } from "../utils/time.js";
 import { isPushConfigured, pushLogger, type PushLogger } from "./firebase.js";
-import { checkDueForSend } from "./checklist-due.js";
+import { checkDueForSend, checkOccurrenceOpen } from "./checklist-due.js";
+import { expireChecklistSchedules } from "./checklist-schedule-expiry.js";
 import {
   buildChecklist30m,
   buildChecklistDue,
+  buildChecklistOverdue,
   buildHabitsDigest,
   buildMorningDigest,
+  buildReviewDigest,
   buildTimerEnd,
+  buildTodoOverdue,
   buildTodoReminder,
   buildTodosDigest,
   type DigestStats,
@@ -48,6 +52,11 @@ import {
 } from "./notification-planner.js";
 import { resolveSettings } from "./notification-schedule.js";
 import { notifyUser } from "./notifications.js";
+import {
+  backfillTodoOverdue,
+  isOverdueSlot,
+  todoWantsOverdue,
+} from "./overdue-nudges.js";
 
 export type TickOptions = {
   now?: Date;
@@ -64,6 +73,10 @@ export type TickSummary = {
   push_disabled: boolean;
   planned: number;
   backfilled: number;
+  /** Mốc nhắc lặp (todo_overdue) vừa vá cho todo chưa có dòng nào. */
+  overdue_backfilled: number;
+  /** Lịch checklist vừa bị xóa vì đã qua ngày kết thúc. */
+  schedules_expired: number;
   recovered: number;
   stuck_failed: number;
   missed: number;
@@ -209,6 +222,48 @@ const prepare = async (job: jobsRepo.JobRow): Promise<Prepared> => {
       };
     }
 
+    case "todo_overdue": {
+      if (!job.ref_id || !job.local_date) return CANCEL;
+      const todo = await todosRepo.getTodoByIdScoped(job.ref_id, job.user_id);
+      // Còn làm dở, vẫn thuộc diện nhắc lặp (ước lượng, quan trọng/khẩn cấp) và vẫn đúng ngày này.
+      if (!todo || !todoWantsOverdue(todo) || todo.scheduled_date !== job.local_date) {
+        return CANCEL;
+      }
+      // Giờ hẹn đã bị sửa sau khi job được tạo -> mốc này không còn là mốc của giờ hẹn hiện tại.
+      const scheduledAt = localDateTimeToUtc(todo.scheduled_date, todo.time, settings.timezone);
+      if (!isOverdueSlot(scheduledAt, new Date(runAtMs), job.local_date, settings.timezone)) {
+        return CANCEL;
+      }
+      // Đang bấm giờ làm chính todo này thì không phải "bỏ lỡ": bỏ mốc này, các mốc sau tự xét lại.
+      const timer = await timersRepo.getTimer(todo.id);
+      if (timer && timer.user_id === job.user_id && timer.status === "running") return CANCEL;
+      return {
+        text: buildTodoOverdue(todo.title, todo.time),
+        id: todo.id,
+        date: job.local_date,
+      };
+    }
+
+    case "checklist_overdue": {
+      if (!job.ref_id || !job.local_date) return CANCEL;
+      // Cùng điều kiện "còn chờ" với checklist_due (lịch bật, đúng ngày, chưa có run xong).
+      const open = await checkOccurrenceOpen(
+        job.user_id,
+        job.ref_id,
+        job.local_date,
+        settings.timezone
+      );
+      if (!open) return CANCEL;
+      if (!isOverdueSlot(open.scheduledAt, new Date(runAtMs), job.local_date, settings.timezone)) {
+        return CANCEL;
+      }
+      return {
+        text: buildChecklistOverdue(open.template.title, open.time),
+        id: open.template.id,
+        date: job.local_date,
+      };
+    }
+
     case "digest_morning": {
       const stats = await digestStats(job.user_id, date);
       return { text: buildMorningDigest(stats, date), id: date, date };
@@ -222,6 +277,12 @@ const prepare = async (job: jobsRepo.JobRow): Promise<Prepared> => {
     case "digest_habits": {
       const text = buildHabitsDigest(await digestStats(job.user_id, date));
       return text ? { text, id: date, date } : CANCEL;
+    }
+
+    case "digest_review": {
+      // Luôn gửi: đây là lời nhắc rà soát + lên kế hoạch, kể cả khi hôm nay trống.
+      const stats = await digestStats(job.user_id, date);
+      return { text: buildReviewDigest(stats), id: date, date };
     }
   }
 };
@@ -349,6 +410,8 @@ const emptySummary = (dryRun: boolean): TickSummary => ({
   push_disabled: false,
   planned: 0,
   backfilled: 0,
+  overdue_backfilled: 0,
+  schedules_expired: 0,
   recovered: 0,
   stuck_failed: 0,
   missed: 0,
@@ -379,9 +442,13 @@ const maintain = async (
   summary.recovered = stuck.requeued;
   summary.stuck_failed = stuck.failed;
 
-  // 1. Lập lịch (idempotent): tổng kết hôm nay/ngày mai + vá nhắc giờ todo thiếu job.
+  // 1a. Lịch checklist đã qua ngày kết thúc bị xóa trước, để planner không lập job cho chúng.
+  summary.schedules_expired = await expireChecklistSchedules(now);
+
+  // 1b. Lập lịch (idempotent): tổng kết hôm nay/ngày mai + vá nhắc giờ todo thiếu job.
   summary.planned = await planAllUsers(now);
   summary.backfilled = await backfillTodoReminders(now);
+  summary.overdue_backfilled = await backfillTodoOverdue(now);
 
   // 2. Chính sách trễ (quét hàng loạt): job pending chạy muộn quá ngưỡng thì bỏ, KHÔNG gửi.
   //    Đường nhanh cũng tự kiểm tra từng ứng viên nên không phụ thuộc bước này.

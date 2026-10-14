@@ -13,6 +13,7 @@ import {
   toScheduleRule,
 } from "./checklist-schedule.js";
 import { completedLocalDates } from "./checklist-due.js";
+import { finishSchedulesForUserSafely } from "./checklist-schedule-expiry.js";
 import { resolveSettings } from "./notification-schedule.js";
 import * as notificationTriggers from "./notification-triggers.js";
 
@@ -66,6 +67,7 @@ export const getSchedule = async (
   templateId: string
 ): Promise<ScheduleView> => {
   await requireVisibleTemplate(userId, templateId);
+  await finishSchedulesForUserSafely(userId);
   const row = await schedulesRepo.getLiveSchedule(userId, templateId);
   if (!row) throw new ScheduleServiceError("not_found");
   return toScheduleView(row);
@@ -117,6 +119,7 @@ export const listOccurrences = async (
   from: string,
   to: string
 ): Promise<OccurrenceItem[]> => {
+  await finishSchedulesForUserSafely(userId);
   const ctx = await settingsRepo.getUserContext(userId);
   const { timezone } = resolveSettings(
     ctx ?? { timezone: null, morning_time: null, evening_time: null }

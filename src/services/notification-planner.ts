@@ -56,7 +56,7 @@ const insertMissingDigests = async (
   return jobsRepo.insertDigestJobs(missing);
 };
 
-/** Bảo đảm đủ 3 tổng kết cho hôm nay + ngày mai cho một người dùng. Trả số job mới tạo. */
+/** Bảo đảm đủ 4 tổng kết (sáng, todo, thói quen, rà soát) cho hôm nay + ngày mai cho một người dùng. Trả số job mới tạo. */
 export const planUser = async (
   userId: string,
   now: Date = new Date()

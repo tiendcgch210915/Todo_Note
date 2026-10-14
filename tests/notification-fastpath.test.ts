@@ -112,7 +112,7 @@ test("maintenance plans, backfills and purges but never sends; the next fast bea
 
   const maintenance = await runMaintenance({ now: T0, logger: fx.silentLogger });
 
-  assert.equal(maintenance.planned, 6);
+  assert.equal(maintenance.planned, 8);
   assert.equal(maintenance.backfilled, 1);
   assert.equal(maintenance.purged, 1);
   assert.equal(maintenance.claimed, 0);
@@ -125,7 +125,7 @@ test("maintenance plans, backfills and purges but never sends; the next fast bea
   assert.equal(fake.messages.length, 1);
 });
 
-test("the endpoint path (runTick) still does both, with the unchanged summary shape", async () => {
+test("the endpoint path (runTick) still does both; the summary only gained overdue_backfilled", async () => {
   await fx.insertDevice(turso, USER_ID, "reg-1");
 
   const summary = await runTick({ now: T0, logger: fx.silentLogger });
@@ -138,15 +138,17 @@ test("the endpoint path (runTick) still does both, with the unchanged summary sh
     "failed",
     "lost_claims",
     "missed",
+    "overdue_backfilled",
     "planned",
     "purged",
     "push_disabled",
     "recovered",
     "retried",
+    "schedules_expired",
     "sent",
     "stuck_failed",
   ]);
-  assert.equal(summary.planned, 6, "planner ran");
+  assert.equal(summary.planned, 8, "planner ran");
   assert.equal(summary.sent, 1, "dispatch ran in the same call");
 });
 

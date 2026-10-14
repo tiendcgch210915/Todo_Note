@@ -157,9 +157,9 @@ test("PUT creates the schedule and answers with it; GET returns the same", async
 test("input is normalised the same way for every kind of repeat", async () => {
   const cases: Array<[string, Json, Json]> = [
     [
-      "no repeat drops every repeat field",
+      "no repeat drops interval and weekdays but keeps the end date",
       { start_date: "2026-06-01", time: "07:30", recurrence_interval: 3, recurrence_days_of_week: "1,2", recurrence_end_date: "2026-07-01" },
-      { recurrence_type: null, recurrence_interval: null, recurrence_days_of_week: null, recurrence_end_date: null },
+      { recurrence_type: null, recurrence_interval: null, recurrence_days_of_week: null, recurrence_end_date: "2026-07-01" },
     ],
     [
       "explicit null type is the same as no repeat",
@@ -350,41 +350,41 @@ test("PUT/DELETE schedule creates and cancels the reminder job", async () => {
 // ── GET /occurrences ─────────────────────────────────────────────────────────
 
 test("occurrences are returned in the documented shape, sorted by date, time then title", async () => {
-  await putSchedule(A, daily({ time: "08:00", recurrence_end_date: "2026-06-02" }));
+  await putSchedule(A, daily({ time: "08:00", recurrence_end_date: "2099-06-02" }));
   await putSchedule(B, daily({ time: "07:00" }));
 
-  const res = await occurrences("2026-06-01", "2026-06-02");
+  const res = await occurrences("2099-06-01", "2099-06-02");
 
   assert.equal(res.status, 200);
   assert.deepEqual(res.body, {
     items: [
-      { checklistId: B, title: "Đi ngủ", stepCount: 2, date: "2026-06-01", time: "07:00", overridden: false, done: false },
-      { checklistId: A, title: "Rời nhà", stepCount: 3, date: "2026-06-01", time: "08:00", overridden: false, done: false },
-      { checklistId: B, title: "Đi ngủ", stepCount: 2, date: "2026-06-02", time: "07:00", overridden: false, done: false },
-      { checklistId: A, title: "Rời nhà", stepCount: 3, date: "2026-06-02", time: "08:00", overridden: false, done: false },
+      { checklistId: B, title: "Đi ngủ", stepCount: 2, date: "2099-06-01", time: "07:00", overridden: false, done: false },
+      { checklistId: A, title: "Rời nhà", stepCount: 3, date: "2099-06-01", time: "08:00", overridden: false, done: false },
+      { checklistId: B, title: "Đi ngủ", stepCount: 2, date: "2099-06-02", time: "07:00", overridden: false, done: false },
+      { checklistId: A, title: "Rời nhà", stepCount: 3, date: "2099-06-02", time: "08:00", overridden: false, done: false },
     ],
   });
 });
 
 test("same date and time: ties are broken by title", async () => {
-  await putSchedule(A, daily({ time: "08:00", recurrence_type: null }));
-  await putSchedule(B, daily({ time: "08:00", recurrence_type: null }));
-  const titles = (await occurrences("2026-06-01", "2026-06-01")).body.items.map((i: Json) => i.title);
+  await putSchedule(A, daily({ time: "08:00", recurrence_type: null, start_date: "2099-06-01" }));
+  await putSchedule(B, daily({ time: "08:00", recurrence_type: null, start_date: "2099-06-01" }));
+  const titles = (await occurrences("2099-06-01", "2099-06-01")).body.items.map((i: Json) => i.title);
   assert.deepEqual(titles, [...titles].sort((a, b) => a.localeCompare(b)));
   assert.equal(titles.length, 2);
 });
 
 test("repeat rules are expanded: weekly days, interval, end date, and a one-off", async () => {
-  await putSchedule(A, daily({ recurrence_type: "weekly", recurrence_days_of_week: "1,3", start_date: "2026-06-01" }));
-  await putSchedule(B, daily({ recurrence_type: "custom", recurrence_interval: 3, recurrence_end_date: "2026-06-07" }));
-  await putSchedule(SYS, daily({ recurrence_type: null, start_date: "2026-06-04" }));
+  await putSchedule(A, daily({ recurrence_type: "weekly", recurrence_days_of_week: "1,3", start_date: "2099-06-01" }));
+  await putSchedule(B, daily({ recurrence_type: "custom", recurrence_interval: 3, recurrence_end_date: "2099-06-07", start_date: "2099-06-01" }));
+  await putSchedule(SYS, daily({ recurrence_type: null, start_date: "2099-06-04" }));
 
-  const items = (await occurrences("2026-06-01", "2026-06-10")).body.items as Json[];
+  const items = (await occurrences("2099-06-01", "2099-06-10")).body.items as Json[];
   const datesOf = (id: string) => items.filter((i) => i.checklistId === id).map((i) => i.date);
 
-  assert.deepEqual(datesOf(A), ["2026-06-01", "2026-06-03", "2026-06-08", "2026-06-10"]);
-  assert.deepEqual(datesOf(B), ["2026-06-01", "2026-06-04", "2026-06-07"]);
-  assert.deepEqual(datesOf(SYS), ["2026-06-04"]);
+  assert.deepEqual(datesOf(A), ["2099-06-01", "2099-06-03", "2099-06-08", "2099-06-10"]);
+  assert.deepEqual(datesOf(B), ["2099-06-01", "2099-06-04", "2099-06-07"]);
+  assert.deepEqual(datesOf(SYS), ["2099-06-04"]);
 });
 
 test("only the requested window is returned, including across a month boundary", async () => {
@@ -515,11 +515,11 @@ test("deleting the schedule drops its overrides; a new schedule starts clean", a
 
 test("an override left behind for a day the schedule no longer covers is ignored", async () => {
   await putSchedule(A, daily());
-  await putOccurrence(A, "2026-06-04", { time: "21:15" });
-  await putSchedule(A, daily({ recurrence_end_date: "2026-06-03" }));
+  await putOccurrence(A, "2099-06-04", { time: "21:15" });
+  await putSchedule(A, daily({ recurrence_end_date: "2099-06-03" }));
 
-  const items = (await occurrences("2026-06-01", "2026-06-10")).body.items as Json[];
-  assert.deepEqual(items.map((i) => i.date), ["2026-06-01", "2026-06-02", "2026-06-03"]);
+  const items = (await occurrences("2099-06-01", "2099-06-10")).body.items as Json[];
+  assert.deepEqual(items.map((i) => i.date), ["2099-06-01", "2099-06-02", "2099-06-03"]);
 });
 
 test("done means at least one COMPLETED run that local day", async () => {
@@ -564,13 +564,13 @@ test("another time zone: the same instant belongs to a different local day", asy
 });
 
 test("stepCount ignores deleted steps; a checklist with no steps reports 0", async () => {
-  await putSchedule(A, daily({ recurrence_type: null }));
-  await turso.execute({ sql: "UPDATE checklist_template_items SET deleted_at = ? WHERE id = ?", args: ["2026-06-01T00:00:00.000Z", `${A}-item-1`] });
-  assert.equal((await occurrences("2026-06-01", "2026-06-01")).body.items[0].stepCount, 2);
+  await putSchedule(A, daily({ recurrence_type: null, start_date: "2099-06-01" }));
+  await turso.execute({ sql: "UPDATE checklist_template_items SET deleted_at = ? WHERE id = ?", args: ["2099-06-01T00:00:00.000Z", `${A}-item-1`] });
+  assert.equal((await occurrences("2099-06-01", "2099-06-01")).body.items[0].stepCount, 2);
 
   await fx.insertTemplateWithItems(turso, { id: "tst-empty", title: "Trống", itemCount: 0 });
-  await putSchedule("tst-empty", daily({ recurrence_type: null }));
-  const empty = (await occurrences("2026-06-01", "2026-06-01")).body.items.find((i: Json) => i.checklistId === "tst-empty");
+  await putSchedule("tst-empty", daily({ recurrence_type: null, start_date: "2099-06-01" }));
+  const empty = (await occurrences("2099-06-01", "2099-06-01")).body.items.find((i: Json) => i.checklistId === "tst-empty");
   assert.equal(empty.stepCount, 0);
 });
 

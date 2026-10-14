@@ -143,6 +143,8 @@ test("labels and icons come from the single config file", () => {
     motivation: "💪 Động lực: ",
     encouragement: "💪 ",
     reflection: "💡 Suy ngẫm: ",
+    today: "📋 Hôm nay: ",
+    review: "🌙 ",
   });
 });
 

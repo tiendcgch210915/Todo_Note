@@ -6,11 +6,14 @@ import {
   EVENT_KINDS,
   NOTIFICATION_KINDS,
   OCCURRENCE_KINDS,
+  OVERDUE,
+  OVERDUE_KINDS,
   type DigestKind,
   type EventKind,
   type NotificationJobKind,
   type NotificationJobStatus,
   type OccurrenceKind,
+  type OverdueKind,
 } from "../config/notification-policy.js";
 
 export type JobRow = {
@@ -40,6 +43,7 @@ const sqlList = (values: readonly string[]): string =>
 const EVENT_KIND_SQL = sqlList(EVENT_KINDS);
 const DIGEST_KIND_SQL = sqlList(DIGEST_KINDS);
 const OCCURRENCE_KIND_SQL = sqlList(OCCURRENCE_KINDS);
+const OVERDUE_KIND_SQL = sqlList(OVERDUE_KINDS);
 
 /**
  * Khi upsert đè lên một dòng có sẵn: giữ nguyên trạng thái nếu run_at (và đích) không đổi và job
@@ -405,11 +409,126 @@ export const cancelOccurrenceJobsExcept = async (
   return res.rowsAffected;
 };
 
+// ── Job nhắc LẶP (todo_overdue, checklist_overdue): một dòng cho mỗi mốc ────
+
+/**
+ * Tạo hoặc sửa job của MỘT mốc nhắc lặp: duy nhất theo (user, kind, ref_id, run_at).
+ * Quy tắc giữ trạng thái giống `upsertEventJob`: mốc đã sent/failed/missed/processing giữ
+ * nguyên (sửa tên todo không làm nhắc lại), mốc đã bị hủy mà nay hợp lệ lại thì đặt về pending.
+ */
+export const upsertSlotJob = async (input: {
+  userId: string;
+  kind: OverdueKind;
+  refId: string;
+  localDate: string;
+  runAt: string;
+}): Promise<void> => {
+  const keep = KEEP_STATE_SQL;
+  await turso.execute({
+    sql: `INSERT INTO notification_jobs
+          (id, user_id, kind, ref_id, target_device_id, local_date, run_at,
+           status, attempts, created_at)
+          VALUES (?, ?, ?, ?, NULL, ?, ?, 'pending', 0, ?)
+          ON CONFLICT(user_id, kind, ref_id, run_at) WHERE kind IN (${OVERDUE_KIND_SQL})
+          DO UPDATE SET
+            status = CASE WHEN ${keep} THEN notification_jobs.status ELSE 'pending' END,
+            attempts = CASE WHEN ${keep} THEN notification_jobs.attempts ELSE 0 END,
+            locked_at = CASE WHEN ${keep} THEN notification_jobs.locked_at ELSE NULL END,
+            sent_at = CASE WHEN ${keep} THEN notification_jobs.sent_at ELSE NULL END,
+            local_date = excluded.local_date`,
+    args: [
+      newId(),
+      input.userId,
+      input.kind,
+      input.refId,
+      input.localDate,
+      input.runAt,
+      nowISO(),
+    ],
+  });
+};
+
+/**
+ * Chỉ thêm khi chưa có dòng cho mốc này (planner và bước vá todo cũ). Trả true nếu thật sự tạo.
+ * `missed` dùng làm dấu "đã xét, không còn mốc nào để nhắc" để lần quét sau bỏ qua.
+ */
+export const insertSlotJobIfAbsent = async (input: {
+  userId: string;
+  kind: OverdueKind;
+  refId: string;
+  localDate: string;
+  runAt: string;
+  status: "pending" | "missed";
+}): Promise<boolean> => {
+  const res = await turso.execute({
+    sql: `INSERT INTO notification_jobs
+          (id, user_id, kind, ref_id, target_device_id, local_date, run_at,
+           status, attempts, created_at)
+          VALUES (?, ?, ?, ?, NULL, ?, ?, ?, 0, ?)
+          ON CONFLICT(user_id, kind, ref_id, run_at) WHERE kind IN (${OVERDUE_KIND_SQL})
+          DO NOTHING`,
+    args: [
+      newId(),
+      input.userId,
+      input.kind,
+      input.refId,
+      input.localDate,
+      input.runAt,
+      input.status,
+      nowISO(),
+    ],
+  });
+  return res.rowsAffected > 0;
+};
+
+/**
+ * Hủy job pending/processing của một todo/checklist TRỪ các mốc còn hợp lệ (`keepRunAts`).
+ * Giống `cancelOccurrenceJobsExcept`: không có khoảng hở hủy-rồi-tạo mà vòng nhanh lọt vào.
+ */
+export const cancelSlotJobsExcept = async (
+  userId: string,
+  kind: OverdueKind,
+  refId: string,
+  keepRunAts: readonly string[]
+): Promise<number> => {
+  const keep =
+    keepRunAts.length > 0 ? `AND run_at NOT IN (${placeholders(keepRunAts.length)})` : "";
+  const res = await turso.execute({
+    sql: `UPDATE notification_jobs SET status = 'cancelled'
+          WHERE user_id = ? AND kind = ? AND ref_id = ?
+            AND status IN ('pending', 'processing') ${keep}`,
+    args: [userId, kind, refId, ...keepRunAts],
+  });
+  return res.rowsAffected;
+};
+
+/** Khóa (user|ref_id|run_at) của mọi mốc đã có dòng trong các ngày địa phương `dates`. */
+export const listSlotJobKeys = async (
+  userIds: readonly string[],
+  kind: OverdueKind,
+  dates: readonly string[]
+): Promise<Set<string>> => {
+  const keys = new Set<string>();
+  if (userIds.length === 0 || dates.length === 0) return keys;
+  for (const part of chunks(userIds, 200)) {
+    const res = await turso.execute({
+      sql: `SELECT user_id, ref_id, run_at FROM notification_jobs
+            WHERE kind = ? AND local_date IN (${placeholders(dates.length)})
+              AND user_id IN (${placeholders(part.length)})`,
+      args: [kind, ...dates, ...part],
+    });
+    for (const row of res.rows as unknown as Record<string, unknown>[]) {
+      keys.add(`${row.user_id}|${row.ref_id}|${row.run_at}`);
+    }
+  }
+  return keys;
+};
+
 // ── Hủy ──────────────────────────────────────────────────────────────────────
 
-/** Hủy job sự kiện còn pending/processing theo ref_id. Trả số job đã hủy. */
+/** Hủy job sự kiện (hoặc nhắc lặp) còn pending/processing theo ref_id. Trả số job đã hủy. */
 export const cancelEventJobs = async (
-  kind: EventKind,
+  kind: EventKind | OverdueKind,
   refIds: readonly string[]
 ): Promise<number> => {
   let cancelled = 0;
@@ -536,6 +655,9 @@ export const releaseForRetry = async (
 
 // ── Vá todo cũ chưa có job nhắc giờ ─────────────────────────────────────────
 
+/** Cùng hình dạng với todo cần vá job nhắc giờ. */
+export type TodoNeedingOverdue = TodoNeedingReminder;
+
 export type TodoNeedingReminder = {
   id: string;
   user_id: string;
@@ -567,6 +689,50 @@ export const listTodosMissingReminderJobs = async (
             AND NOT EXISTS (
               SELECT 1 FROM notification_jobs j
               WHERE j.user_id = t.user_id AND j.kind = 'todo_reminder' AND j.ref_id = t.id
+            )
+          ORDER BY t.scheduled_date ASC, t.id ASC
+          LIMIT ?`,
+    args: [fromDate, limit],
+  });
+  return (res.rows as unknown as Record<string, unknown>[]).map((row) => ({
+    id: row.id as string,
+    user_id: row.user_id as string,
+    scheduled_date: row.scheduled_date as string,
+    time: row.time as string,
+    timezone: row.timezone as string,
+  }));
+};
+
+/**
+ * Todo thuộc diện nhắc lặp (cùng điều kiện với `todoWantsOverdue`) của người dùng có thiết bị mà
+ * CHƯA có dòng job `todo_overdue` nào cho ngày đó (todo có trước tính năng, hoặc hook bị sót).
+ *
+ * `time <= '21:59'`: giờ là giờ địa phương dạng chuỗi nên so sánh được không cần múi giờ; từ
+ * 22:00 trở đi, giờ hẹn + 2h đã sang ngày khác nên chắc chắn không có mốc nào để nhắc.
+ * `fromDate` chặn dưới để không quét lại toàn bộ lịch sử.
+ */
+export const listTodosMissingOverdueJobs = async (
+  fromDate: string,
+  limit: number
+): Promise<TodoNeedingOverdue[]> => {
+  const res = await turso.execute({
+    sql: `SELECT t.id, t.user_id, t.scheduled_date, t.time, u.timezone
+          FROM todos t
+          JOIN users u ON u.id = t.user_id AND u.deleted_at IS NULL
+          WHERE t.time IS NOT NULL
+            AND t.time <= '21:59'
+            AND t.scheduled_date IS NOT NULL
+            AND t.scheduled_date >= ?
+            AND t.parent_id IS NULL
+            AND t.deleted_at IS NULL
+            AND t.status IN ('open', 'in_progress')
+            AND (t.estimated_minutes IS NULL OR t.estimated_minutes <= ${OVERDUE.maxEstimatedMinutes})
+            AND NOT (COALESCE(t.is_important, 1) = 0 AND COALESCE(t.is_urgent, 1) = 0)
+            AND EXISTS (SELECT 1 FROM user_devices d WHERE d.user_id = t.user_id)
+            AND NOT EXISTS (
+              SELECT 1 FROM notification_jobs j
+              WHERE j.user_id = t.user_id AND j.kind = 'todo_overdue'
+                AND j.ref_id = t.id AND j.local_date = t.scheduled_date
             )
           ORDER BY t.scheduled_date ASC, t.id ASC
           LIMIT ?`,

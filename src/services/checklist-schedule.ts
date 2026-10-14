@@ -176,6 +176,37 @@ export const occurrencesBetween = (
   }));
 };
 
+/**
+ * Ngày kết thúc hiệu lực của lịch: sau ngày này lịch bị xóa hẳn.
+ *  - có `recurrence_end_date` (lịch lặp HOẶC không lặp): chính ngày đó;
+ *  - lịch không lặp không đặt ngày kết thúc: ngày kết thúc là chính `start_date` (một lần duy
+ *    nhất nên hết ngày là hết);
+ *  - lịch lặp không đặt ngày kết thúc: null (không bao giờ hết hạn).
+ */
+export const effectiveEndDate = (schedule: ScheduleRule): string | null =>
+  schedule.recurrenceEndDate ??
+  (schedule.recurrenceType === null ? schedule.startDate : null);
+
+export type ScheduleFinish = "expired" | "completed";
+
+/**
+ * Lịch đã "xong" chưa (HÀM THUẦN; `today` là ngày địa phương của người dùng):
+ *  - `expired`: đã qua ngày kết thúc (00:00 ngày kế tiếp là hết);
+ *  - `completed`: lịch KHÔNG lặp mà checklist đã được hoàn thành đúng vào ngày của lịch
+ *    (`startDateDone`). Lịch lặp thì hoàn thành một ngày không làm mất lịch.
+ * Lịch xong thì bị xóa như chưa từng đặt; ghi đè giờ theo ngày đi theo lịch.
+ */
+export const scheduleFinishReason = (
+  schedule: ScheduleRule,
+  today: string,
+  startDateDone: boolean
+): ScheduleFinish | null => {
+  const end = effectiveEndDate(schedule);
+  if (end !== null && today > end) return "expired";
+  if (schedule.recurrenceType === null && startDateDone) return "completed";
+  return null;
+};
+
 /** `date` có thật sự là một lần xuất hiện của lịch (bỏ qua ghi đè) không? */
 export const isOccurrenceDate = (schedule: ScheduleRule, date: string): boolean =>
   baseOccurrenceDates(schedule, date, date).length === 1;

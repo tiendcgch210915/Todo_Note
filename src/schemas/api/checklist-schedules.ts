@@ -47,7 +47,8 @@ export type ScheduleFieldsInput = z.infer<typeof ScheduleFieldsSchema>;
 
 /**
  * Đưa đầu vào về dạng lưu trữ nhất quán:
- *  - không lặp (type null): bỏ interval/thứ/ngày kết thúc, chỉ còn đúng một lần vào start_date;
+ *  - không lặp (type null): bỏ interval/thứ, chỉ còn đúng một lần vào start_date. Ngày kết thúc
+ *    được GIỮ (null = hết hạn ngay sau start_date, xem effectiveEndDate);
  *  - daily / custom: interval mặc định 1, bỏ thứ;
  *  - weekly: interval mặc định 1, thứ được sắp xếp và khử trùng (rỗng = thứ của start_date).
  */
@@ -64,7 +65,7 @@ export const normalizeScheduleFields = (input: ScheduleFieldsInput): ScheduleFie
       recurrence_type: null,
       recurrence_interval: null,
       recurrence_days_of_week: null,
-      recurrence_end_date: null,
+      recurrence_end_date: input.recurrence_end_date ?? null,
     };
   }
   const days =

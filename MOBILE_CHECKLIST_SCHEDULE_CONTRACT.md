@@ -21,13 +21,13 @@
 | `recurrence_type` | `null` \| `daily` \| `weekly` \| `custom` | `null` = one single occurrence on `start_date`. |
 | `recurrence_interval` | int 1..365 \| `null` | Days for `daily`/`custom`, weeks for `weekly`. |
 | `recurrence_days_of_week` | `"1,3,5"` \| `null` | Mon=1 ... Sun=7. Only used by `weekly`. |
-| `recurrence_end_date` | `YYYY-MM-DD` \| `null` | Inclusive. Must not be before `start_date`. |
+| `recurrence_end_date` | `YYYY-MM-DD` \| `null` | The **end date of the schedule**, valid for repeating AND non-repeating schedules. Inclusive, must not be before `start_date`. Once it has passed the whole schedule is removed (see "Finished schedules are removed"). |
 | `enabled` | boolean | `false` keeps the schedule but stops occurrences and reminders. |
 | `created_at`, `updated_at` | ISO UTC | |
 
 Normalisation applied by the server (REST and sync alike):
 
-- `recurrence_type = null` -> `recurrence_interval`, `recurrence_days_of_week`, `recurrence_end_date` are stored as `null`.
+- `recurrence_type = null` -> `recurrence_interval` and `recurrence_days_of_week` are stored as `null`. `recurrence_end_date` is **kept**: leaving it `null` on a non-repeating schedule means it ends on its own day (`start_date`).
 - `daily` / `custom` -> `recurrence_interval` defaults to 1; `recurrence_days_of_week` is stored as `null`.
 - `weekly` -> `recurrence_interval` defaults to 1; weekdays are sorted and de-duplicated (`"5,1,3,1"` becomes `"1,3,5"`). No weekdays = repeat on the weekday of `start_date`.
 - `enabled` defaults to `true`.
@@ -39,6 +39,32 @@ Normalisation applied by the server (REST and sync alike):
 - `weekly` without weekdays: `start_date + n * interval` weeks.
 - `weekly` with weekdays: `start_date` first, then the next listed weekday in the same Monday-Sunday week; after the last listed weekday of a week, jump `interval` weeks to the first listed weekday.
 - Stop after `recurrence_end_date` (inclusive). A schedule with `enabled = false` has no occurrences.
+- A non-repeating schedule has exactly one occurrence, on `start_date`. A later `recurrence_end_date` does not add occurrences; it only decides when the schedule is removed.
+
+## Finished schedules are removed
+
+A schedule that is "finished" is deleted entirely, as if it had never been set. The detail page goes back to its default: **"Nhắc theo lịch" off and no schedule shown**.
+
+| Finished when | Applies to |
+| --- | --- |
+| The checklist was **completed on the scheduled day** (a run with `status = completed` whose `completed_at` is on `start_date` in the user's local day) | Non-repeating schedules only |
+| The **end date has passed**, i.e. from 00:00 of the next local day (end date the 10th -> removed at 00:00 on the 11th) | Every schedule. The end date is `recurrence_end_date`, or `start_date` for a non-repeating schedule without one. A repeating schedule without an end date never expires. |
+
+A repeating schedule is **not** removed by completing the checklist on one of its days: that day just shows `done: true`.
+
+What the server does when a schedule is finished:
+
+- Soft-deletes the schedule **and all its per-day time overrides** (bumping `updated_at`), so the next `GET /sync/changes` carries tombstones (`deleted_at` set) for both.
+- Cancels the pending `checklist_due` reminder and the `checklist_overdue` nudges.
+- `GET /checklists/templates/:id` returns `"schedule": null`, `GET /checklists/templates/:id/schedule` returns `404 not_found`, and `GET /checklists/occurrences` no longer lists that checklist. **This includes its past days**: the timeline is built from the schedule, so a removed schedule leaves no occurrence behind (the runs themselves stay in the history).
+- Checking happens right when a run changes (REST or sync), on every minute's maintenance beat, and before the three read endpoints above answer, so the app never reads a finished schedule even a moment after it finished.
+
+Notes for the app:
+
+- On pull, a `checklist_schedules` tombstone means: drop the local schedule and show the default state. Apply the same rule locally right after the user completes a non-repeating checklist so the page resets without waiting for a sync.
+- Saving a non-repeating schedule for a day that is already completed, or one whose end date is already past, is accepted but is removed again the next time the server reads it. The app can avoid offering these.
+- The per-day time change on the timeline (`PUT /checklists/templates/:id/occurrences/:date`) is unchanged: it moves only that day's reminder and leaves other days alone.
+- Setting a schedule again after a removal works from scratch (same row is revived, the old overrides do not come back).
 
 ## REST Contract
 
@@ -82,7 +108,7 @@ Creates or replaces the schedule (idempotent; a second PUT keeps the same `id`, 
 }
 ```
 
-A one-off reminder is just `{ "start_date": "2026-06-20", "time": "21:00" }` (omit `recurrence_type`).
+A one-off reminder is just `{ "start_date": "2026-06-20", "time": "21:00" }` (omit `recurrence_type`). It may carry an end date too: `{ "start_date": "2026-06-20", "time": "21:00", "recurrence_end_date": "2026-06-25" }` keeps the schedule until 00:00 on the 26th unless the checklist is completed on the 20th.
 
 ### `GET /checklists/templates/:id/schedule`
 
@@ -90,7 +116,7 @@ A one-off reminder is just `{ "start_date": "2026-06-20", "time": "21:00" }` (om
 
 ### `DELETE /checklists/templates/:id/schedule`
 
-`204`. Idempotent (deleting a schedule that does not exist is also `204`). Its per-day overrides are removed with it, pending reminders are cancelled.
+`204`. Idempotent (deleting a schedule that does not exist is also `204`). Its per-day overrides are removed with it, pending reminders are cancelled. This is also what the server does by itself when a schedule is finished.
 
 ### `PUT /checklists/templates/:id/occurrences/:date`
 
@@ -208,6 +234,8 @@ Rules:
 - `notification.body`: `Đến giờ thực hiện · {n} bước`, or only `Đến giờ thực hiện` when the checklist has no steps.
 - `data` (all strings): `{ "type": "checklist_due", "id": "<checklist id>", "date": "YYYY-MM-DD" }`. Open the checklist `id` and start a run.
 
+If the checklist is still not done 2 hours after its time, the server keeps nudging every 2 hours until the end of the day: see `MOBILE_NOTIFICATION_REMINDERS_CONTRACT.md`.
+
 Other copy changed in the same release:
 
 - `checklist_30m`: title is the checklist title; body `Đã chạy 30 phút · còn {n} bước chưa tick. Rà lại cho đủ nhé!`. `data` is unchanged.
@@ -226,6 +254,6 @@ Other copy changed in the same release:
 ## Verification
 
 - `npx tsc --noEmit` is clean.
-- `npm test` passes with 396 tests, including `tests/checklist-schedule.test.ts` (pure expansion), `tests/checklist-due.test.ts` (planner, hooks, send, re-validation), `tests/checklist-schedule-api.test.ts` (REST and sync).
+- `npm test` passes, including `tests/checklist-schedule.test.ts` (pure expansion), `tests/checklist-due.test.ts` (planner, hooks, send, re-validation), `tests/checklist-schedule-api.test.ts` (REST and sync) and `tests/checklist-schedule-expiry.test.ts` (finished schedules are removed).
 - Migration `0017_checklist_schedules.sql` creates `checklist_schedules`, `checklist_schedule_overrides` and rebuilds `notification_jobs` so its `kind` CHECK accepts `checklist_due`. Apply it with `npm run db:migrate` **before** deploying the code, because the new code inserts the new kind.
 - Manual send: `npm run notify:job-test -- <userId> checklist_due` (then `--cleanup`).

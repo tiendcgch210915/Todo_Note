@@ -15,6 +15,7 @@ export const DIGEST_KINDS = [
   "digest_morning",
   "digest_todos",
   "digest_habits",
+  "digest_review",
 ] as const;
 
 /**
@@ -23,14 +24,23 @@ export const DIGEST_KINDS = [
  */
 export const OCCURRENCE_KINDS = ["checklist_due"] as const;
 
+/**
+ * Nhắc LẶP khi người dùng bỏ lỡ giờ hẹn: giờ hẹn + 2h, +4h, ... trong cùng ngày địa phương.
+ * Mỗi mốc là MỘT dòng job riêng, duy nhất theo (user, kind, ref_id, run_at): một mốc bị lỡ
+ * (server ngủ) không làm đứt các mốc sau.
+ */
+export const OVERDUE_KINDS = ["todo_overdue", "checklist_overdue"] as const;
+
 export const NOTIFICATION_KINDS = [
   ...EVENT_KINDS,
   ...OCCURRENCE_KINDS,
+  ...OVERDUE_KINDS,
   ...DIGEST_KINDS,
 ] as const;
 
 export type EventKind = (typeof EVENT_KINDS)[number];
 export type OccurrenceKind = (typeof OCCURRENCE_KINDS)[number];
+export type OverdueKind = (typeof OVERDUE_KINDS)[number];
 export type DigestKind = (typeof DIGEST_KINDS)[number];
 export type NotificationJobKind = (typeof NOTIFICATION_KINDS)[number];
 
@@ -54,9 +64,12 @@ export const LATENESS_MS: Record<NotificationJobKind, number> = {
   todo_timer_end: 5 * MINUTE,
   checklist_30m: 15 * MINUTE,
   checklist_due: 30 * MINUTE,
+  todo_overdue: 30 * MINUTE,
+  checklist_overdue: 30 * MINUTE,
   digest_morning: 2 * HOUR,
   digest_todos: 2 * HOUR,
   digest_habits: 1 * HOUR,
+  digest_review: 1 * HOUR,
 };
 
 /** Thời gian FCM giữ tin khi thiết bị offline (mili-giây, xem ghi chú đầu file). */
@@ -65,9 +78,12 @@ export const TTL_MS: Record<NotificationJobKind, number> = {
   todo_timer_end: 900_000,
   checklist_30m: 1_800_000,
   checklist_due: 3_600_000,
+  todo_overdue: 3_600_000,
+  checklist_overdue: 3_600_000,
   digest_morning: 7_200_000,
   digest_todos: 7_200_000,
   digest_habits: 3_600_000,
+  digest_review: 3_600_000,
 };
 
 /** Notification channel do app Android tạo; app PHẢI tạo đủ 4 channel này. */
@@ -76,20 +92,29 @@ export const CHANNEL_ID: Record<NotificationJobKind, string> = {
   todo_timer_end: "todo_timer",
   checklist_30m: "checklist_reminders",
   checklist_due: "checklist_reminders",
+  todo_overdue: "todo_reminders",
+  checklist_overdue: "checklist_reminders",
   digest_morning: "daily_digest",
   digest_todos: "daily_digest",
   digest_habits: "daily_digest",
+  digest_review: "daily_digest",
 };
 
-/** Giá trị `data.type` gửi cho app. */
+/**
+ * Giá trị `data.type` gửi cho app. Nhắc lặp dùng lại đúng type của lần nhắc đúng giờ ("todo",
+ * "checklist_due") để app mở đúng màn hình mà không cần xử lý thêm loại mới.
+ */
 export const DATA_TYPE: Record<NotificationJobKind, string> = {
   todo_reminder: "todo",
   todo_timer_end: "todo_timer_end",
   checklist_30m: "checklist",
   checklist_due: "checklist_due",
+  todo_overdue: "todo",
+  checklist_overdue: "checklist_due",
   digest_morning: "digest_morning",
   digest_todos: "digest_todos",
   digest_habits: "digest_habits",
+  digest_review: "digest_review",
 };
 
 export const DISPATCH = {
@@ -155,9 +180,19 @@ export const TIMER = {
 
 export const CHECKLIST_REMINDER_AFTER_MS = 30 * MINUTE;
 
+/** Quy tắc nhắc lặp khi bỏ lỡ giờ hẹn (todo và checklist theo lịch). */
+export const OVERDUE = {
+  /** Khoảng cách giữa hai lần nhắc: giờ hẹn + 2h, +4h, ... trong cùng ngày địa phương. */
+  intervalMs: 2 * HOUR,
+  /** Todo ước lượng LỚN HƠN mức này (phút) thì không bao giờ nhắc lặp; đúng bằng vẫn nhắc. */
+  maxEstimatedMinutes: 120,
+} as const;
+
 export const DEFAULT_NOTIFICATION_SETTINGS = {
   morningTime: "07:00",
   eveningTime: "17:00",
+  /** Giờ gửi thông báo rà soát cuối ngày (sửa được qua PUT /notification-settings). */
+  reviewTime: "21:30",
   timezone: "Asia/Ho_Chi_Minh",
 } as const;
 

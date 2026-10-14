@@ -86,22 +86,37 @@ export const createNotificationTables = async (db: TestDb): Promise<void> => {
   await applyMigrationFileOnce(db, "0016_notification_jobs.sql", "notification_jobs");
   // 0017 thêm bảng lịch checklist và dựng lại notification_jobs (kind checklist_due).
   await applyMigrationFileOnce(db, "0017_checklist_schedules.sql", "checklist_schedules");
+  // 0018 thêm cột review_time và dựng lại notification_jobs (nhắc lặp + digest_review).
+  await applyMigrationFileWhen(db, "0018_overdue_nudges_and_review.sql", async () => {
+    const columns = await db.execute("PRAGMA table_info(notification_settings)");
+    return !columns.rows.some((row) => row.name === "review_time");
+  });
 };
 
 /**
  * Áp dụng một migration nếu bảng `probeTable` chưa có. Test dùng DDL tay có thể thiếu bảng mà
  * migration tham chiếu (ví dụ chỉ mục trên checklist_runs): bỏ qua riêng câu lệnh "no such table".
  */
-const applyMigrationFileOnce = async (
+const applyMigrationFileOnce = (
   db: TestDb,
   file: string,
   probeTable: string
-): Promise<void> => {
-  const existing = await db.execute({
-    sql: "SELECT name FROM sqlite_master WHERE type = 'table' AND name = ?",
-    args: [probeTable],
+): Promise<void> =>
+  applyMigrationFileWhen(db, file, async () => {
+    const existing = await db.execute({
+      sql: "SELECT name FROM sqlite_master WHERE type = 'table' AND name = ?",
+      args: [probeTable],
+    });
+    return existing.rows.length === 0;
   });
-  if (existing.rows.length > 0) return;
+
+/** Như `applyMigrationFileOnce` nhưng điều kiện "cần áp dụng" do người gọi quyết định. */
+const applyMigrationFileWhen = async (
+  db: TestDb,
+  file: string,
+  isNeeded: () => Promise<boolean>
+): Promise<void> => {
+  if (!(await isNeeded())) return;
   const sql = await readFile(join(MIGRATIONS_DIR, file), "utf-8");
   for (const statement of parseStatements(sql)) {
     try {

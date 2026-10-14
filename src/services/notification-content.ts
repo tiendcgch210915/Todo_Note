@@ -13,8 +13,10 @@ import {
   CHECKLIST_DUE_BODY,
   DIGEST_LABELS,
   FALLBACK_TITLE,
+  OVERDUE_BODY,
   PUSH_TITLE_MAX_CHARS,
   QUOTE,
+  REVIEW_BODY,
   TODO_REMINDER_BODY,
 } from "../config/notification-labels.js";
 import { cheerForDate, philosophyForDate } from "./notification-phrases.js";
@@ -174,6 +176,35 @@ export const buildHabitsDigest = (
   };
 };
 
+/**
+ * digest_review (rà soát cuối ngày): LUÔN gửi, kể cả khi hôm nay trống (đây là lời nhắc thói quen
+ * lên kế hoạch). Hai dòng:
+ *   📋 Hôm nay: <x>/<T> todo xong · <y>/<H> thói quen     (bỏ phần không có; bỏ cả dòng nếu cả hai = 0)
+ *   🌙 <lời nhắc rà soát + lên kế hoạch ngày mai>
+ */
+export const buildReviewDigest = (rawStats: DigestStats): NotificationText => {
+  const { totalTodos: t, doneTodos: done, habitsTotal: h, habitsDone: x } = normalize(rawStats);
+
+  const parts: string[] = [];
+  if (t > 0) parts.push(`${done}/${t}${REVIEW_BODY.todosDone}`);
+  if (h > 0) parts.push(`${x}/${h}${REVIEW_BODY.habitsDone}`);
+
+  let prompt: string;
+  if (t === 0 && h === 0) prompt = REVIEW_BODY.empty;
+  else if (done === t && x === h) prompt = REVIEW_BODY.allDone;
+  else prompt = REVIEW_BODY.pending;
+
+  return {
+    title: "Rà soát cuối ngày",
+    body: lines(
+      parts.length === 0
+        ? null
+        : `${DIGEST_LABELS.today}${parts.join(REVIEW_BODY.separator)}`,
+      `${DIGEST_LABELS.review}${prompt}`
+    ),
+  };
+};
+
 type Flag = number | boolean | null | undefined;
 
 const toKnownFlag = (value: Flag): boolean | null => {
@@ -201,6 +232,28 @@ export const buildTodoReminder = (
 ): NotificationText => ({
   title: normalizePushTitle(todoTitle, FALLBACK_TITLE.todo),
   body: todoPriorityBody(isImportant, isUrgent),
+});
+
+/** Nội dung nhắc lặp: giờ hẹn đã lỡ (HH:mm) + việc nên làm. */
+const overdueBody = (scheduledTime: string): string =>
+  `${OVERDUE_BODY.prefix}${scheduledTime}${OVERDUE_BODY.suffix}`;
+
+/** todo_overdue: tiêu đề = tiêu đề todo; `scheduledTime` = giờ đặt của todo (HH:mm). */
+export const buildTodoOverdue = (
+  todoTitle: string,
+  scheduledTime: string
+): NotificationText => ({
+  title: normalizePushTitle(todoTitle, FALLBACK_TITLE.todo),
+  body: overdueBody(scheduledTime),
+});
+
+/** checklist_overdue: tiêu đề = tiêu đề checklist; `scheduledTime` = giờ của lần xuất hiện hôm nay. */
+export const buildChecklistOverdue = (
+  checklistTitle: string,
+  scheduledTime: string
+): NotificationText => ({
+  title: normalizePushTitle(checklistTitle, FALLBACK_TITLE.checklist),
+  body: overdueBody(scheduledTime),
 });
 
 /** N = thời gian ước lượng ban đầu của đếm ngược, làm tròn theo phút (tối thiểu 1). */

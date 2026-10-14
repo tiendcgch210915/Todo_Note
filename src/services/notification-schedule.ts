@@ -19,12 +19,16 @@ export type ResolvedSettings = {
   eveningTime: string;
   /** evening_time + 30 phút (tối đa 23:59); luôn tính, không lưu. */
   habitSummaryTime: string;
+  /** Giờ thông báo rà soát cuối ngày (digest_review), mặc định 21:30. */
+  reviewTime: string;
 };
 
 export const resolveSettings = (input: {
   timezone: string | null | undefined;
   morning_time: string | null | undefined;
   evening_time: string | null | undefined;
+  /** Bỏ qua được: nơi chỉ cần múi giờ không phải truyền. */
+  review_time?: string | null | undefined;
 }): ResolvedSettings => {
   const timezone =
     input.timezone && isValidTimeZone(input.timezone)
@@ -38,11 +42,16 @@ export const resolveSettings = (input: {
     input.evening_time && HHMM_RE.test(input.evening_time)
       ? input.evening_time
       : DEFAULT_NOTIFICATION_SETTINGS.eveningTime;
+  const reviewTime =
+    input.review_time && HHMM_RE.test(input.review_time)
+      ? input.review_time
+      : DEFAULT_NOTIFICATION_SETTINGS.reviewTime;
   return {
     timezone,
     morningTime,
     eveningTime,
     habitSummaryTime: habitSummaryTime(eveningTime),
+    reviewTime,
   };
 };
 
@@ -58,6 +67,8 @@ export const digestLocalTime = (
       return settings.eveningTime;
     case "digest_habits":
       return settings.habitSummaryTime;
+    case "digest_review":
+      return settings.reviewTime;
   }
 };
 

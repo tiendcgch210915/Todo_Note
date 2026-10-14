@@ -20,6 +20,24 @@ export const DIGEST_LABELS = {
   encouragement: "💪 ",
   /** digest_morning: dòng câu triết lý. */
   reflection: "💡 Suy ngẫm: ",
+  /** digest_review: dòng số liệu của hôm nay. */
+  today: "📋 Hôm nay: ",
+  /** digest_review: dòng lời nhắc rà soát + lên kế hoạch. */
+  review: "🌙 ",
+} as const;
+
+/** Nội dung digest_review (rà soát cuối ngày). Số liệu: x/T todo xong, y/H thói quen. */
+export const REVIEW_BODY = {
+  /** Ghép sau DIGEST_LABELS.today: "3/5 todo xong · 2/3 thói quen". */
+  todosDone: " todo xong",
+  habitsDone: " thói quen",
+  separator: " · ",
+  /** Còn việc chưa xong: rà lại rồi lên kế hoạch. */
+  pending: "Rà lại phần chưa xong & lên kế hoạch cho ngày mai để tiến bộ hơn nhé!",
+  /** Xong hết mọi thứ của hôm nay. */
+  allDone: "Tuyệt vời! Lên kế hoạch cho ngày mai để tiến bộ hơn nữa nhé!",
+  /** Hôm nay không có todo hay thói quen nào. */
+  empty: "Hôm nay chưa có todo hay thói quen. Lên kế hoạch cho ngày mai nhé!",
 } as const;
 
 /** Dấu ngoặc kép cong bao quanh câu cổ vũ của digest_morning. */
@@ -44,6 +62,15 @@ export const CHECKLIST_DUE_BODY = {
   /** Ghép sau `base` khi biết số bước. */
   stepsSeparator: " · ",
   stepsSuffix: " bước",
+} as const;
+
+/**
+ * Nhắc LẶP khi bỏ lỡ giờ hẹn (todo_overdue, checklist_overdue). Tiêu đề vẫn là tên todo/checklist,
+ * nội dung chỉ nói giờ đã lỡ và việc nên làm: "⏰ Quá giờ 10:00 · Làm ngay hoặc dời lịch!".
+ */
+export const OVERDUE_BODY = {
+  prefix: "⏰ Quá giờ ",
+  suffix: " · Làm ngay hoặc dời lịch!",
 } as const;
 
 /** Nội dung nhắc checklist đã chạy 30 phút. */

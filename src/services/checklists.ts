@@ -3,6 +3,7 @@ import * as catRepo from "../repositories/checklist-categories.js";
 import * as runsRepo from "../repositories/checklist-runs.js";
 import * as notificationTriggers from "./notification-triggers.js";
 import { findScheduleView, type ScheduleView } from "./checklist-schedules.js";
+import { finishSchedulesForUserSafely } from "./checklist-schedule-expiry.js";
 import type {
   CreateCategoryInput,
   UpdateCategoryInput,
@@ -160,6 +161,8 @@ export const getTemplateDetailWithSchedule = async (
   schedule: ScheduleView | null;
 }> => {
   const detail = await getTemplateDetail(userId, id);
+  // Một lịch đã xong (qua ngày kết thúc, hoặc không lặp mà đã hoàn thành) không được hiện ra.
+  await finishSchedulesForUserSafely(userId);
   return { ...detail, schedule: await findScheduleView(userId, id) };
 };
 

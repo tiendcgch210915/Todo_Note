@@ -76,21 +76,23 @@ beforeEach(async () => {
 
 // ── planner ──────────────────────────────────────────────────────────────────
 
-test("planner creates the three digests for today and tomorrow in the user's zone, once", async () => {
+test("planner creates the four digests for today and tomorrow in the user's zone, once", async () => {
   await fx.insertDevice(turso, USER_ID, "reg-1");
 
-  assert.equal(await planner.planAllUsers(T0), 6);
+  assert.equal(await planner.planAllUsers(T0), 8);
   assert.equal(await planner.planAllUsers(T0), 0, "second run must not create duplicates");
   assert.equal(await planner.planAllUsers(plusMinutes(T0, 5)), 0);
 
   const rows = await fx.jobsFor(turso, USER_ID);
-  assert.equal(rows.length, 6);
+  assert.equal(rows.length, 8);
   const key = (row: Record<string, unknown>) => `${row.kind} ${row.local_date} ${row.run_at}`;
   assert.deepEqual(rows.map(key).sort(), [
     "digest_habits 2026-06-20 2026-06-20T10:30:00.000Z",
     "digest_habits 2026-06-21 2026-06-21T10:30:00.000Z",
     "digest_morning 2026-06-20 2026-06-20T00:00:00.000Z",
     "digest_morning 2026-06-21 2026-06-21T00:00:00.000Z",
+    "digest_review 2026-06-20 2026-06-20T14:30:00.000Z",
+    "digest_review 2026-06-21 2026-06-21T14:30:00.000Z",
     "digest_todos 2026-06-20 2026-06-20T10:00:00.000Z",
     "digest_todos 2026-06-21 2026-06-21T10:00:00.000Z",
   ]);
@@ -111,7 +113,7 @@ test("planner skips digests already past their lateness window and ignores users
   const rows = await fx.jobsFor(turso, USER_ID);
   const morning = rows.filter((row) => row.kind === "digest_morning");
   assert.deepEqual(morning.map((row) => row.local_date), ["2026-06-21"]);
-  assert.equal(rows.length, 5);
+  assert.equal(rows.length, 7);
   assert.equal((await fx.jobsFor(turso, OTHER_USER_ID)).length, 0, "no device -> no jobs");
   assert.equal((await fx.jobsFor(turso, "user-disabled")).length, 0, "disabled user -> no jobs");
 });
@@ -371,9 +373,12 @@ test("the documented lateness thresholds are the configured ones", () => {
     todo_timer_end: 5 * MINUTE,
     checklist_30m: 15 * MINUTE,
     checklist_due: 30 * MINUTE,
+    todo_overdue: 30 * MINUTE,
+    checklist_overdue: 30 * MINUTE,
     digest_morning: 2 * MIN,
     digest_todos: 2 * MIN,
     digest_habits: 1 * MIN,
+    digest_review: 1 * MIN,
   });
 });
 
@@ -545,7 +550,7 @@ test("the tick summary contains counts only, no personal data", async () => {
 
 test("in steady state the planner reads but performs no writes, and fills only what is missing", async () => {
   await fx.insertDevice(turso, USER_ID, "reg-1");
-  assert.equal(await planner.planAllUsers(T0), 6);
+  assert.equal(await planner.planAllUsers(T0), 8);
 
   const originalBatch = turso.batch.bind(turso);
   let batches = 0;
@@ -563,7 +568,7 @@ test("in steady state the planner reads but performs no writes, and fills only w
 
   await turso.execute("DELETE FROM notification_jobs WHERE kind = 'digest_todos' AND local_date = '2026-06-21'");
   assert.equal(await planner.planAllUsers(T0), 1, "only the missing digest is recreated");
-  assert.equal((await fx.jobsFor(turso, USER_ID)).length, 6);
+  assert.equal((await fx.jobsFor(turso, USER_ID)).length, 8);
 });
 
 test("finished jobs older than 30 days are purged; recent and active ones are kept", async () => {
