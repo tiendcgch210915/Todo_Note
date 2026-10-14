@@ -179,6 +179,11 @@ export const softDeleteSystemTemplate = async (id: string): Promise<void> => {
         sql: "UPDATE checklist_schedule_overrides SET deleted_at = ?, updated_at = ? WHERE template_id = ? AND deleted_at IS NULL",
         args: [now, now, id],
       },
+      // Habit của mọi người dùng đang gắn vào mẫu này mất liên kết; bump updated_at để client nhận qua sync.
+      {
+        sql: "UPDATE habits SET checklist_template_id = NULL, updated_at = ? WHERE checklist_template_id = ? AND deleted_at IS NULL",
+        args: [now, id],
+      },
     ],
     "write"
   );
@@ -483,6 +488,12 @@ export const softDeleteUserTemplate = async (
               SET deleted_at = ?, updated_at = ?
               WHERE template_id = ? AND user_id = ? AND deleted_at IS NULL`,
         args: [now, now, id, userId],
+      },
+      {
+        sql: `UPDATE habits
+              SET checklist_template_id = NULL, updated_at = ?
+              WHERE checklist_template_id = ? AND user_id = ? AND deleted_at IS NULL`,
+        args: [now, id, userId],
       },
     ],
     "write"

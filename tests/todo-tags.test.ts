@@ -195,6 +195,7 @@ before(async () => {
       is_archived INTEGER NOT NULL DEFAULT 0,
       created_at TEXT NOT NULL,
       updated_at TEXT NOT NULL,
+      checklist_template_id TEXT,
       deleted_at TEXT
     )
   `);
@@ -207,6 +208,7 @@ before(async () => {
       note TEXT,
       created_at TEXT NOT NULL,
       updated_at TEXT NOT NULL,
+      auto_closed INTEGER NOT NULL DEFAULT 0,
       deleted_at TEXT
     )
   `);
