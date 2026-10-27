@@ -61,7 +61,8 @@ const REQUIRED_KEYS: Record<string, string[]> = {
   checklist_run_items: ["id", "run_id", "template_item_id", "status", "completed_at", "note", "created_at", "updated_at", "deleted_at"],
   checklist_schedules: [
     "id", "user_id", "template_id", "start_date", "time", "recurrence_type", "recurrence_interval",
-    "recurrence_days_of_week", "recurrence_end_date", "enabled", "created_at", "updated_at", "deleted_at",
+    "recurrence_days_of_week", "recurrence_end_date", "enabled", "paused_from", "paused_until",
+    "created_at", "updated_at", "deleted_at",
   ],
   checklist_schedule_overrides: ["id", "user_id", "template_id", "local_date", "time", "created_at", "updated_at", "deleted_at"],
 };

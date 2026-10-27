@@ -18,6 +18,7 @@ import {
   JOB_RETENTION_MS,
   LATENESS_MS,
   NOTIFICATION_KINDS,
+  OVERDUE_DIGEST,
   TTL_MS,
   type NotificationJobKind,
 } from "../config/notification-policy.js";
@@ -28,16 +29,20 @@ import * as sourcesRepo from "../repositories/notification-sources.js";
 import * as devicesRepo from "../repositories/notifications.js";
 import * as timersRepo from "../repositories/todo-timers.js";
 import * as todosRepo from "../repositories/todos.js";
-import { localDateOf, localDateTimeToUtc } from "../utils/time.js";
+import { addDays, localDateOf, localDateTimeToUtc } from "../utils/time.js";
 import { isPushConfigured, pushLogger, type PushLogger } from "./firebase.js";
 import { checkDueForSend, checkOccurrenceOpen } from "./checklist-due.js";
+import { backfillChecklistRunNudges, findRunNudge } from "./checklist-run-nudges.js";
 import { expireChecklistSchedules } from "./checklist-schedule-expiry.js";
 import {
-  buildChecklist30m,
+  buildChecklistCarryover,
   buildChecklistDue,
   buildChecklistOverdue,
+  buildChecklistRunning,
   buildHabitsDigest,
   buildMorningDigest,
+  buildOverdueEveningDigest,
+  buildOverdueMorningDigest,
   buildReviewDigest,
   buildTimerEnd,
   buildTodoOverdue,
@@ -55,7 +60,7 @@ import { notifyUser } from "./notifications.js";
 import {
   backfillTodoOverdue,
   isOverdueSlot,
-  todoWantsOverdue,
+  todoOverdueIntervalMs,
 } from "./overdue-nudges.js";
 
 export type TickOptions = {
@@ -73,7 +78,7 @@ export type TickSummary = {
   push_disabled: boolean;
   planned: number;
   backfilled: number;
-  /** Mốc nhắc lặp (todo_overdue) vừa vá cho todo chưa có dòng nào. */
+  /** Mốc nhắc lặp vừa vá: todo_overdue cho todo chưa có dòng nào, checklist_running cho run đang chạy. */
   overdue_backfilled: number;
   /** Lịch checklist vừa bị xóa vì đã qua ngày kết thúc. */
   schedules_expired: number;
@@ -192,15 +197,25 @@ const prepare = async (job: jobsRepo.JobRow): Promise<Prepared> => {
       };
     }
 
-    case "checklist_30m": {
+    case "checklist_30m":
+      // Loại CŨ (một nhắc sau 30 phút), đã thay bằng checklist_running: không gửi nữa.
+      return CANCEL;
+
+    case "checklist_running": {
       if (!job.ref_id) return CANCEL;
       const run = await sourcesRepo.getChecklistRunInfo(job.user_id, job.ref_id);
       if (!run || run.status !== "in_progress") return CANCEL;
+      const startedAt = new Date(Date.parse(run.started_at));
+      if (Number.isNaN(startedAt.getTime())) return CANCEL;
+      // Giờ bắt đầu hoặc múi giờ đã đổi sau khi job được tạo -> mốc này không còn là mốc của run.
+      const nudge = findRunNudge(startedAt, new Date(runAtMs), settings.timezone);
+      if (!nudge) return CANCEL;
       // Tiêu đề thông báo là tiêu đề của chính checklist (mẫu), không phải tên đặt cho lần chạy.
-      const text = buildChecklist30m(
-        run.template_title ?? run.name ?? "",
-        run.pending_steps
-      );
+      const title = run.template_title ?? run.name ?? "";
+      const text =
+        nudge.kind === "hourly"
+          ? buildChecklistRunning(title, run.pending_steps, nudge.hours)
+          : buildChecklistCarryover(title, run.pending_steps);
       return text ? { text, id: run.id, date } : CANCEL;
     }
 
@@ -225,13 +240,14 @@ const prepare = async (job: jobsRepo.JobRow): Promise<Prepared> => {
     case "todo_overdue": {
       if (!job.ref_id || !job.local_date) return CANCEL;
       const todo = await todosRepo.getTodoByIdScoped(job.ref_id, job.user_id);
-      // Còn làm dở, vẫn thuộc diện nhắc lặp (ước lượng, quan trọng/khẩn cấp) và vẫn đúng ngày này.
-      if (!todo || !todoWantsOverdue(todo) || todo.scheduled_date !== job.local_date) {
-        return CANCEL;
-      }
+      if (!todo || todo.scheduled_date !== job.local_date) return CANCEL;
+      // Còn làm dở và vẫn thuộc diện nhắc lặp; nhịp nhắc là nhịp HIỆN TẠI của nhóm todo (đổi nhóm
+      // quan trọng/khẩn cấp sau khi job được tạo thì mốc không còn khớp nhịp mới là bỏ).
+      const intervalMs = todoOverdueIntervalMs(todo);
+      if (intervalMs === null || !todo.time) return CANCEL;
       // Giờ hẹn đã bị sửa sau khi job được tạo -> mốc này không còn là mốc của giờ hẹn hiện tại.
       const scheduledAt = localDateTimeToUtc(todo.scheduled_date, todo.time, settings.timezone);
-      if (!isOverdueSlot(scheduledAt, new Date(runAtMs), job.local_date, settings.timezone)) {
+      if (!isOverdueSlot(scheduledAt, new Date(runAtMs), job.local_date, settings.timezone, intervalMs)) {
         return CANCEL;
       }
       // Đang bấm giờ làm chính todo này thì không phải "bỏ lỡ": bỏ mốc này, các mốc sau tự xét lại.
@@ -276,6 +292,28 @@ const prepare = async (job: jobsRepo.JobRow): Promise<Prepared> => {
 
     case "digest_habits": {
       const text = buildHabitsDigest(await digestStats(job.user_id, date));
+      return text ? { text, id: date, date } : CANCEL;
+    }
+
+    case "digest_overdue_evening": {
+      // Đếm lại lúc gửi: chỉ todo của HÔM NAY có giờ hẹn đã qua mà chưa xong. Không có thì không gửi.
+      const count = await sourcesRepo.countOverdueImportantTodos(
+        job.user_id,
+        date,
+        OVERDUE_DIGEST.eveningTime
+      );
+      const text = buildOverdueEveningDigest(count);
+      return text ? { text, id: date, date } : CANCEL;
+    }
+
+    case "digest_overdue_morning": {
+      // Sáng nay đếm todo của HÔM QUA vẫn chưa xong (mọi giờ hẹn đều đã qua).
+      const count = await sourcesRepo.countOverdueImportantTodos(
+        job.user_id,
+        addDays(date, -1),
+        null
+      );
+      const text = buildOverdueMorningDigest(count);
       return text ? { text, id: date, date } : CANCEL;
     }
 
@@ -449,6 +487,7 @@ const maintain = async (
   summary.planned = await planAllUsers(now);
   summary.backfilled = await backfillTodoReminders(now);
   summary.overdue_backfilled = await backfillTodoOverdue(now);
+  summary.overdue_backfilled += await backfillChecklistRunNudges(now);
 
   // 2. Chính sách trễ (quét hàng loạt): job pending chạy muộn quá ngưỡng thì bỏ, KHÔNG gửi.
   //    Đường nhanh cũng tự kiểm tra từng ứng viên nên không phụ thuộc bước này.

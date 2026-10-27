@@ -6,7 +6,10 @@
  *   npm run notify:job-test -- <userId> checklist_due           # checklist có lịch hôm nay, đúng giờ chạy
  *   npm run notify:job-test -- <userId> todo_overdue            # nhắc lặp "Quá giờ" của một todo trễ 2 giờ
  *   npm run notify:job-test -- <userId> checklist_overdue       # nhắc lặp "Quá giờ" của một checklist trễ 2 giờ
+ *   npm run notify:job-test -- <userId> checklist_running       # nhắc "đã làm 1 giờ" của một checklist đang chạy
  *   npm run notify:job-test -- <userId> digest_review           # thông báo rà soát cuối ngày
+ *   npm run notify:job-test -- <userId> digest_overdue_evening  # "⏰ x todo quan trọng quá hạn" (tổng kết 17:00)
+ *   npm run notify:job-test -- <userId> digest_overdue_morning  # "⏰ x todo quan trọng hôm qua chưa xong" (07:00)
  *   npm run notify:job-test -- <userId> todo_timer_end --device <user_devices.id>
  *   npm run notify:job-test -- <userId> --cleanup               # xóa đồ thử "[TEST]"
  *
@@ -24,6 +27,8 @@
 import "../config/env.js";
 import { turso } from "../config/db.js";
 import {
+  CHECKLIST_RUNNING,
+  EVENT_KINDS,
   NOTIFICATION_KINDS,
   OVERDUE,
   isDigestKind,
@@ -36,9 +41,12 @@ import * as devicesRepo from "../repositories/notifications.js";
 import * as timersRepo from "../repositories/todo-timers.js";
 import { resolveSettings } from "../services/notification-schedule.js";
 import { newId } from "../utils/id.js";
-import { nowISO, localDateOf, minutesToHhmm } from "../utils/time.js";
+import { addDays, nowISO, localDateOf, minutesToHhmm } from "../utils/time.js";
 
 const TEST_PREFIX = "[TEST]";
+
+/** Loại cũ (nhắc 30 phút) không còn được tạo; tick luôn hủy nó nên không có gì để thử. */
+const LEGACY_KIND = EVENT_KINDS[2];
 
 type Args = {
   userId: string | null;
@@ -66,7 +74,7 @@ const parseArgs = (argv: string[]): Args | string => {
   }
   const kinds =
     kindArg === null || kindArg === "all"
-      ? [...NOTIFICATION_KINDS]
+      ? NOTIFICATION_KINDS.filter((kind) => kind !== LEGACY_KIND)
       : [kindArg as NotificationJobKind];
   return { userId, kinds, deviceId, cleanup };
 };
@@ -91,16 +99,27 @@ const insertTestTodo = async (
   title: string,
   scheduledDate: string,
   time: string | null,
-  important = false
+  /** true = quan trọng (chưa phân loại khẩn cấp); "not_urgent" = quan trọng & KHÔNG khẩn cấp. */
+  important: boolean | "not_urgent" = false
 ): Promise<string> => {
   const id = newId();
   const now = nowISO();
   await turso.execute({
     sql: `INSERT INTO todos
-          (id, user_id, title, status, position, is_important, scheduled_date, time,
+          (id, user_id, title, status, position, is_important, is_urgent, scheduled_date, time,
            created_at, updated_at)
-          VALUES (?, ?, ?, 'open', 0, ?, ?, ?, ?, ?)`,
-    args: [id, userId, `${TEST_PREFIX} ${title}`, important ? 1 : null, scheduledDate, time, now, now],
+          VALUES (?, ?, ?, 'open', 0, ?, ?, ?, ?, ?, ?)`,
+    args: [
+      id,
+      userId,
+      `${TEST_PREFIX} ${title}`,
+      important ? 1 : null,
+      important === "not_urgent" ? 0 : null,
+      scheduledDate,
+      time,
+      now,
+      now,
+    ],
   });
   return id;
 };
@@ -194,7 +213,9 @@ const cleanup = async (userId: string): Promise<void> => {
     args: [userId, `${TEST_PREFIX}%`],
   });
   const runIds = (runs.rows as unknown as { id: string }[]).map((r) => r.id);
-  await jobsRepo.cancelEventJobs("checklist_30m", runIds);
+  for (const runId of runIds) {
+    await jobsRepo.cancelSlotJobsExcept(userId, "checklist_running", runId, []);
+  }
   const templates = await turso.execute({
     sql: "SELECT id FROM checklist_templates WHERE user_id = ? AND deleted_at IS NULL AND title LIKE ?",
     args: [userId, `${TEST_PREFIX}%`],
@@ -313,10 +334,16 @@ const main = async (): Promise<number> => {
         console.log(`✓ ${kind}: job nhắm CHỈ thiết bị ${device.id}.`);
         break;
       }
-      case "checklist_30m": {
-        const runId = await createChecklistRun(userId, new Date(target.getTime() - 30 * 60_000));
-        await jobsRepo.upsertEventJob({ userId, kind, refId: runId, runAt });
-        console.log(`✓ ${kind}: run thử đang chạy, còn 2 bước chưa tick.`);
+      case "checklist_running": {
+        // Mốc theo giờ đầu tiên = lúc bắt đầu + 1 giờ, nên run phải bắt đầu lúc (giờ chạy - 1 giờ), cùng ngày.
+        const startedAt = new Date(target.getTime() - CHECKLIST_RUNNING.intervalMs);
+        if (localDateOf(startedAt, settings.timezone) !== today) {
+          console.log(`- ${kind}: bỏ qua, lúc bắt đầu (chạy - 1 giờ) rơi sang ngày hôm trước. Thử lại sau 01:00.`);
+          break;
+        }
+        const runId = await createChecklistRun(userId, startedAt);
+        await jobsRepo.upsertSlotJob({ userId, kind, refId: runId, localDate: today, runAt });
+        console.log(`✓ ${kind}: run thử đã chạy 1 giờ, còn 2 bước chưa tick.`);
         break;
       }
       case "checklist_due": {
@@ -355,6 +382,13 @@ const main = async (): Promise<number> => {
       default: {
         if (!isDigestKind(kind)) break;
         if (kind === "digest_todos") await ensureTodayTodo();
+        // Tổng kết quá hạn đếm lại lúc gửi nên cần một todo quan trọng & không khẩn cấp thật phía sau.
+        if (kind === "digest_overdue_evening") {
+          await insertTestTodo(userId, "Quá hạn", today, "00:01", "not_urgent");
+        }
+        if (kind === "digest_overdue_morning") {
+          await insertTestTodo(userId, "Chưa xong hôm qua", addDays(today, -1), "09:00", "not_urgent");
+        }
         const created = await jobsRepo.insertDigestJobs([{ userId, kind, localDate: today, runAt }]);
         if (created === 0) {
           await turso.execute({
@@ -371,7 +405,9 @@ const main = async (): Promise<number> => {
               ? " (đã thêm 1 todo thử cho hôm nay)"
               : kind === "digest_review"
                 ? " (luôn được gửi, kể cả khi hôm nay trống)"
-                : "";
+                : kind === "digest_overdue_evening" || kind === "digest_overdue_morning"
+                  ? " (đã thêm 1 todo thử quan trọng & không khẩn cấp)"
+                  : "";
         console.log(`✓ ${kind}: ${created > 0 ? "tạo mới" : "dời job sẵn có của hôm nay"}${note}.`);
       }
     }

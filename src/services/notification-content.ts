@@ -9,11 +9,12 @@
  * Nhãn, biểu tượng và câu chữ cố định nằm ở config/notification-labels.ts.
  */
 import {
-  CHECKLIST_30M_BODY,
   CHECKLIST_DUE_BODY,
+  CHECKLIST_RUNNING_BODY,
   DIGEST_LABELS,
   FALLBACK_TITLE,
   OVERDUE_BODY,
+  OVERDUE_DIGEST_TEXT,
   PUSH_TITLE_MAX_CHARS,
   QUOTE,
   REVIEW_BODY,
@@ -256,6 +257,29 @@ export const buildChecklistOverdue = (
   body: overdueBody(scheduledTime),
 });
 
+/**
+ * digest_overdue_evening (17:00): "⏰ {x} todo quan trọng quá hạn" + "Làm ngay hoặc dời lịch!".
+ * x = số todo quan trọng & không khẩn cấp của hôm nay đã quá giờ hẹn mà chưa xong; null nếu x = 0.
+ */
+export const buildOverdueEveningDigest = (count: number): NotificationText | null => {
+  const n = nonNegativeInt(count);
+  if (n === 0) return null;
+  return {
+    title: `${OVERDUE_DIGEST_TEXT.prefix}${n}${OVERDUE_DIGEST_TEXT.eveningSuffix}`,
+    body: OVERDUE_DIGEST_TEXT.body,
+  };
+};
+
+/** digest_overdue_morning (07:00): như trên nhưng nói rõ là việc của hôm qua; null nếu x = 0. */
+export const buildOverdueMorningDigest = (count: number): NotificationText | null => {
+  const n = nonNegativeInt(count);
+  if (n === 0) return null;
+  return {
+    title: `${OVERDUE_DIGEST_TEXT.prefix}${n}${OVERDUE_DIGEST_TEXT.morningSuffix}`,
+    body: OVERDUE_DIGEST_TEXT.body,
+  };
+};
+
 /** N = thời gian ước lượng ban đầu của đếm ngược, làm tròn theo phút (tối thiểu 1). */
 export const buildTimerEnd = (
   todoTitle: string,
@@ -291,8 +315,31 @@ export const buildChecklistDue = (
   };
 };
 
-/** checklist_30m: null nếu đã tick hết (n = số bước chưa tick, tính lúc gửi). */
-export const buildChecklist30m = (
+/**
+ * checklist_running, mốc theo giờ: "⏳ Đã làm 2 giờ · còn 3 bước chưa tick". `hours` = số giờ từ lúc
+ * bắt đầu tới mốc này. null nếu đã tick hết (n = số bước chưa tick, tính lúc gửi).
+ */
+export const buildChecklistRunning = (
+  checklistTitle: string,
+  pendingSteps: number,
+  hours: number
+): NotificationText | null => {
+  const n = nonNegativeInt(pendingSteps);
+  if (n === 0) return null;
+  const h = Math.max(1, nonNegativeInt(hours));
+  return {
+    title: normalizePushTitle(checklistTitle, FALLBACK_TITLE.checklist),
+    body:
+      `${CHECKLIST_RUNNING_BODY.hourlyPrefix}${h}${CHECKLIST_RUNNING_BODY.hourlySuffix}` +
+      `${n}${CHECKLIST_RUNNING_BODY.stepsSuffix}`,
+  };
+};
+
+/**
+ * checklist_running, mốc 06:00 sáng hôm sau: "🌅 Hôm qua chưa xong · còn 3 bước chưa tick".
+ * null nếu đã tick hết.
+ */
+export const buildChecklistCarryover = (
   checklistTitle: string,
   pendingSteps: number
 ): NotificationText | null => {
@@ -300,6 +347,6 @@ export const buildChecklist30m = (
   if (n === 0) return null;
   return {
     title: normalizePushTitle(checklistTitle, FALLBACK_TITLE.checklist),
-    body: `${CHECKLIST_30M_BODY.prefix}${n}${CHECKLIST_30M_BODY.suffix}`,
+    body: `${CHECKLIST_RUNNING_BODY.carryoverPrefix}${n}${CHECKLIST_RUNNING_BODY.stepsSuffix}`,
   };
 };

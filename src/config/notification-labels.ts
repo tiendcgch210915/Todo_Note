@@ -73,10 +73,32 @@ export const OVERDUE_BODY = {
   suffix: " · Làm ngay hoặc dời lịch!",
 } as const;
 
-/** Nội dung nhắc checklist đã chạy 30 phút. */
-export const CHECKLIST_30M_BODY = {
-  prefix: "Đã chạy 30 phút · còn ",
-  suffix: " bước chưa tick. Rà lại cho đủ nhé!",
+/**
+ * Nhắc checklist đang làm dở (checklist_running). Tiêu đề là tên checklist; nội dung chỉ một dòng
+ * ngắn: thời gian đã làm hoặc "hôm qua chưa xong", rồi số bước còn lại.
+ *   ⏳ Đã làm 2 giờ · còn 3 bước chưa tick
+ *   🌅 Hôm qua chưa xong · còn 3 bước chưa tick
+ */
+export const CHECKLIST_RUNNING_BODY = {
+  /** Ghép: prefix + số giờ + hoursSuffix + số bước + stepsSuffix. */
+  hourlyPrefix: "⏳ Đã làm ",
+  hourlySuffix: " giờ · còn ",
+  carryoverPrefix: "🌅 Hôm qua chưa xong · còn ",
+  stepsSuffix: " bước chưa tick",
+} as const;
+
+/**
+ * Tổng kết todo "quan trọng & không khẩn cấp" quá hạn (digest_overdue_*). Số lượng nằm ngay ở
+ * tiêu đề để nhìn vào là hiểu, nội dung chỉ là việc cần làm:
+ *   ⏰ 3 todo quan trọng quá hạn            (17:00 cùng ngày)
+ *   ⏰ 3 todo quan trọng hôm qua chưa xong  (07:00 sáng hôm sau)
+ *   Làm ngay hoặc dời lịch!
+ */
+export const OVERDUE_DIGEST_TEXT = {
+  prefix: "⏰ ",
+  eveningSuffix: " todo quan trọng quá hạn",
+  morningSuffix: " todo quan trọng hôm qua chưa xong",
+  body: "Làm ngay hoặc dời lịch!",
 } as const;
 
 /** Tiêu đề thay thế khi todo/checklist không có tiêu đề dùng được. */

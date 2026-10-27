@@ -798,3 +798,200 @@ test("the stored schedule row is the one the repository reads back", async () =>
   assert.equal(row?.recurrence_days_of_week, "1,7");
   assert.equal(row?.enabled, 1);
 });
+
+// ── pause (paused_from .. paused_until) ──────────────────────────────────────
+
+// Far future so the schedule is neither expired nor "today" for the reminder planner.
+const FAR = "2099-06";
+const day = (n: number): string => `${FAR}-${String(n).padStart(2, "0")}`;
+const pausedDaily = (overrides: Json = {}): Json =>
+  daily({
+    start_date: day(1),
+    recurrence_end_date: day(10),
+    paused_from: day(4),
+    paused_until: day(7),
+    ...overrides,
+  });
+
+test("pause: PUT stores the window, echoes it, and the timeline skips exactly those days", async () => {
+  const put = await putSchedule(A, pausedDaily());
+
+  assert.equal(put.status, 200);
+  assert.equal(put.body.schedule.paused_from, day(4));
+  assert.equal(put.body.schedule.paused_until, day(7));
+  assert.equal((await getSchedule(A)).body.schedule.paused_until, day(7));
+  assert.equal((await call("GET", `/checklists/templates/${A}`)).body.schedule.paused_from, day(4));
+
+  const items = (await occurrences(day(1), day(10))).body.items as Json[];
+  assert.deepEqual(
+    items.map((i) => i.date),
+    [day(1), day(2), day(3), day(8), day(9), day(10)]
+  );
+});
+
+test("pause: a schedule that was never paused reports a null window", async () => {
+  const put = await putSchedule(A, daily());
+  assert.equal(put.body.schedule.paused_from, null);
+  assert.equal(put.body.schedule.paused_until, null);
+});
+
+test("pause: editing the schedule without mentioning pause keeps the window; null clears it", async () => {
+  await putSchedule(A, pausedDaily());
+
+  const edited = await putSchedule(A, daily({ start_date: day(1), recurrence_end_date: day(10), time: "09:00" }));
+  assert.equal(edited.body.schedule.time, "09:00");
+  assert.equal(edited.body.schedule.paused_from, day(4), "pause survives an unrelated edit");
+  assert.equal(edited.body.schedule.paused_until, day(7));
+
+  const cleared = await putSchedule(A, pausedDaily({ paused_from: null, paused_until: null }));
+  assert.equal(cleared.body.schedule.paused_from, null);
+  assert.equal(cleared.body.schedule.paused_until, null);
+  assert.equal(((await occurrences(day(4), day(7))).body.items as Json[]).length, 4, "days are back right away");
+});
+
+test("pause: the window can be shortened (resume early)", async () => {
+  await putSchedule(A, pausedDaily());
+  await putSchedule(A, pausedDaily({ paused_until: day(5) })); // shows again on the 6th
+
+  const items = (await occurrences(day(1), day(10))).body.items as Json[];
+  assert.deepEqual(
+    items.map((i) => i.date),
+    [day(1), day(2), day(3), day(6), day(7), day(8), day(9), day(10)]
+  );
+});
+
+test("pause: invalid windows are rejected with bad_input", async () => {
+  const bad: Json[] = [
+    pausedDaily({ paused_until: null }), // half a pair
+    pausedDaily({ paused_from: null }),
+    pausedDaily({ paused_from: day(8), paused_until: day(7) }), // reversed
+    pausedDaily({ paused_from: "2099-02-30" }), // not a real date
+    pausedDaily({ paused_until: "7/6" }), // wrong format
+  ];
+  for (const body of bad) {
+    const res = await putSchedule(A, body);
+    assert.equal(res.status, 400, JSON.stringify(body));
+    assert.equal(res.body.error, "bad_input");
+  }
+  assert.equal((await liveRows("checklist_schedules")).length, 0);
+});
+
+test("pause: re-creating a deleted schedule starts from scratch, not paused", async () => {
+  await putSchedule(A, pausedDaily());
+  await deleteSchedule(A);
+
+  const again = await putSchedule(A, daily({ start_date: day(1), recurrence_end_date: day(10) }));
+  assert.equal(again.body.schedule.paused_from, null);
+  assert.equal(again.body.schedule.paused_until, null);
+  assert.equal(((await occurrences(day(1), day(10))).body.items as Json[]).length, 10);
+});
+
+test("pause: a paused day cannot get a time override, an unpaused one can", async () => {
+  await putSchedule(A, pausedDaily());
+
+  const paused = await putOccurrence(A, day(5), { time: "09:00" });
+  assert.equal(paused.status, 400);
+  assert.equal(paused.body.error, "not_an_occurrence");
+
+  assert.equal((await putOccurrence(A, day(8), { time: "09:00" })).status, 200);
+});
+
+test("pause: the reminder job of a paused day is cancelled and comes back when the pause is lifted", async () => {
+  const today = localDateOf(new Date(), "Asia/Ho_Chi_Minh");
+  const tomorrow = addDays(today, 1);
+  await putSchedule(A, daily({ start_date: tomorrow }));
+  assert.equal((await jobsRepo.getOccurrenceJob(USER_ID, "checklist_due", A, tomorrow))?.status, "pending");
+
+  await putSchedule(A, daily({ start_date: tomorrow, paused_from: today, paused_until: tomorrow }));
+  assert.equal((await jobsRepo.getOccurrenceJob(USER_ID, "checklist_due", A, tomorrow))?.status, "cancelled");
+
+  await putSchedule(A, daily({ start_date: tomorrow, paused_from: null, paused_until: null }));
+  assert.equal((await jobsRepo.getOccurrenceJob(USER_ID, "checklist_due", A, tomorrow))?.status, "pending");
+});
+
+test("pause: a window that ends before tomorrow leaves tomorrow's reminder alone", async () => {
+  const today = localDateOf(new Date(), "Asia/Ho_Chi_Minh");
+  const tomorrow = addDays(today, 1);
+  await putSchedule(A, daily({ start_date: today, paused_from: today, paused_until: today }));
+  assert.equal((await jobsRepo.getOccurrenceJob(USER_ID, "checklist_due", A, tomorrow))?.status, "pending");
+  assert.equal(await jobsRepo.getOccurrenceJob(USER_ID, "checklist_due", A, today), null);
+});
+
+test("pause sync: a pushed window is stored, pulled with the schedule, and applied to the timeline", async () => {
+  const [result] = await push("checklist_schedule", "create", schedulePayload("sched-p", {
+    start_date: day(1),
+    recurrence_end_date: day(10),
+    paused_from: day(4),
+    paused_until: day(7),
+  }));
+  assert.deepEqual(result, { id: "sched-p", status: "applied" });
+
+  const row = (await getChangesSince(USER_ID, null)).checklist_schedules[0] as Json;
+  assert.equal(row.paused_from, day(4));
+  assert.equal(row.paused_until, day(7));
+  const items = (await occurrences(day(1), day(10))).body.items as Json[];
+  assert.deepEqual(items.map((i) => i.date), [day(1), day(2), day(3), day(8), day(9), day(10)]);
+});
+
+test("pause sync: an older app that omits the fields does not lift the pause; explicit nulls do", async () => {
+  await push("checklist_schedule", "create", schedulePayload("sched-p", { start_date: day(1), paused_from: day(4), paused_until: day(7) }));
+
+  await push("checklist_schedule", "update", schedulePayload("sched-p", { start_date: day(1), time: "08:00", updated_at: LATER }));
+  let row = (await getChangesSince(USER_ID, null)).checklist_schedules[0] as Json;
+  assert.equal(row.time, "08:00");
+  assert.equal(row.paused_from, day(4), "omitted -> unchanged");
+  assert.equal(row.paused_until, day(7));
+
+  await push("checklist_schedule", "update", schedulePayload("sched-p", {
+    start_date: day(1), paused_from: null, paused_until: null, updated_at: "2026-06-03T00:00:00.000Z",
+  }));
+  row = (await getChangesSince(USER_ID, null)).checklist_schedules[0] as Json;
+  assert.equal(row.paused_from, null);
+  assert.equal(row.paused_until, null);
+});
+
+test("pause sync: a half-set or reversed window is bad_input and nothing is written", async () => {
+  const bad: Json[] = [
+    schedulePayload("p1", { paused_from: day(4) }),
+    schedulePayload("p2", { paused_until: day(7) }),
+    schedulePayload("p3", { paused_from: day(8), paused_until: day(7) }),
+    schedulePayload("p4", { paused_from: "nope", paused_until: day(7) }),
+  ];
+  for (const payload of bad) {
+    const [result] = await push("checklist_schedule", "create", payload);
+    assert.deepEqual(result, { id: payload.id, status: "error", error: "bad_input" }, String(payload.id));
+  }
+  assert.equal((await liveRows("checklist_schedules")).length, 0);
+});
+
+test("pause sync: an older pause push loses to a newer one (Last-Write-Wins)", async () => {
+  await push("checklist_schedule", "create", schedulePayload("sched-p", {
+    start_date: day(1), paused_from: day(4), paused_until: day(7), updated_at: LATER,
+  }));
+  await push("checklist_schedule", "update", schedulePayload("sched-p", {
+    start_date: day(1), paused_from: null, paused_until: null, updated_at: EARLIER,
+  }));
+  assert.equal((await getSchedule(A)).body.schedule.paused_from, day(4));
+});
+
+test("pause sync: reviving a deleted schedule without pause fields starts unpaused", async () => {
+  await push("checklist_schedule", "create", schedulePayload("sched-p", { start_date: day(1), paused_from: day(4), paused_until: day(7) }));
+  await push("checklist_schedule", "delete", { id: "sched-p", updated_at: LATER, deleted_at: LATER });
+
+  await push("checklist_schedule", "create", schedulePayload("sched-p", { start_date: day(1), updated_at: "2026-06-03T00:00:00.000Z" }));
+  const schedule = (await getSchedule(A)).body.schedule;
+  assert.equal(schedule.paused_from, null);
+  assert.equal(schedule.paused_until, null);
+});
+
+test("pause sync: a pushed pause cancels the reminder job through the same hook", async () => {
+  const today = localDateOf(new Date(), "Asia/Ho_Chi_Minh");
+  const tomorrow = addDays(today, 1);
+  await push("checklist_schedule", "create", schedulePayload("sched-p", { start_date: tomorrow }));
+  assert.equal((await jobsRepo.getOccurrenceJob(USER_ID, "checklist_due", A, tomorrow))?.status, "pending");
+
+  await push("checklist_schedule", "update", schedulePayload("sched-p", {
+    start_date: tomorrow, paused_from: today, paused_until: tomorrow, updated_at: "2999-01-01T00:00:00.000Z",
+  }));
+  assert.equal((await jobsRepo.getOccurrenceJob(USER_ID, "checklist_due", A, tomorrow))?.status, "cancelled");
+});

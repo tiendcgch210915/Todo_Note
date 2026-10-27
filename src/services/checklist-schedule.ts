@@ -34,6 +34,9 @@ export type ScheduleRule = {
   recurrenceDaysOfWeek: string | null;
   recurrenceEndDate: string | null;
   enabled: boolean;
+  /** Khoảng tạm dừng [pausedFrom, pausedUntil], cả hai đầu tính; cùng null = không dừng. */
+  pausedFrom: string | null;
+  pausedUntil: string | null;
 };
 
 /** Đổi giờ của MỘT ngày cụ thể. */
@@ -57,6 +60,8 @@ export type ScheduleRowLike = {
   recurrence_end_date: string | null;
   /** 0 | 1 */
   enabled: number;
+  paused_from?: string | null;
+  paused_until?: string | null;
 };
 
 export const toScheduleRule = (row: ScheduleRowLike): ScheduleRule => ({
@@ -68,7 +73,20 @@ export const toScheduleRule = (row: ScheduleRowLike): ScheduleRule => ({
   recurrenceDaysOfWeek: row.recurrence_days_of_week,
   recurrenceEndDate: row.recurrence_end_date,
   enabled: row.enabled === 1,
+  pausedFrom: row.paused_from ?? null,
+  pausedUntil: row.paused_until ?? null,
 });
+
+/**
+ * `date` nằm trong khoảng tạm dừng của lịch (cả hai đầu tính) không? Thiếu một đầu hoặc đầu sai
+ * định dạng thì coi như không tạm dừng: dữ liệu lạ không được làm mất lịch.
+ */
+export const isPausedOn = (schedule: ScheduleRule, date: string): boolean => {
+  const { pausedFrom, pausedUntil } = schedule;
+  if (!pausedFrom || !pausedUntil) return false;
+  if (!isIsoDate(pausedFrom) || !isIsoDate(pausedUntil)) return false;
+  return date >= pausedFrom && date <= pausedUntil;
+};
 
 const ruleOf = (schedule: ScheduleRule): RecurrenceRule => ({
   type: schedule.recurrenceType,
@@ -113,7 +131,8 @@ const fastForward = (
 
 /**
  * Các ngày lịch xuất hiện trong [from, to] (chưa tính ghi đè). Lịch tắt, khoảng ngày sai hoặc
- * lịch có `start_date` sau `recurrence_end_date` thì rỗng.
+ * lịch có `start_date` sau `recurrence_end_date` thì rỗng. Ngày nằm trong khoảng tạm dừng bị bỏ
+ * (đây là nguồn sự thật duy nhất nên timeline, job nhắc và nhắc lặp quá giờ cùng bỏ qua).
  */
 export const baseOccurrenceDates = (
   schedule: ScheduleRule,
@@ -128,7 +147,9 @@ export const baseOccurrenceDates = (
 
   const out: string[] = [];
   const visit = (date: string): void => {
-    if (date >= from && date <= to && (!endDate || date <= endDate)) out.push(date);
+    if (date >= from && date <= to && (!endDate || date <= endDate) && !isPausedOn(schedule, date)) {
+      out.push(date);
+    }
   };
 
   const rule = ruleOf(schedule);

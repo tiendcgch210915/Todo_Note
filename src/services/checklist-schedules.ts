@@ -34,6 +34,9 @@ export type ScheduleView = {
   recurrence_days_of_week: string | null;
   recurrence_end_date: string | null;
   enabled: boolean;
+  /** Đang/sắp tạm dừng trong [paused_from, paused_until] (cả hai đầu tính); cùng null = không. */
+  paused_from: string | null;
+  paused_until: string | null;
   created_at: string;
   updated_at: string;
 };
@@ -48,6 +51,8 @@ export const toScheduleView = (row: schedulesRepo.ScheduleRow): ScheduleView => 
   recurrence_days_of_week: row.recurrence_days_of_week,
   recurrence_end_date: row.recurrence_end_date,
   enabled: row.enabled === 1,
+  paused_from: row.paused_from,
+  paused_until: row.paused_until,
   created_at: row.created_at,
   updated_at: row.updated_at,
 });

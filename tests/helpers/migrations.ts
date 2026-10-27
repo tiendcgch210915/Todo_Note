@@ -91,6 +91,22 @@ export const createNotificationTables = async (db: TestDb): Promise<void> => {
     const columns = await db.execute("PRAGMA table_info(notification_settings)");
     return !columns.rows.some((row) => row.name === "review_time");
   });
+  // 0020 dựng lại notification_jobs để nhận kind checklist_running (nhắc checklist đang làm dở mỗi giờ).
+  await applyMigrationFileWhen(db, "0020_checklist_running_nudges.sql", async () => {
+    const table = await db.execute(
+      "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'notification_jobs'"
+    );
+    const ddl = String((table.rows[0] as unknown as { sql?: string } | undefined)?.sql ?? "");
+    return !ddl.includes("checklist_running");
+  });
+  // 0022 dựng lại notification_jobs lần nữa để nhận digest_overdue_evening / digest_overdue_morning.
+  await applyMigrationFileWhen(db, "0022_overdue_digests.sql", async () => {
+    const table = await db.execute(
+      "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'notification_jobs'"
+    );
+    const ddl = String((table.rows[0] as unknown as { sql?: string } | undefined)?.sql ?? "");
+    return !ddl.includes("digest_overdue_evening");
+  });
 };
 
 /**

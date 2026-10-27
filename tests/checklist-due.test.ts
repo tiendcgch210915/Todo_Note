@@ -407,6 +407,7 @@ const invalidations: Array<[string, () => Promise<void>]> = [
   ["the checklist was deleted", () => turso.execute({ sql: "UPDATE checklist_templates SET deleted_at = '2026-06-20T00:10:00.000Z' WHERE id = ?", args: [TPL] }).then(() => undefined)],
   ["a run was completed that day", () => fx.insertRun(turso, { id: "r-today", templateId: TPL, completedAt: "2026-06-20T00:10:00.000Z" })],
   ["the day's time was overridden", () => schedulesRepo.upsertOverride(USER_ID, TPL, "2026-06-20", "09:00").then(() => undefined)],
+  ["that day was paused", () => turso.execute("UPDATE checklist_schedules SET paused_from = '2026-06-19', paused_until = '2026-06-21'").then(() => undefined)],
   ["the schedule time changed", () => turso.execute("UPDATE checklist_schedules SET time = '08:00'").then(() => undefined)],
   ["the schedule now ends before that day", () => turso.execute("UPDATE checklist_schedules SET recurrence_end_date = '2026-06-19', start_date = '2026-06-10'").then(() => undefined)],
   ["the schedule now starts after that day", () => turso.execute("UPDATE checklist_schedules SET start_date = '2026-06-25'").then(() => undefined)],
@@ -453,4 +454,33 @@ test("an override that moves the day's time later re-times the pending job inste
 
   await runDispatch({ now: new Date("2026-06-20T02:00:10.000Z"), logger: fx.silentLogger });
   assert.equal(dueMessages().length, 2, "fires at the overridden time");
+});
+
+// ── pause ────────────────────────────────────────────────────────────────────
+
+test("pause: the planner skips the paused days and the reminder returns the day after the pause", async () => {
+  // Paused through the end of today (the 20th): no job today, tomorrow's is back.
+  await setup(dailyFrom("2026-06-01", { paused_from: "2026-06-18", paused_until: "2026-06-20" }));
+
+  await planner.planAllUsers(NOW);
+
+  assert.deepEqual((await dueJobs()).map((j) => j.local_date), ["2026-06-21"]);
+});
+
+test("pause: pausing cancels today's reminder and its overdue nudges, lifting it brings them back", async () => {
+  await setup(dailyFrom("2026-06-20"));
+  const lateMorning = plus(NOW, 180); // 10:00 in Vietnam, 2.5h after the 07:30 slot
+  await reconcileChecklistDue(USER_ID, TPL, lateMorning);
+  const pendingNudges = () =>
+    fx.jobsFor(turso, USER_ID, "AND kind = 'checklist_overdue' AND status = 'pending'");
+  assert.ok((await pendingNudges()).length > 0, "unpaused: overdue nudges are planned");
+
+  await schedulesRepo.upsertSchedule(USER_ID, TPL, dailyFrom("2026-06-20", { paused_from: "2026-06-20", paused_until: "2026-06-22" }));
+  await reconcileChecklistDue(USER_ID, TPL, lateMorning);
+  assert.equal((await pendingNudges()).length, 0, "paused: no overdue nudge is left pending");
+  assert.notEqual((await job("2026-06-20"))?.status, "pending");
+
+  await schedulesRepo.upsertSchedule(USER_ID, TPL, dailyFrom("2026-06-20", { paused_from: null, paused_until: null }));
+  await reconcileChecklistDue(USER_ID, TPL, lateMorning);
+  assert.ok((await pendingNudges()).length > 0, "resumed: nudges are planned again");
 });

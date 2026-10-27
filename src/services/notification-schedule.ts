@@ -4,6 +4,7 @@
  */
 import {
   DEFAULT_NOTIFICATION_SETTINGS,
+  OVERDUE_DIGEST,
   type DigestKind,
 } from "../config/notification-policy.js";
 import {
@@ -69,6 +70,11 @@ export const digestLocalTime = (
       return settings.habitSummaryTime;
     case "digest_review":
       return settings.reviewTime;
+    // Cố định theo yêu cầu (17:00 và 07:00), không theo evening_time/morning_time của người dùng.
+    case "digest_overdue_evening":
+      return OVERDUE_DIGEST.eveningTime;
+    case "digest_overdue_morning":
+      return OVERDUE_DIGEST.morningTime;
   }
 };
 

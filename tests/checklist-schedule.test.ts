@@ -32,10 +32,12 @@ const rule = (overrides: Partial<ScheduleRule> = {}): ScheduleRule => ({
   recurrenceDaysOfWeek: null,
   recurrenceEndDate: null,
   enabled: true,
+  pausedFrom: null,
+  pausedUntil: null,
   ...overrides,
 });
 
-const dates = (r: ScheduleRule, from: string, to: string): string[] =>
+const dates =(r: ScheduleRule, from: string, to: string): string[] =>
   baseOccurrenceDates(r, from, to);
 
 test("sanity: 2026-06-22 is a Monday and the helpers agree", () => {
@@ -317,6 +319,8 @@ test("toScheduleRule maps a database row", () => {
       recurrenceDaysOfWeek: "1,3",
       recurrenceEndDate: null,
       enabled: true,
+      pausedFrom: null,
+      pausedUntil: null,
     }
   );
 });
@@ -387,4 +391,119 @@ test("slots already beyond the 30 minute lateness window are not created", () =>
   assert.equal(creatableSlots(slots, new Date(runAt - 60_000)).length, 2, "not yet due");
   assert.equal(creatableSlots(slots, new Date(runAt + 30 * 60_000)).length, 2, "exactly at the limit");
   assert.equal(creatableSlots(slots, new Date(runAt + 30 * 60_000 + 1)).length, 1, "just past it");
+});
+
+// ── pause (paused_from .. paused_until) ──────────────────────────────────────
+
+const daily = (overrides: Partial<ScheduleRule> = {}): ScheduleRule =>
+  rule({ startDate: "2026-06-01", recurrenceType: "daily", recurrenceInterval: 1, ...overrides });
+
+test("pause: daily 1st..10th paused 4th..7th keeps 1-3, drops 4-7, shows again on the 8th", () => {
+  const paused = daily({
+    recurrenceEndDate: "2026-06-10",
+    pausedFrom: "2026-06-04",
+    pausedUntil: "2026-06-07",
+  });
+  assert.deepEqual(dates(paused, "2026-06-01", "2026-06-30"), [
+    "2026-06-01",
+    "2026-06-02",
+    "2026-06-03",
+    "2026-06-08",
+    "2026-06-09",
+    "2026-06-10",
+  ]);
+});
+
+test("pause: both ends are inclusive and a one-day pause drops exactly that day", () => {
+  const range = daily({ pausedFrom: "2026-06-04", pausedUntil: "2026-06-07" });
+  assert.deepEqual(dates(range, "2026-06-03", "2026-06-08"), ["2026-06-03", "2026-06-08"]);
+
+  const oneDay = daily({ pausedFrom: "2026-06-05", pausedUntil: "2026-06-05" });
+  assert.deepEqual(dates(oneDay, "2026-06-04", "2026-06-06"), ["2026-06-04", "2026-06-06"]);
+});
+
+test("pause: a window that does not intersect the queried range changes nothing", () => {
+  const paused = daily({ pausedFrom: "2026-07-01", pausedUntil: "2026-07-05" });
+  assert.deepEqual(dates(paused, "2026-06-01", "2026-06-03"), ["2026-06-01", "2026-06-02", "2026-06-03"]);
+  // Querying inside the window directly (the timeline for a single paused day) is empty.
+  assert.deepEqual(dates(paused, "2026-07-03", "2026-07-03"), []);
+});
+
+test("pause: weekly weekdays skip only the occurrences inside the window", () => {
+  const weekly = rule({
+    startDate: "2026-06-01", // Monday
+    recurrenceType: "weekly",
+    recurrenceInterval: 1,
+    recurrenceDaysOfWeek: "1,3",
+    pausedFrom: "2026-06-08",
+    pausedUntil: "2026-06-10",
+  });
+  // Mon 1, Wed 3, [Mon 8, Wed 10 paused], Mon 15, Wed 17
+  assert.deepEqual(dates(weekly, "2026-06-01", "2026-06-17"), [
+    "2026-06-01",
+    "2026-06-03",
+    "2026-06-15",
+    "2026-06-17",
+  ]);
+});
+
+test("pause: a half-set or malformed window is ignored instead of hiding the schedule", () => {
+  const all = ["2026-06-01", "2026-06-02", "2026-06-03"];
+  assert.deepEqual(dates(daily({ pausedFrom: "2026-06-01", pausedUntil: null }), "2026-06-01", "2026-06-03"), all);
+  assert.deepEqual(dates(daily({ pausedFrom: null, pausedUntil: "2026-06-03" }), "2026-06-01", "2026-06-03"), all);
+  assert.deepEqual(dates(daily({ pausedFrom: "x", pausedUntil: "y" }), "2026-06-01", "2026-06-03"), all);
+});
+
+test("pause: a paused day is not an occurrence, carries no override and is not overridable", () => {
+  const paused = daily({ pausedFrom: "2026-06-04", pausedUntil: "2026-06-07" });
+  assert.equal(isOccurrenceDate(paused, "2026-06-03"), true);
+  assert.equal(isOccurrenceDate(paused, "2026-06-04"), false);
+  assert.equal(isOccurrenceDate(paused, "2026-06-08"), true);
+
+  const occurrences = occurrencesBetween(
+    paused,
+    [
+      { localDate: "2026-06-05", time: "09:00" }, // orphan override of a paused day
+      { localDate: "2026-06-08", time: "10:00" },
+    ],
+    "2026-06-04",
+    "2026-06-09"
+  );
+  assert.deepEqual(
+    occurrences.map((o) => [o.date, o.time, o.overridden]),
+    [
+      ["2026-06-08", "10:00", true],
+      ["2026-06-09", "07:30", false],
+    ]
+  );
+});
+
+test("pause: a one-off schedule paused on its day has no occurrence at all", () => {
+  const once = rule({ startDate: "2026-06-22", pausedFrom: "2026-06-20", pausedUntil: "2026-06-25" });
+  assert.deepEqual(dates(once, "2026-06-01", "2026-07-31"), []);
+});
+
+test("pause: the due-slot planner input (dueSlotsFor) skips paused days and resumes after", () => {
+  const paused = daily({ pausedFrom: "2026-06-04", pausedUntil: "2026-06-07" });
+  const slots = dueSlotsFor(paused, [], new Set(), "Asia/Ho_Chi_Minh", "2026-06-03", "2026-06-08");
+  assert.deepEqual(slots.map((s) => s.date), ["2026-06-03", "2026-06-08"]);
+});
+
+test("pause: toScheduleRule maps paused_from/paused_until and defaults to not paused", () => {
+  const base = {
+    template_id: "tpl-1",
+    start_date: "2026-06-01",
+    time: "07:30",
+    recurrence_type: "daily" as const,
+    recurrence_interval: 1,
+    recurrence_days_of_week: null,
+    recurrence_end_date: null,
+    enabled: 1,
+  };
+  const withPause = toScheduleRule({ ...base, paused_from: "2026-06-04", paused_until: "2026-06-07" });
+  assert.equal(withPause.pausedFrom, "2026-06-04");
+  assert.equal(withPause.pausedUntil, "2026-06-07");
+  const without = toScheduleRule(base);
+  assert.equal(without.pausedFrom, null);
+  assert.equal(without.pausedUntil, null);
 });

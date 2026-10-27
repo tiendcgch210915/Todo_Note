@@ -196,7 +196,7 @@ test("changing the review time moves the pending review jobs and leaves sent one
 
 // ── planner ──────────────────────────────────────────────────────────────────
 
-test("the planner adds a review job for today and tomorrow at 21:30 local, next to the other three digests", async () => {
+test("the planner adds a review job for today and tomorrow at 21:30 local, next to the other five digests", async () => {
   await fx.insertDevice(turso, USER_ID, "reg-A");
 
   await planner.planAllUsers(at(TODAY, "06:00"));
@@ -208,6 +208,10 @@ test("the planner adds a review job for today and tomorrow at 21:30 local, next 
     `digest_habits ${TOMORROW} ${runAtVn(TOMORROW, "17:30")}`,
     `digest_morning ${TODAY} ${runAtVn(TODAY, "07:00")}`,
     `digest_morning ${TOMORROW} ${runAtVn(TOMORROW, "07:00")}`,
+    `digest_overdue_evening ${TODAY} ${runAtVn(TODAY, "17:00")}`,
+    `digest_overdue_evening ${TOMORROW} ${runAtVn(TOMORROW, "17:00")}`,
+    `digest_overdue_morning ${TODAY} ${runAtVn(TODAY, "07:00")}`,
+    `digest_overdue_morning ${TOMORROW} ${runAtVn(TOMORROW, "07:00")}`,
     `digest_review ${TODAY} ${runAtVn(TODAY, "21:30")}`,
     `digest_review ${TOMORROW} ${runAtVn(TOMORROW, "21:30")}`,
     `digest_todos ${TODAY} ${runAtVn(TODAY, "17:00")}`,

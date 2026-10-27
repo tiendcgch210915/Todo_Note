@@ -15,6 +15,9 @@ export type ScheduleRow = {
   recurrence_end_date: string | null;
   /** 0 | 1 */
   enabled: number;
+  /** Khoảng tạm dừng [paused_from, paused_until], cả hai đầu tính; cùng null = không dừng. */
+  paused_from: string | null;
+  paused_until: string | null;
   created_at: string;
   updated_at: string;
   deleted_at: string | null;
@@ -40,11 +43,18 @@ export type ScheduleFields = {
   recurrence_days_of_week: string | null;
   recurrence_end_date: string | null;
   enabled: boolean;
+  /**
+   * Khoảng tạm dừng. `undefined` = người gọi không nhắc tới: giữ nguyên khoảng đang có (lịch vừa
+   * được tạo lại sau khi xóa thì không dừng). `null` = bỏ tạm dừng. Luôn đi theo cặp.
+   */
+  paused_from?: string | null;
+  paused_until?: string | null;
 };
 
 const SCHEDULE_COLUMNS =
   "id, user_id, template_id, start_date, time, recurrence_type, recurrence_interval, " +
-  "recurrence_days_of_week, recurrence_end_date, enabled, created_at, updated_at, deleted_at";
+  "recurrence_days_of_week, recurrence_end_date, enabled, paused_from, paused_until, " +
+  "created_at, updated_at, deleted_at";
 
 const OVERRIDE_COLUMNS =
   "id, user_id, template_id, local_date, time, created_at, updated_at, deleted_at";
@@ -74,6 +84,8 @@ const mapSchedule = (row: Record<string, unknown>): ScheduleRow => ({
   recurrence_days_of_week: (row.recurrence_days_of_week as string | null) ?? null,
   recurrence_end_date: (row.recurrence_end_date as string | null) ?? null,
   enabled: Number(row.enabled),
+  paused_from: (row.paused_from as string | null) ?? null,
+  paused_until: (row.paused_until as string | null) ?? null,
   created_at: row.created_at as string,
   updated_at: row.updated_at as string,
   deleted_at: (row.deleted_at as string | null) ?? null,
@@ -120,6 +132,9 @@ export const getScheduleById = async (id: string): Promise<ScheduleRow | null> =
 /**
  * Tạo hoặc thay thế lịch của (user, checklist). Một dòng duy nhất cho mỗi cặp: lịch đã bị xóa mềm
  * được hồi sinh tại chỗ (giữ id) thay vì tạo dòng mới.
+ *
+ * Khoảng tạm dừng: nếu `fields` không nhắc tới thì GIỮ khoảng đang có (sửa giờ/lặp không làm lịch
+ * tự hết tạm dừng), trừ khi dòng đang bị xóa mềm (lịch tạo lại "từ đầu" nên không dừng).
  */
 export const upsertSchedule = async (
   userId: string,
@@ -127,11 +142,13 @@ export const upsertSchedule = async (
   fields: ScheduleFields
 ): Promise<ScheduleRow> => {
   const now = nowISO();
+  const pauseGiven = fields.paused_from !== undefined || fields.paused_until !== undefined;
   await turso.execute({
     sql: `INSERT INTO checklist_schedules
           (id, user_id, template_id, start_date, time, recurrence_type, recurrence_interval,
-           recurrence_days_of_week, recurrence_end_date, enabled, created_at, updated_at, deleted_at)
-          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)
+           recurrence_days_of_week, recurrence_end_date, enabled, paused_from, paused_until,
+           created_at, updated_at, deleted_at)
+          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)
           ON CONFLICT(user_id, template_id) DO UPDATE SET
             start_date = excluded.start_date,
             time = excluded.time,
@@ -140,6 +157,12 @@ export const upsertSchedule = async (
             recurrence_days_of_week = excluded.recurrence_days_of_week,
             recurrence_end_date = excluded.recurrence_end_date,
             enabled = excluded.enabled,
+            paused_from = CASE WHEN ? = 1 THEN excluded.paused_from
+                               WHEN checklist_schedules.deleted_at IS NOT NULL THEN NULL
+                               ELSE checklist_schedules.paused_from END,
+            paused_until = CASE WHEN ? = 1 THEN excluded.paused_until
+                                WHEN checklist_schedules.deleted_at IS NOT NULL THEN NULL
+                                ELSE checklist_schedules.paused_until END,
             updated_at = excluded.updated_at,
             deleted_at = NULL`,
     args: [
@@ -153,8 +176,12 @@ export const upsertSchedule = async (
       fields.recurrence_days_of_week,
       fields.recurrence_end_date,
       fields.enabled ? 1 : 0,
+      fields.paused_from ?? null,
+      fields.paused_until ?? null,
       now,
       now,
+      pauseGiven ? 1 : 0,
+      pauseGiven ? 1 : 0,
     ],
   });
   const row = await getLiveSchedule(userId, templateId);

@@ -119,14 +119,16 @@ test("which todos get repeat nudges", () => {
   assert.equal(wants({ estimated_minutes: 0 }), true);
   assert.equal(wants({ estimated_minutes: null }), true);
 
-  // not important AND not urgent -> no nudges; any other combination (including unknown) -> nudges
+  // important+urgent and urgent-only get per-todo nudges; important-only has the 17:00/07:00 digest
+  // instead and not-important+not-urgent only gets the on-time reminder; unknown keeps the default.
   const flags: Array<[number | boolean | null, number | boolean | null, boolean]> = [
     [1, 1, true],
-    [1, 0, true],
+    [1, 0, false],
     [0, 1, true],
     [0, 0, false],
     [false, false, false],
-    [true, false, true],
+    [true, false, false],
+    [true, true, true],
     [null, null, true],
     [0, null, true],
     [null, 0, true],
@@ -208,8 +210,8 @@ type CreateInput = Parameters<typeof todosService.createTodo>[1];
 const makeTodo = async (input: CreateInput) => (await todosService.createTodo(USER_ID, input)).todo;
 const EVEN_SLOTS = ["12:00", "14:00", "16:00", "18:00", "20:00", "22:00"];
 
-test("an important todo at 10:00 gets pending nudges at 12, 14, 16, 18, 20 and 22", async () => {
-  const todo = await makeTodo({ title: "Nộp báo cáo", scheduled_date: DATE, time: "10:00", is_important: true, is_urgent: false });
+test("an urgent (not important) todo at 10:00 gets pending nudges at 12, 14, 16, 18, 20 and 22", async () => {
+  const todo = await makeTodo({ title: "Nộp báo cáo", scheduled_date: DATE, time: "10:00", is_important: false, is_urgent: true });
 
   assert.deepEqual(await pendingRunAts("todo_overdue", todo.id), slotsVn(DATE, EVEN_SLOTS));
   const rows = await overdueRows();
@@ -219,10 +221,12 @@ test("an important todo at 10:00 gets pending nudges at 12, 14, 16, 18, 20 and 2
   }
 });
 
-test("eligibility: unclassified, estimate up to 2h and urgent-only todos are nudged; the rest are not", async () => {
+test("eligibility: unclassified, important+urgent, urgent-only and small estimates are nudged; the rest are not", async () => {
   const cases: Array<[string, CreateInput, boolean]> = [
     ["unclassified", { title: "a", scheduled_date: DATE, time: "10:00" }, true],
     ["urgent only", { title: "b", scheduled_date: DATE, time: "10:00", is_important: false, is_urgent: true }, true],
+    ["important and urgent", { title: "b2", scheduled_date: DATE, time: "10:00", is_important: true, is_urgent: true }, true],
+    ["important only (has the digest instead)", { title: "b3", scheduled_date: DATE, time: "10:00", is_important: true, is_urgent: false }, false],
     ["estimate exactly 120", { title: "c", scheduled_date: DATE, time: "10:00", estimated_minutes: 120 }, true],
     ["estimate 121", { title: "d", scheduled_date: DATE, time: "10:00", estimated_minutes: 121 }, false],
     ["not important, not urgent", { title: "e", scheduled_date: DATE, time: "10:00", is_important: false, is_urgent: false }, false],
@@ -374,7 +378,7 @@ const todoRow = async (id: string) => {
 };
 
 test("only slots that are in the future or at most 30 minutes late are created", async () => {
-  await fx.insertTodo(turso, { id: "t1", scheduledDate: TODAY, time: "10:00", isImportant: 1, isUrgent: 1 });
+  await fx.insertTodo(turso, { id: "t1", scheduledDate: TODAY, time: "10:00", isImportant: 0, isUrgent: 1 });
 
   // 14:20: the 12:00 slot is long gone, 14:00 is 20 minutes late, 16:00 and later are ahead.
   await nudges.reconcileTodoOverdue(USER_ID, await todoRow("t1"), VN, at(TODAY, "14:20"));
@@ -391,7 +395,7 @@ const maintenance = (now: Date) => runMaintenance({ now, logger: fx.silentLogger
 
 test("the tick creates the nudges of existing todos that never got any, once", async () => {
   await fx.insertDevice(turso, USER_ID, "reg-A");
-  await fx.insertTodo(turso, { id: "t1", scheduledDate: TODAY, time: "10:00", isImportant: 1, isUrgent: 0 });
+  await fx.insertTodo(turso, { id: "t1", scheduledDate: TODAY, time: "10:00", isImportant: 0, isUrgent: 1 });
 
   const first = await maintenance(at(TODAY, "09:00"));
   assert.equal(first.overdue_backfilled, 6);
@@ -404,8 +408,9 @@ test("the tick creates the nudges of existing todos that never got any, once", a
 
 test("backfill skips todos that are not eligible and users without a device", async () => {
   await fx.insertDevice(turso, USER_ID, "reg-A");
-  const base = { scheduledDate: TODAY, time: "10:00", isImportant: 1, isUrgent: 1 };
+  const base = { scheduledDate: TODAY, time: "10:00", isImportant: 0, isUrgent: 1 };
   await fx.insertTodo(turso, { id: "ok", ...base });
+  await fx.insertTodo(turso, { id: "important-only", ...base, isImportant: 1, isUrgent: 0 });
   await fx.insertTodo(turso, { id: "done", ...base, status: "done" });
   await fx.insertTodo(turso, { id: "sub", ...base, parentId: "ok" });
   await fx.insertTodo(turso, { id: "big", ...base, estimatedMinutes: 240 });
@@ -417,8 +422,13 @@ test("backfill skips todos that are not eligible and users without a device", as
 
   await maintenance(at(TODAY, "09:00"));
 
-  const refs = new Set((await overdueRows()).map((row) => row.ref_id));
-  assert.deepEqual([...refs], ["ok"]);
+  // "late" (22:30) is scanned but has no slot left for a 2-hour todo: only a 'missed' marker.
+  const live = (await overdueRows()).filter((row) => row.status !== "missed");
+  assert.deepEqual([...new Set(live.map((row) => row.ref_id))], ["ok"]);
+  assert.deepEqual(
+    (await overdueRows()).filter((row) => row.status === "missed").map((row) => row.ref_id),
+    ["late"]
+  );
   assert.equal((await overdueRows("todo_overdue", OTHER_USER_ID)).length, 0);
 });
 
@@ -454,7 +464,7 @@ test("a candidate scan cannot be starved by todos that have no slot left", async
 const armTodo = async (overrides: Partial<Parameters<typeof fx.insertTodo>[1]> = {}) => {
   await fx.insertDevice(turso, USER_ID, "reg-A", { id: "device-A" });
   await fx.insertDevice(turso, USER_ID, "reg-B", { id: "device-B", kind: "fid" });
-  await fx.insertTodo(turso, { id: "t1", title: "Nộp báo cáo", scheduledDate: TODAY, time: "10:00", isImportant: 1, isUrgent: 1, ...overrides });
+  await fx.insertTodo(turso, { id: "t1", title: "Nộp báo cáo", scheduledDate: TODAY, time: "10:00", isImportant: 0, isUrgent: 1, ...overrides });
   await maintenance(at(TODAY, "09:00"));
   assert.equal((await pendingRunAts("todo_overdue", "t1")).length, 6);
 };
@@ -854,4 +864,121 @@ test("each user's nudges are independent and follow their own time zone", async 
   for (const runAt of nz) {
     assert.equal(localDateOf(new Date(runAt), "Pacific/Auckland"), TODAY);
   }
+});
+
+// ── cadence by quadrant (important / urgent) ─────────────────────────────────
+
+const HOUR_MS = 60 * 60_000;
+const HOURLY = ["11:00", "12:00", "13:00", "14:00", "15:00", "16:00", "17:00", "18:00", "19:00", "20:00", "21:00", "22:00", "23:00"];
+
+test("the repeat interval follows the quadrant: 1h, none (digest), 2h, none, unknown keeps 2h", () => {
+  const interval = (important: number | boolean | null, urgent: number | boolean | null) =>
+    nudges.todoOverdueIntervalMs(todoFields({ is_important: important, is_urgent: urgent }));
+
+  assert.equal(interval(1, 1), HOUR_MS, "important and urgent: every hour");
+  assert.equal(interval(true, true), HOUR_MS);
+  assert.equal(interval(1, 0), null, "important only: the 17:00 / 07:00 digest instead");
+  assert.equal(interval(true, false), null);
+  assert.equal(interval(0, 1), 2 * HOUR_MS, "urgent only: every 2 hours");
+  assert.equal(interval(false, true), 2 * HOUR_MS);
+  assert.equal(interval(0, 0), null, "neither: only the on-time reminder");
+  assert.equal(interval(false, false), null);
+  // Not fully classified: do not guess, keep the default 2 hours.
+  for (const [important, urgent] of [[null, null], [1, null], [null, 1], [0, null], [null, 0]] as const) {
+    assert.equal(interval(important, urgent), 2 * HOUR_MS, `important=${important} urgent=${urgent}`);
+  }
+  // The general conditions still apply to every quadrant.
+  assert.equal(nudges.todoOverdueIntervalMs(todoFields({ is_important: 1, is_urgent: 1, estimated_minutes: 121 })), null);
+  assert.equal(nudges.todoOverdueIntervalMs(todoFields({ is_important: 1, is_urgent: 1, status: "done" })), null);
+  assert.equal(nudges.todoOverdueIntervalMs(todoFields({ is_important: 1, is_urgent: 1, time: null })), null);
+});
+
+test("hourly slots: appointment + 1h, 2h, ... until the end of the day, and only those are valid", () => {
+  const date = "2026-06-20";
+  const scheduledAt = at(date, "10:00");
+
+  assert.deepEqual(localTimes(nudges.overdueSlots(scheduledAt, date, VN, HOUR_MS)), HOURLY);
+  assert.deepEqual(localTimes(nudges.overdueSlots(at(date, "22:30"), date, VN, HOUR_MS)), ["23:30"]);
+  assert.deepEqual(nudges.overdueSlots(at(date, "23:00"), date, VN, HOUR_MS), [], "23:00 + 1h is tomorrow");
+  assert.equal(nudges.overdueSlots(at(date, "00:00"), date, VN, HOUR_MS).length, 23);
+
+  assert.equal(nudges.isOverdueSlot(scheduledAt, at(date, "11:00"), date, VN, HOUR_MS), true);
+  assert.equal(nudges.isOverdueSlot(scheduledAt, at(date, "11:00"), date, VN), false, "11:00 is not a 2-hour slot");
+  assert.equal(nudges.isOverdueSlot(scheduledAt, at(date, "10:30"), date, VN, HOUR_MS), false);
+  assert.equal(nudges.isOverdueSlot(scheduledAt, at(date, "10:00"), date, VN, HOUR_MS), false, "the appointment itself");
+});
+
+test("an important and urgent todo at 10:00 is nudged every hour until the end of the day", async () => {
+  const todo = await makeTodo({ title: "Gấp", scheduled_date: DATE, time: "10:00", is_important: true, is_urgent: true });
+
+  assert.deepEqual(await pendingRunAts("todo_overdue", todo.id), slotsVn(DATE, HOURLY));
+});
+
+test("important only and neither-important-nor-urgent todos get no repeat nudge at all", async () => {
+  const importantOnly = await makeTodo({ title: "Quan trọng", scheduled_date: DATE, time: "10:00", is_important: true, is_urgent: false });
+  const neither = await makeTodo({ title: "Nhẹ", scheduled_date: DATE, time: "10:00", is_important: false, is_urgent: false });
+
+  assert.deepEqual(await statusesOf("todo_overdue", importantOnly.id), []);
+  assert.deepEqual(await statusesOf("todo_overdue", neither.id), []);
+});
+
+test("moving a todo between quadrants re-times its nudges; slots both cadences share are kept", async () => {
+  const todo = await makeTodo({ title: "A", scheduled_date: DATE, time: "10:00", is_important: true, is_urgent: true });
+  assert.equal((await pendingRunAts("todo_overdue", todo.id)).length, 13);
+
+  await todosService.updateTodo(USER_ID, todo.id, { is_important: false }); // urgent only
+  assert.deepEqual(await pendingRunAts("todo_overdue", todo.id), slotsVn(DATE, EVEN_SLOTS));
+
+  await todosService.updateTodo(USER_ID, todo.id, { is_urgent: false }); // neither
+  assert.deepEqual(await pendingRunAts("todo_overdue", todo.id), []);
+
+  await todosService.updateTodo(USER_ID, todo.id, { is_important: true }); // important only
+  assert.deepEqual(await pendingRunAts("todo_overdue", todo.id), []);
+
+  await todosService.updateTodo(USER_ID, todo.id, { is_urgent: true }); // important and urgent again
+  assert.deepEqual(await pendingRunAts("todo_overdue", todo.id), slotsVn(DATE, HOURLY));
+});
+
+test("the tick arms hourly nudges for an existing important and urgent todo, including one at 22:30", async () => {
+  await fx.insertDevice(turso, USER_ID, "reg-A");
+  await fx.insertTodo(turso, { id: "morning", scheduledDate: TODAY, time: "10:00", isImportant: 1, isUrgent: 1 });
+  await fx.insertTodo(turso, { id: "night", scheduledDate: TODAY, time: "22:30", isImportant: 1, isUrgent: 1 });
+
+  await maintenance(at(TODAY, "09:00"));
+
+  assert.deepEqual(await pendingRunAts("todo_overdue", "morning"), slotsVn(TODAY, HOURLY));
+  assert.deepEqual(await pendingRunAts("todo_overdue", "night"), [runAtVn(TODAY, "23:30")]);
+});
+
+test("an important and urgent todo is pushed every hour, one push per slot", async () => {
+  await fx.insertDevice(turso, USER_ID, "reg-A", { id: "device-A" });
+  await fx.insertTodo(turso, { id: "t1", title: "Nộp báo cáo", scheduledDate: TODAY, time: "10:00", isImportant: 1, isUrgent: 1 });
+  await maintenance(at(TODAY, "09:00"));
+
+  for (const hhmm of HOURLY) await dispatchAt(TODAY, hhmm);
+
+  assert.equal(overdueMessages().length, 13);
+  assert.equal(overdueMessages()[0].notification?.body, "⏰ Quá giờ 10:00 · Làm ngay hoặc dời lịch!");
+});
+
+test("a leftover odd-hour slot is dropped when the todo has since become urgent-only (2h)", async () => {
+  await fx.insertDevice(turso, USER_ID, "reg-A", { id: "device-A" });
+  await fx.insertTodo(turso, { id: "t1", title: "A", scheduledDate: TODAY, time: "10:00", isImportant: 1, isUrgent: 1 });
+  await maintenance(at(TODAY, "09:00"));
+  // Edited without going through the hook (e.g. an old write path): 11:00 is no longer a slot.
+  await turso.execute("UPDATE todos SET is_important = 0 WHERE id = 't1'");
+
+  await dispatchAt(TODAY, "11:00");
+  assert.equal(overdueMessages().length, 0);
+  await dispatchAt(TODAY, "12:00");
+  assert.equal(overdueMessages().length, 1, "12:00 is still a valid 2-hour slot");
+});
+
+test("a leftover nudge is dropped when the todo has since become important-only", async () => {
+  await armTodo();
+  await turso.execute("UPDATE todos SET is_important = 1, is_urgent = 0 WHERE id = 't1'");
+
+  await dispatchAt(TODAY, "12:00");
+
+  assert.equal(overdueMessages().length, 0);
 });

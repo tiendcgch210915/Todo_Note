@@ -76,21 +76,26 @@ beforeEach(async () => {
 
 // ── planner ──────────────────────────────────────────────────────────────────
 
-test("planner creates the four digests for today and tomorrow in the user's zone, once", async () => {
+test("planner creates the six digests for today and tomorrow in the user's zone, once", async () => {
   await fx.insertDevice(turso, USER_ID, "reg-1");
 
-  assert.equal(await planner.planAllUsers(T0), 8);
+  assert.equal(await planner.planAllUsers(T0), 12);
   assert.equal(await planner.planAllUsers(T0), 0, "second run must not create duplicates");
   assert.equal(await planner.planAllUsers(plusMinutes(T0, 5)), 0);
 
   const rows = await fx.jobsFor(turso, USER_ID);
-  assert.equal(rows.length, 8);
+  assert.equal(rows.length, 12);
   const key = (row: Record<string, unknown>) => `${row.kind} ${row.local_date} ${row.run_at}`;
   assert.deepEqual(rows.map(key).sort(), [
     "digest_habits 2026-06-20 2026-06-20T10:30:00.000Z",
     "digest_habits 2026-06-21 2026-06-21T10:30:00.000Z",
     "digest_morning 2026-06-20 2026-06-20T00:00:00.000Z",
     "digest_morning 2026-06-21 2026-06-21T00:00:00.000Z",
+    // 17:00 and 07:00 in Vietnam, fixed (they do not follow the user's evening/morning time).
+    "digest_overdue_evening 2026-06-20 2026-06-20T10:00:00.000Z",
+    "digest_overdue_evening 2026-06-21 2026-06-21T10:00:00.000Z",
+    "digest_overdue_morning 2026-06-20 2026-06-20T00:00:00.000Z",
+    "digest_overdue_morning 2026-06-21 2026-06-21T00:00:00.000Z",
     "digest_review 2026-06-20 2026-06-20T14:30:00.000Z",
     "digest_review 2026-06-21 2026-06-21T14:30:00.000Z",
     "digest_todos 2026-06-20 2026-06-20T10:00:00.000Z",
@@ -113,7 +118,9 @@ test("planner skips digests already past their lateness window and ignores users
   const rows = await fx.jobsFor(turso, USER_ID);
   const morning = rows.filter((row) => row.kind === "digest_morning");
   assert.deepEqual(morning.map((row) => row.local_date), ["2026-06-21"]);
-  assert.equal(rows.length, 7);
+  const overdueMorning = rows.filter((row) => row.kind === "digest_overdue_morning");
+  assert.deepEqual(overdueMorning.map((row) => row.local_date), ["2026-06-21"], "07:00 today is 5.5 h late (> 1 h)");
+  assert.equal(rows.length, 10);
   assert.equal((await fx.jobsFor(turso, OTHER_USER_ID)).length, 0, "no device -> no jobs");
   assert.equal((await fx.jobsFor(turso, "user-disabled")).length, 0, "disabled user -> no jobs");
 });
@@ -138,8 +145,10 @@ test("two concurrent ticks send a due job only once", async () => {
   const [a, b] = await Promise.all([tick(T0), tick(T0)]);
 
   assert.equal(fake.messages.length, 1, "exactly one push for the one due digest");
-  assert.equal(a.claimed + b.claimed, 1);
+  // Two jobs are due: the morning digest, and the overdue digest (nothing overdue: cancelled).
+  assert.equal(a.claimed + b.claimed, 2);
   assert.equal(a.sent + b.sent, 1);
+  assert.equal(a.cancelled + b.cancelled, 1);
 });
 
 // ── re-validation right before sending ──────────────────────────────────────
@@ -225,7 +234,7 @@ test("todo reminder is cancelled, not sent, if the todo was completed, deleted o
   }
 });
 
-test("checklist reminder reports unticked steps and is cancelled when all are ticked or the run stopped", async () => {
+test("running-checklist reminder reports unticked steps and is cancelled when all are ticked or the run stopped", async () => {
   await fx.insertDevice(turso, USER_ID, "reg-1");
   const items = await fx.insertTemplateWithItems(turso, { id: "tpl-1", title: "Rời nhà", itemCount: 3 });
   const startedAt = "2026-06-20T03:00:00.000Z";
@@ -241,9 +250,10 @@ test("checklist reminder reports unticked steps and is cancelled when all are ti
       args: [`ri-${index}`, itemId, index === 0 ? "done" : "pending", startedAt, startedAt],
     });
   }
-  const runAt = "2026-06-20T03:30:00.000Z";
-  const now = new Date("2026-06-20T03:31:00.000Z");
-  await fx.insertRawJob(turso, { id: "job-cl", kind: "checklist_30m", refId: "run-1", runAt });
+  // 03:00Z = 10:00 giờ Việt Nam: mốc theo giờ đầu tiên là 04:00Z (đã làm 1 giờ).
+  const runAt = "2026-06-20T04:00:00.000Z";
+  const now = new Date("2026-06-20T04:01:00.000Z");
+  await fx.insertRawJob(turso, { id: "job-cl", kind: "checklist_running", refId: "run-1", runAt, localDate: "2026-06-20" });
 
   await tick(now);
 
@@ -253,10 +263,10 @@ test("checklist reminder reports unticked steps and is cancelled when all are ti
   assert.equal(message.notification?.title, "Rời nhà");
   assert.equal(
     message.notification?.body,
-    "Đã chạy 30 phút · còn 2 bước chưa tick. Rà lại cho đủ nhé!"
+    "⏳ Đã làm 1 giờ · còn 2 bước chưa tick"
   );
   assert.equal(message.android?.notification?.channelId, "checklist_reminders");
-  assert.equal(message.android?.ttl, 1_800_000);
+  assert.equal(message.android?.ttl, 3_600_000);
 
   for (const [label, sql] of [
     ["all ticked", "UPDATE checklist_run_items SET status = 'done'"],
@@ -375,10 +385,13 @@ test("the documented lateness thresholds are the configured ones", () => {
     checklist_due: 30 * MINUTE,
     todo_overdue: 30 * MINUTE,
     checklist_overdue: 30 * MINUTE,
+    checklist_running: 30 * MINUTE,
     digest_morning: 2 * MIN,
     digest_todos: 2 * MIN,
     digest_habits: 1 * MIN,
     digest_review: 1 * MIN,
+    digest_overdue_evening: 1 * MIN,
+    digest_overdue_morning: 1 * MIN,
   });
 });
 
@@ -550,7 +563,7 @@ test("the tick summary contains counts only, no personal data", async () => {
 
 test("in steady state the planner reads but performs no writes, and fills only what is missing", async () => {
   await fx.insertDevice(turso, USER_ID, "reg-1");
-  assert.equal(await planner.planAllUsers(T0), 8);
+  assert.equal(await planner.planAllUsers(T0), 12);
 
   const originalBatch = turso.batch.bind(turso);
   let batches = 0;
@@ -568,7 +581,7 @@ test("in steady state the planner reads but performs no writes, and fills only w
 
   await turso.execute("DELETE FROM notification_jobs WHERE kind = 'digest_todos' AND local_date = '2026-06-21'");
   assert.equal(await planner.planAllUsers(T0), 1, "only the missing digest is recreated");
-  assert.equal((await fx.jobsFor(turso, USER_ID)).length, 8);
+  assert.equal((await fx.jobsFor(turso, USER_ID)).length, 12);
 });
 
 test("finished jobs older than 30 days are purged; recent and active ones are kept", async () => {

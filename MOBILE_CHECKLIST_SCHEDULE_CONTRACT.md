@@ -23,6 +23,8 @@
 | `recurrence_days_of_week` | `"1,3,5"` \| `null` | Mon=1 ... Sun=7. Only used by `weekly`. |
 | `recurrence_end_date` | `YYYY-MM-DD` \| `null` | The **end date of the schedule**, valid for repeating AND non-repeating schedules. Inclusive, must not be before `start_date`. Once it has passed the whole schedule is removed (see "Finished schedules are removed"). |
 | `enabled` | boolean | `false` keeps the schedule but stops occurrences and reminders. |
+| `paused_from` | `YYYY-MM-DD` \| `null` | Start of the pause window (see "Pausing a schedule"). Always set together with `paused_until`. |
+| `paused_until` | `YYYY-MM-DD` \| `null` | Last paused day, inclusive, not before `paused_from`. Both `null` = not paused. |
 | `created_at`, `updated_at` | ISO UTC | |
 
 Normalisation applied by the server (REST and sync alike):
@@ -31,6 +33,7 @@ Normalisation applied by the server (REST and sync alike):
 - `daily` / `custom` -> `recurrence_interval` defaults to 1; `recurrence_days_of_week` is stored as `null`.
 - `weekly` -> `recurrence_interval` defaults to 1; weekdays are sorted and de-duplicated (`"5,1,3,1"` becomes `"1,3,5"`). No weekdays = repeat on the weekday of `start_date`.
 - `enabled` defaults to `true`.
+- `paused_from` / `paused_until`: both `null` or both a real date with `paused_until >= paused_from`; anything else is `400 bad_input` (REST) / `bad_input` (sync op). **Leaving both keys out keeps the pause the schedule already has** (so an older app editing the time does not lift a pause); sending both as `null` clears it. A schedule that is deleted and set again starts from scratch, not paused.
 
 ### How occurrences are expanded (mirror this if you compute offline)
 
@@ -40,6 +43,27 @@ Normalisation applied by the server (REST and sync alike):
 - `weekly` with weekdays: `start_date` first, then the next listed weekday in the same Monday-Sunday week; after the last listed weekday of a week, jump `interval` weeks to the first listed weekday.
 - Stop after `recurrence_end_date` (inclusive). A schedule with `enabled = false` has no occurrences.
 - A non-repeating schedule has exactly one occurrence, on `start_date`. A later `recurrence_end_date` does not add occurrences; it only decides when the schedule is removed.
+- **Pause:** a date inside `[paused_from, paused_until]` (both ends inclusive) is not an occurrence. Apply it last, after the rules above; it never shifts the remaining dates.
+
+## Pausing a schedule
+
+For days the user wants to skip without losing the schedule ("pause until the end of the 7th"). While a day is paused the checklist has **no occurrence** that day, so:
+
+- it is not returned by `GET /checklists/occurrences` and must not be on the app's 24h timeline;
+- no `checklist_due` reminder is created or sent, and no `checklist_overdue` nudges either (pending ones are cancelled right away; the server also re-checks right before sending);
+- a time override for a paused day is rejected like any non-occurrence (`400 not_an_occurrence`), and an orphan override is ignored;
+- the schedule comes back **by itself** the day after `paused_until`: no job and no extra write is needed.
+
+Example: daily from the 1st to the 10th, today is the 4th, the user pauses through the 7th -> store `paused_from = 4th`, `paused_until = 7th`. The 1st-3rd stay on the timeline (they are history), the 4th-7th disappear, the 8th-10th show again.
+
+Rules for the app:
+
+- Set `paused_from` to the **local today** when the user pauses "from now". Do **not** leave it empty or use the schedule's start date: the days before the pause must keep their history on the timeline.
+- To change the end of a running pause keep its `paused_from`; to resume early send both as `null`. Editing a pause never changes `start_date`, the repeat rule or `recurrence_end_date`.
+- A pause whose `paused_until` is already in the past is harmless history; show it as "not paused". The server does not clean it up.
+- The pause does **not** extend the schedule: a schedule still expires after its end date (see below), and a one-off schedule paused on its day simply never fires.
+- Pausing does not touch a checklist run the user starts by hand; only scheduled reminders and occurrences are skipped.
+- Over REST it is the normal `PUT /checklists/templates/:id/schedule` with the two fields (omit them to keep the current pause, send `null`s to clear). `GET .../schedule`, `GET /checklists/templates/:id` and the sync pull return both fields.
 
 ## Finished schedules are removed
 
@@ -229,16 +253,36 @@ Rules:
 
 - Sent to **all** devices of the user at the occurrence time (the override time if any), unless the checklist was already completed that local day, the schedule was disabled/deleted/moved, or the checklist was deleted. The server re-checks all of this right before sending.
 - A reminder that would be sent more than 30 minutes late is dropped, never sent. FCM `ttl` 1 hour, priority `high`.
-- Android channel id: `checklist_reminders` (the app must create it; `checklist_30m` already uses it).
+- Android channel id: `checklist_reminders` (the app must create it; the "still running" nudges below use it too).
 - `notification.title`: the checklist title (newlines removed, whitespace collapsed, at most 60 characters including a trailing `…`).
 - `notification.body`: `Đến giờ thực hiện · {n} bước`, or only `Đến giờ thực hiện` when the checklist has no steps.
 - `data` (all strings): `{ "type": "checklist_due", "id": "<checklist id>", "date": "YYYY-MM-DD" }`. Open the checklist `id` and start a run.
 
 If the checklist is still not done 2 hours after its time, the server keeps nudging every 2 hours until the end of the day: see `MOBILE_NOTIFICATION_REMINDERS_CONTRACT.md`.
 
+## Push Notification `checklist_running` (a started checklist that is not finished)
+
+Replaces the single 30-minute nudge. While a run is `in_progress` the server nudges **every hour after it was started**, for the rest of that local day, and then **once at 06:00 the next morning**:
+
+| Started at | Nudges |
+| --- | --- |
+| 12:15 | 13:15, 14:15, ... , 23:15, then 06:00 the next day |
+| 23:30 | only 06:00 the next day (no hourly nudge crosses midnight) |
+
+- After the 06:00 reminder nothing more is sent for that run, even if it is still open.
+- Everything is in the user's notification timezone. A nudge is cancelled as soon as the run is completed, stopped or deleted, and it is not sent when every step is already ticked. The server re-checks this right before each send.
+- A nudge that would be sent more than 30 minutes late is dropped, never sent late. FCM `ttl` 1 hour, priority `high`, channel `checklist_reminders`.
+- `notification.title`: the checklist title (same normalisation as above).
+- `notification.body`, one short line (`n` = steps not ticked yet):
+  - hourly: `⏳ Đã làm {h} giờ · còn {n} bước chưa tick` (`h` = hours since the start: 1, 2, 3, ...);
+  - next morning: `🌅 Hôm qua chưa xong · còn {n} bước chưa tick`.
+- `data` (all strings), unchanged from the old nudge: `{ "type": "checklist", "id": "<run id>", "date": "YYYY-MM-DD" }`, where `date` is the local day the run was started. Open the run `id`; for the 06:00 reminder that run was started the day before.
+
+No app change is required: the type, the id and the channel are the same as before.
+
 Other copy changed in the same release:
 
-- `checklist_30m`: title is the checklist title; body `Đã chạy 30 phút · còn {n} bước chưa tick. Rà lại cho đủ nhé!`. `data` is unchanged.
+- The one-shot `checklist_30m` nudge (30 minutes after "start") is gone: see "Push Notification `checklist_running`" below.
 - `todo_reminder`: title is the todo's own title (same normalisation); the body depends on `is_important` / `is_urgent`:
 
 | `is_important` | `is_urgent` | Body |
@@ -257,3 +301,4 @@ Other copy changed in the same release:
 - `npm test` passes, including `tests/checklist-schedule.test.ts` (pure expansion), `tests/checklist-due.test.ts` (planner, hooks, send, re-validation), `tests/checklist-schedule-api.test.ts` (REST and sync) and `tests/checklist-schedule-expiry.test.ts` (finished schedules are removed).
 - Migration `0017_checklist_schedules.sql` creates `checklist_schedules`, `checklist_schedule_overrides` and rebuilds `notification_jobs` so its `kind` CHECK accepts `checklist_due`. Apply it with `npm run db:migrate` **before** deploying the code, because the new code inserts the new kind.
 - Manual send: `npm run notify:job-test -- <userId> checklist_due` (then `--cleanup`).
+- Pause: migration `0021_checklist_schedule_pause.sql` adds the two nullable columns `paused_from` / `paused_until` (existing rows = not paused). Apply it with `npm run db:migrate` **before** deploying the code, because the code selects and writes them. Covered by the `pause` tests in `tests/checklist-schedule.test.ts` (expansion), `tests/checklist-schedule-api.test.ts` (REST, sync, jobs) and `tests/checklist-due.test.ts` (planner, overdue nudges, re-validation before sending).

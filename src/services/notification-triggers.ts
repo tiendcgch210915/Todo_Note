@@ -7,10 +7,6 @@
  *  - Hook chỉ là đường nhanh. Độ đúng cuối cùng nằm ở bước kiểm tra lại ngay trước khi gửi
  *    (notification-tick) và bước vá todo thiếu job (notification-planner).
  */
-import {
-  CHECKLIST_REMINDER_AFTER_MS,
-  LATENESS_MS,
-} from "../config/notification-policy.js";
 import * as jobsRepo from "../repositories/notification-jobs.js";
 import * as settingsRepo from "../repositories/notification-settings.js";
 import * as sourcesRepo from "../repositories/notification-sources.js";
@@ -18,6 +14,10 @@ import * as timersRepo from "../repositories/todo-timers.js";
 import * as todosRepo from "../repositories/todos.js";
 import { localDateTimeToUtc } from "../utils/time.js";
 import { pushLogger } from "./push-logger.js";
+import {
+  reconcileAllChecklistRunNudges,
+  reconcileChecklistRunNudges,
+} from "./checklist-run-nudges.js";
 import {
   reconcileAllChecklistDue,
   reconcileChecklistDue,
@@ -127,13 +127,15 @@ export const onTodosRemoved = (
 
 /**
  * Checklist run bắt đầu / hoàn thành / dừng / xóa (REST hoặc sync):
- * đang chạy -> job nhắc sau 30 phút kể từ started_at; ngược lại -> hủy.
+ * đang chạy -> nhắc mỗi giờ kể từ started_at (và 06:00 sáng hôm sau); ngược lại -> hủy.
  */
 export const onChecklistRunChanged = async (
   userId: string,
   runId: string
 ): Promise<void> => {
-  await safely("checklist_run_changed", () => syncChecklist30m(userId, runId));
+  await safely("checklist_run_changed", () =>
+    reconcileChecklistRunNudges(userId, runId)
+  );
   // Hoàn thành đúng ngày của lịch KHÔNG lặp thì lịch hết nhiệm vụ: xóa như chưa từng đặt.
   await finishSchedulesForUserSafely(userId);
   // Một run hoàn thành (hoặc bị xóa/hủy) trong ngày đổi việc lần xuất hiện của lịch đã xong hay chưa.
@@ -141,25 +143,6 @@ export const onChecklistRunChanged = async (
     const templateId = await sourcesRepo.getRunTemplateId(userId, runId);
     if (templateId) await reconcileChecklistDue(userId, templateId);
   });
-};
-
-const syncChecklist30m = async (userId: string, runId: string): Promise<void> => {
-    const run = await sourcesRepo.getChecklistRunInfo(userId, runId);
-    if (!run || run.status !== "in_progress") {
-      await jobsRepo.cancelEventJobs("checklist_30m", [runId]);
-      return;
-    }
-    const startedMs = Date.parse(run.started_at);
-    if (Number.isNaN(startedMs)) return;
-    const runAtMs = startedMs + CHECKLIST_REMINDER_AFTER_MS;
-    // Run đồng bộ muộn từ offline: còn trong ngưỡng trễ thì vẫn nhắc, quá thì bỏ.
-    if (Date.now() - runAtMs > LATENESS_MS.checklist_30m) return;
-    await jobsRepo.upsertEventJob({
-      userId,
-      kind: "checklist_30m",
-      refId: runId,
-      runAt: new Date(runAtMs).toISOString(),
-    });
 };
 
 /**
@@ -182,4 +165,6 @@ export const onUserSettingsChanged = async (userId: string): Promise<void> => {
   await safely("user_settings_checklist_due", () => reconcileAllChecklistDue(userId));
   // Mốc nhắc lặp của todo tính từ giờ hẹn theo múi giờ nên cũng vậy.
   await safely("user_settings_todo_overdue", () => reconcileAllTodoOverdue(userId));
+  // Ngày địa phương và mốc 06:00 của run đang chạy cũng đổi theo múi giờ.
+  await safely("user_settings_checklist_running", () => reconcileAllChecklistRunNudges(userId));
 };

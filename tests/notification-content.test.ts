@@ -2,7 +2,8 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 
 import {
-  buildChecklist30m,
+  buildChecklistCarryover,
+  buildChecklistRunning,
   buildChecklistDue,
   buildHabitsDigest,
   buildMorningDigest,
@@ -214,7 +215,7 @@ test("an empty or missing title falls back", () => {
   assert.equal(buildTodoReminder("   ", 1, 1).title, "Todo");
 });
 
-// ── checklist_due / checklist_30m ────────────────────────────────────────────
+// ── checklist_due / checklist_running ───────────────────────────────────────────
 
 test("checklist due: title is the checklist title, body shows the step count", () => {
   assert.deepEqual(buildChecklistDue("Rời nhà", 5), {
@@ -238,13 +239,24 @@ test("checklist due: long and multi-line titles are normalized", () => {
   assert.equal(buildChecklistDue("", 2).title, "Checklist");
 });
 
-test("checklist 30 minutes: title is the checklist title, body reports unticked steps", () => {
-  assert.deepEqual(buildChecklist30m("Rời nhà", 3), {
+test("checklist running (hourly): short one-line body with hours so far and unticked steps", () => {
+  assert.deepEqual(buildChecklistRunning("Rời nhà", 3, 2), {
     title: "Rời nhà",
-    body: "Đã chạy 30 phút · còn 3 bước chưa tick. Rà lại cho đủ nhé!",
+    body: "⏳ Đã làm 2 giờ · còn 3 bước chưa tick",
   });
-  assert.equal(buildChecklist30m("Rời nhà", 0), null, "nothing left to tick: no push");
-  assert.equal(Array.from(buildChecklist30m("x".repeat(100), 1)?.title ?? "").length, PUSH_TITLE_MAX_CHARS);
+  assert.equal(buildChecklistRunning("Rời nhà", 1, 1)?.body, "⏳ Đã làm 1 giờ · còn 1 bước chưa tick");
+  assert.equal(buildChecklistRunning("Rời nhà", 0, 2), null, "nothing left to tick: no push");
+  assert.equal(buildChecklistRunning("Rời nhà", 3, 0)?.body, "⏳ Đã làm 1 giờ · còn 3 bước chưa tick", "hours are at least 1");
+  assert.equal(Array.from(buildChecklistRunning("x".repeat(100), 1, 1)?.title ?? "").length, PUSH_TITLE_MAX_CHARS);
+});
+
+test("checklist running (next morning): says it was not finished yesterday", () => {
+  assert.deepEqual(buildChecklistCarryover("Rời nhà", 3), {
+    title: "Rời nhà",
+    body: "🌅 Hôm qua chưa xong · còn 3 bước chưa tick",
+  });
+  assert.equal(buildChecklistCarryover("Rời nhà", 0), null);
+  assert.equal(buildChecklistCarryover("", 2)?.title, "Checklist");
 });
 
 // ── timer end is unchanged ───────────────────────────────────────────────────

@@ -33,6 +33,9 @@ export const ScheduleFieldsSchema = z
     recurrence_days_of_week: WeekdaysStr.nullable().optional(),
     recurrence_end_date: IsoDate.nullable().optional(),
     enabled: z.boolean().optional(),
+    // Tạm dừng [paused_from, paused_until], cả hai đầu tính; luôn đi theo cặp.
+    paused_from: IsoDate.nullable().optional(),
+    paused_until: IsoDate.nullable().optional(),
   })
   .superRefine((value, ctx) => {
     if (value.recurrence_end_date && value.recurrence_end_date < value.start_date) {
@@ -40,6 +43,21 @@ export const ScheduleFieldsSchema = z
         code: "custom",
         path: ["recurrence_end_date"],
         message: "recurrence_end_date must not be before start_date",
+      });
+    }
+    const hasFrom = value.paused_from != null;
+    const hasUntil = value.paused_until != null;
+    if (hasFrom !== hasUntil) {
+      ctx.addIssue({
+        code: "custom",
+        path: [hasFrom ? "paused_until" : "paused_from"],
+        message: "paused_from and paused_until must be set together",
+      });
+    } else if (value.paused_from && value.paused_until && value.paused_until < value.paused_from) {
+      ctx.addIssue({
+        code: "custom",
+        path: ["paused_until"],
+        message: "paused_until must not be before paused_from",
       });
     }
   });
@@ -51,13 +69,19 @@ export type ScheduleFieldsInput = z.infer<typeof ScheduleFieldsSchema>;
  *    được GIỮ (null = hết hạn ngay sau start_date, xem effectiveEndDate);
  *  - daily / custom: interval mặc định 1, bỏ thứ;
  *  - weekly: interval mặc định 1, thứ được sắp xếp và khử trùng (rỗng = thứ của start_date).
+ *  - tạm dừng: không nhắc tới (cả hai khóa vắng) -> bỏ khóa, repository giữ khoảng đang có; có nhắc
+ *    tới thì luôn là cặp (cùng ngày hoặc cùng null = bỏ tạm dừng).
  */
 export const normalizeScheduleFields = (input: ScheduleFieldsInput): ScheduleFields => {
   const type = input.recurrence_type ?? null;
+  const pauseGiven = input.paused_from !== undefined || input.paused_until !== undefined;
   const base = {
     start_date: input.start_date,
     time: input.time,
     enabled: input.enabled ?? true,
+    ...(pauseGiven
+      ? { paused_from: input.paused_from ?? null, paused_until: input.paused_until ?? null }
+      : {}),
   };
   if (type === null) {
     return {

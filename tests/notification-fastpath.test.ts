@@ -112,7 +112,7 @@ test("maintenance plans, backfills and purges but never sends; the next fast bea
 
   const maintenance = await runMaintenance({ now: T0, logger: fx.silentLogger });
 
-  assert.equal(maintenance.planned, 8);
+  assert.equal(maintenance.planned, 12);
   assert.equal(maintenance.backfilled, 1);
   assert.equal(maintenance.purged, 1);
   assert.equal(maintenance.claimed, 0);
@@ -148,7 +148,7 @@ test("the endpoint path (runTick) still does both; the summary only gained overd
     "sent",
     "stuck_failed",
   ]);
-  assert.equal(summary.planned, 8, "planner ran");
+  assert.equal(summary.planned, 12, "planner ran");
   assert.equal(summary.sent, 1, "dispatch ran in the same call");
 });
 

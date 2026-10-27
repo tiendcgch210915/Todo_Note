@@ -67,3 +67,42 @@ export const listTimedTodoIds = async (
   });
   return (res.rows as unknown as { id: string }[]).map((row) => row.id);
 };
+
+/**
+ * Id các run còn đang chạy của người dùng, bắt đầu từ `startedAfterIso` trở đi. Dùng khi đổi múi
+ * giờ để tính lại mốc nhắc.
+ */
+export const listInProgressRunIds = async (
+  userId: string,
+  startedAfterIso: string
+): Promise<string[]> => {
+  const res = await turso.execute({
+    sql: `SELECT id FROM checklist_runs
+          WHERE user_id = ? AND status = 'in_progress' AND deleted_at IS NULL
+            AND started_at >= ?`,
+    args: [userId, startedAfterIso],
+  });
+  return (res.rows as unknown as { id: string }[]).map((row) => row.id);
+};
+
+/**
+ * Số todo "quan trọng & không khẩn cấp" còn làm dở của ngày địa phương `scheduledDate`, có giờ hẹn
+ * (giống các nhắc khác chỉ xét todo có giờ hẹn). `beforeTime` (HH:mm) giữ lại chỉ những todo có giờ
+ * hẹn SỚM HƠN mốc đó, tức đã quá hạn vào lúc ấy; null = mọi giờ hẹn trong ngày.
+ */
+export const countOverdueImportantTodos = async (
+  userId: string,
+  scheduledDate: string,
+  beforeTime: string | null
+): Promise<number> => {
+  const res = await turso.execute({
+    sql: `SELECT COUNT(*) AS n FROM todos
+          WHERE user_id = ? AND scheduled_date = ?
+            AND deleted_at IS NULL AND parent_id IS NULL
+            AND status IN ('open', 'in_progress')
+            AND time IS NOT NULL ${beforeTime === null ? "" : "AND time < ?"}
+            AND is_important = 1 AND is_urgent = 0`,
+    args: beforeTime === null ? [userId, scheduledDate] : [userId, scheduledDate, beforeTime],
+  });
+  return Number((res.rows[0] as unknown as { n: number }).n);
+};

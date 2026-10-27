@@ -20,6 +20,7 @@ const contentService = await import("../src/services/content.js");
 const usersService = await import("../src/services/users.js");
 const { processPush } = await import("../src/services/sync.service.js");
 const { runTick } = await import("../src/services/notification-tick.js");
+const { runNudgeSlots } = await import("../src/services/checklist-run-nudges.js");
 const { localDateTimeToUtc } = await import("../src/utils/time.js");
 const { default: Fastify } = await import("fastify");
 const { default: userAuth } = await import("../src/plugins/user-auth.js");
@@ -242,12 +243,20 @@ test("an admin timezone edit moves the pending digests", async () => {
   await usersService.updateUserProfile(USER_ID, { timezone: "America/New_York" });
 
   for (const job of await fx.jobsFor(turso, USER_ID, "AND status = 'pending'")) {
-    const kind = job.kind as "digest_morning" | "digest_todos" | "digest_habits" | "digest_review";
+    const kind = job.kind as
+      | "digest_morning"
+      | "digest_todos"
+      | "digest_habits"
+      | "digest_review"
+      | "digest_overdue_evening"
+      | "digest_overdue_morning";
     const hhmm = {
       digest_morning: "07:00",
       digest_todos: "17:00",
       digest_habits: "17:30",
       digest_review: "21:30",
+      digest_overdue_evening: "17:00",
+      digest_overdue_morning: "07:00",
     }[kind];
     assert.equal(
       job.run_at,
@@ -319,31 +328,50 @@ test("sync push: a pushed user entity with a new timezone moves the pending dige
 
 // ── checklist runs ───────────────────────────────────────────────────────────
 
-const checklistJob = (runId: string) =>
-  jobsRepo.getEventJob(USER_ID, "checklist_30m", runId);
+const VN_TZ = "Asia/Ho_Chi_Minh";
 
-test("REST: starting a run arms a job 30 minutes after started_at; complete/abandon/delete cancel it", async () => {
+/** Mọi mốc nhắc theo quy tắc cho một run bắt đầu lúc `startedAt` (giờ, rồi 06:00 hôm sau). */
+const expectedNudges = (startedAt: string): string[] =>
+  runNudgeSlots(new Date(startedAt), VN_TZ).map((slot) => slot.at.toISOString()).sort();
+
+const nudgeRows = (runId: string) =>
+  fx.jobsFor(turso, USER_ID, `AND kind = 'checklist_running' AND ref_id = '${runId}'`);
+const nudgesWith = async (runId: string, status: string): Promise<string[]> =>
+  (await nudgeRows(runId))
+    .filter((row) => row.status === status)
+    .map((row) => String(row.run_at))
+    .sort();
+
+test("REST: starting a run arms hourly nudges plus the next-morning one; complete/abandon/delete cancel them", async () => {
   await fx.insertTemplateWithItems(turso, { id: "tpl-1", itemCount: 2 });
 
   const started = await checklistsService.startRun(USER_ID, { template_id: "tpl-1" });
-  const job = await checklistJob(started.run.id);
-  assert.equal(job?.status, "pending");
-  assert.equal(job?.run_at, new Date(Date.parse(started.run.started_at) + 30 * 60_000).toISOString());
+  const pending = await nudgesWith(started.run.id, "pending");
+  assert.deepEqual(pending, expectedNudges(started.run.started_at));
+  assert.ok(pending.length >= 1, "always at least the next-morning nudge");
+  assert.equal(
+    pending[pending.length - 1],
+    runNudgeSlots(new Date(started.run.started_at), VN_TZ).find((slot) => slot.kind === "carryover")?.at.toISOString()
+  );
+  // The old one-shot 30-minute job is no longer created.
+  assert.deepEqual(await fx.jobsFor(turso, USER_ID, "AND kind = 'checklist_30m'"), []);
 
   await checklistsService.abandonRun(USER_ID, started.run.id);
-  assert.equal((await checklistJob(started.run.id))?.status, "cancelled");
+  assert.deepEqual(await nudgesWith(started.run.id, "pending"), []);
+  assert.equal((await nudgesWith(started.run.id, "cancelled")).length, pending.length);
 
   const second = await checklistsService.startRun(USER_ID, { template_id: "tpl-1" });
-  assert.equal((await checklistJob(second.run.id))?.status, "pending");
+  assert.ok((await nudgesWith(second.run.id, "pending")).length >= 1);
   await checklistsService.completeRun(USER_ID, second.run.id, {});
-  assert.equal((await checklistJob(second.run.id))?.status, "cancelled");
+  assert.deepEqual(await nudgesWith(second.run.id, "pending"), []);
 
   const third = await checklistsService.startRun(USER_ID, { template_id: "tpl-1" });
+  assert.ok((await nudgesWith(third.run.id, "pending")).length >= 1);
   await checklistsService.deleteRun(USER_ID, third.run.id);
-  assert.equal((await checklistJob(third.run.id))?.status, "cancelled");
+  assert.deepEqual(await nudgesWith(third.run.id, "pending"), []);
 });
 
-test("sync push: a run created offline arms the job, finishing or deleting it cancels", async () => {
+test("sync push: a run created offline arms the nudges, finishing or deleting it cancels them", async () => {
   await fx.insertTemplateWithItems(turso, { id: "tpl-2", itemCount: 1 });
   const startedAt = stamp(-60_000);
   const runId = "sync-run-1";
@@ -351,31 +379,31 @@ test("sync push: a run created offline arms the job, finishing or deleting it ca
   await processPush(USER_ID, [
     { op: "create", type: "checklist_run", payload: { id: runId, template_id: "tpl-2", name: null, status: "in_progress", started_at: startedAt, created_at: startedAt, updated_at: startedAt } },
   ]);
-  assert.equal((await checklistJob(runId))?.status, "pending");
+  assert.deepEqual(await nudgesWith(runId, "pending"), expectedNudges(startedAt));
 
   await processPush(USER_ID, [
     { op: "update", type: "checklist_run", payload: { id: runId, template_id: "tpl-2", name: null, status: "completed", started_at: startedAt, completed_at: stamp(), created_at: startedAt, updated_at: stamp(2000) } },
   ]);
-  assert.equal((await checklistJob(runId))?.status, "cancelled");
+  assert.deepEqual(await nudgesWith(runId, "pending"), []);
 
   const other = "sync-run-2";
   await processPush(USER_ID, [
     { op: "create", type: "checklist_run", payload: { id: other, template_id: "tpl-2", name: null, status: "in_progress", started_at: startedAt, created_at: startedAt, updated_at: startedAt } },
   ]);
-  assert.equal((await checklistJob(other))?.status, "pending");
+  assert.ok((await nudgesWith(other, "pending")).length >= 1);
   await processPush(USER_ID, [
     { op: "delete", type: "checklist_run", payload: { id: other, deleted_at: stamp(3000) } },
   ]);
-  assert.equal((await checklistJob(other))?.status, "cancelled");
+  assert.deepEqual(await nudgesWith(other, "pending"), []);
 });
 
-test("a run that was already far past its 30 minutes when it syncs gets no reminder", async () => {
+test("a run that was already far past all of its nudges when it syncs gets none", async () => {
   await fx.insertTemplateWithItems(turso, { id: "tpl-3", itemCount: 1 });
-  const longAgo = stamp(-3 * 3_600_000);
+  const longAgo = stamp(-48 * 3_600_000);
   await processPush(USER_ID, [
     { op: "create", type: "checklist_run", payload: { id: "old-run", template_id: "tpl-3", name: null, status: "in_progress", started_at: longAgo, created_at: longAgo, updated_at: longAgo } },
   ]);
-  assert.equal(await checklistJob("old-run"), null);
+  assert.deepEqual(await nudgeRows("old-run"), []);
 });
 
 // ── safety net: todos that never got a job ───────────────────────────────────
@@ -451,6 +479,9 @@ test("PUT /notification-settings saves, changes users.timezone and moves pending
     digest_todos: "20:00",
     digest_habits: "20:30",
     digest_review: "21:30",
+    // Fixed times: they do not follow the user's morning/evening settings.
+    digest_overdue_evening: "17:00",
+    digest_overdue_morning: "07:00",
   } as const;
   const pending = await fx.jobsFor(turso, USER_ID, "AND status = 'pending'");
   assert.ok(pending.length > 0);

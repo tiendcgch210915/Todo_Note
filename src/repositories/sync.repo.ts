@@ -828,6 +828,10 @@ export const upsertEntity = async (
         p.start_date, p.time, p.recurrence_type ?? null, p.recurrence_interval ?? null,
         p.recurrence_days_of_week ?? null, p.recurrence_end_date ?? null, p.enabled ?? 1,
       ];
+      // Tạm dừng: payload không nhắc tới (app cũ) thì giữ khoảng đang có; dòng đang bị xóa mềm
+      // được dựng lại "từ đầu" nên không dừng. Có nhắc tới thì luôn là cặp (đã kiểm ở Zod).
+      const pauseGiven = p.paused_from !== undefined || p.paused_until !== undefined;
+      const pause = [p.paused_from ?? null, p.paused_until ?? null];
 
       if (existing.rows.length > 0) {
         const row = existing.rows[0] as unknown as { id: string; updated_at: string };
@@ -836,18 +840,31 @@ export const upsertEntity = async (
           sql: `UPDATE checklist_schedules
                 SET template_id = ?, start_date = ?, time = ?, recurrence_type = ?,
                     recurrence_interval = ?, recurrence_days_of_week = ?,
-                    recurrence_end_date = ?, enabled = ?, updated_at = ?, deleted_at = ?
+                    recurrence_end_date = ?, enabled = ?,
+                    paused_from = CASE WHEN ? = 1 THEN ?
+                                       WHEN deleted_at IS NOT NULL THEN NULL
+                                       ELSE paused_from END,
+                    paused_until = CASE WHEN ? = 1 THEN ?
+                                        WHEN deleted_at IS NOT NULL THEN NULL
+                                        ELSE paused_until END,
+                    updated_at = ?, deleted_at = ?
                 WHERE id = ? AND user_id = ?`,
-          args: dbArgs([p.template_id, ...fields, updatedAt, deletedAt, row.id, userId]),
+          args: dbArgs([
+            p.template_id, ...fields,
+            pauseGiven ? 1 : 0, pause[0], pauseGiven ? 1 : 0, pause[1],
+            updatedAt, deletedAt, row.id, userId,
+          ]),
         });
       } else {
         await turso.execute({
           sql: `INSERT INTO checklist_schedules
                 (id, user_id, template_id, start_date, time, recurrence_type,
                  recurrence_interval, recurrence_days_of_week, recurrence_end_date, enabled,
-                 created_at, updated_at, deleted_at)
-                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)`,
-          args: dbArgs([p.id, userId, p.template_id, ...fields, createdAt, updatedAt, deletedAt]),
+                 paused_from, paused_until, created_at, updated_at, deleted_at)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+          args: dbArgs([
+            p.id, userId, p.template_id, ...fields, ...pause, createdAt, updatedAt, deletedAt,
+          ]),
         });
       }
       break;

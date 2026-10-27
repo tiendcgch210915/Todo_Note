@@ -1,7 +1,13 @@
 /**
- * Nhắc LẶP khi người dùng bỏ lỡ giờ hẹn của một todo: giờ hẹn + 2h, +4h, ... cho tới hết ngày
- * địa phương đó, miễn là todo vẫn chưa xong. Module này KHÔNG import env/firebase để các service
- * nghiệp vụ dùng được trong test không có cấu hình.
+ * Nhắc LẶP khi người dùng bỏ lỡ giờ hẹn của một todo, cho tới hết ngày địa phương đó, miễn là todo
+ * vẫn chưa xong. Nhịp nhắc phụ thuộc todo thuộc nhóm nào (xem `todoOverdueIntervalMs`):
+ *  - quan trọng & khẩn cấp: giờ hẹn + 1h, +2h, ...;
+ *  - khẩn cấp (không quan trọng) hoặc chưa phân loại: giờ hẹn + 2h, +4h, ...;
+ *  - quan trọng (không khẩn cấp): KHÔNG nhắc theo từng todo, đã có tổng kết 17:00 và 07:00 sáng
+ *    hôm sau (digest_overdue_*);
+ *  - không quan trọng, không khẩn cấp: chỉ nhắc đúng giờ hẹn.
+ *
+ * Module này KHÔNG import env/firebase để các service nghiệp vụ dùng được trong test không có cấu hình.
  *
  * Mỗi mốc là MỘT dòng job (`todo_overdue`, unique theo user/kind/ref_id/run_at):
  *  - hook (`reconcileTodoOverdue`): todo đổi -> hủy mốc thừa, upsert mốc còn hợp lệ;
@@ -26,12 +32,13 @@ import { resolveSettings } from "./notification-schedule.js";
 
 // ── Hàm thuần ────────────────────────────────────────────────────────────────
 
-/** Một ngày không có quá chừng này mốc (24h / 2h = 12; dư một mốc cho ngày đổi giờ 25 tiếng). */
-const MAX_SLOTS_PER_DAY = 13;
+/** Một ngày không có quá chừng này mốc (24h / 1h = 24; dư một mốc cho ngày đổi giờ 25 tiếng). */
+const MAX_SLOTS_PER_DAY = 25;
 
 type Flag = number | boolean | null | undefined;
 
 const isFalse = (value: Flag): boolean => value === 0 || value === false;
+const isTrue = (value: Flag): boolean => value === 1 || value === true;
 
 export type OverdueTodoFields = {
   status: string;
@@ -44,40 +51,66 @@ export type OverdueTodoFields = {
 };
 
 /**
- * Todo có thuộc diện nhắc lặp không. Cần ĐỒNG THỜI:
- *  - còn làm dở (open/in_progress), là todo cấp trên cùng, có ngày và giờ hẹn;
- *  - ước lượng KHÔNG quá 2 giờ (trên 2h thì không bao giờ nhắc lặp; chưa ước lượng thì nhắc);
- *  - không phải loại "không quan trọng, không khẩn cấp". Chỉ khi CẢ HAI cờ đều là false mới bỏ;
- *    chưa phân loại (null) thì không đoán, vẫn nhắc.
+ * Nhịp nhắc lặp (ms) theo nhóm (quan trọng, khẩn cấp), hoặc null nếu nhóm đó không nhắc lặp theo
+ * từng todo:
+ *
+ * | quan trọng | khẩn cấp | nhắc                                                         |
+ * | ---------- | -------- | ------------------------------------------------------------ |
+ * | có         | có       | mỗi 1 giờ                                                    |
+ * | có         | không    | không nhắc từng todo (tổng kết 17:00 + 07:00 sáng hôm sau)   |
+ * | không      | có       | mỗi 2 giờ                                                    |
+ * | không      | không    | không nhắc lặp (chỉ nhắc đúng giờ hẹn)                       |
+ *
+ * Chưa phân loại (ít nhất một cờ là null) thì không đoán: giữ nhịp mặc định 2 giờ như trước đây.
  */
-export const todoWantsOverdue = <T extends OverdueTodoFields>(
-  todo: T
-): todo is T & { time: string; scheduled_date: string } => {
-  if (todo.status !== "open" && todo.status !== "in_progress") return false;
-  if (todo.parent_id !== null) return false;
-  if (!todo.time || !todo.scheduled_date) return false;
+export const overdueIntervalForFlags = (
+  isImportant: Flag,
+  isUrgent: Flag
+): number | null => {
+  if (isTrue(isImportant) && isTrue(isUrgent)) return OVERDUE.importantUrgentIntervalMs;
+  if (isTrue(isImportant) && isFalse(isUrgent)) return null;
+  if (isFalse(isImportant) && isFalse(isUrgent)) return null;
+  return OVERDUE.intervalMs;
+};
+
+/**
+ * Nhịp nhắc lặp (ms) của một todo, hoặc null nếu todo không được nhắc lặp theo từng todo. Điều kiện
+ * chung: còn làm dở (open/in_progress), là todo cấp trên cùng, có ngày và giờ hẹn, và ước lượng
+ * KHÔNG quá 2 giờ (trên 2h thì không bao giờ nhắc lặp; chưa ước lượng thì nhắc). Rồi theo nhóm:
+ * xem `overdueIntervalForFlags`.
+ */
+export const todoOverdueIntervalMs = (todo: OverdueTodoFields): number | null => {
+  if (todo.status !== "open" && todo.status !== "in_progress") return null;
+  if (todo.parent_id !== null) return null;
+  if (!todo.time || !todo.scheduled_date) return null;
   if (
     todo.estimated_minutes !== null &&
     todo.estimated_minutes > OVERDUE.maxEstimatedMinutes
   ) {
-    return false;
+    return null;
   }
-  if (isFalse(todo.is_important) && isFalse(todo.is_urgent)) return false;
-  return true;
+  return overdueIntervalForFlags(todo.is_important, todo.is_urgent);
 };
 
+/** Todo có thuộc diện nhắc lặp theo từng todo không (xem `todoOverdueIntervalMs`). */
+export const todoWantsOverdue = <T extends OverdueTodoFields>(
+  todo: T
+): todo is T & { time: string; scheduled_date: string } =>
+  todoOverdueIntervalMs(todo) !== null;
+
 /**
- * Mọi mốc nhắc của ngày địa phương `date`: `scheduledAt` + 2h·k (k >= 1) còn rơi trong cùng ngày
- * đó. Hết ngày là hết nhắc (giờ hẹn 23:00 thì không có mốc nào).
+ * Mọi mốc nhắc của ngày địa phương `date`: `scheduledAt` + k·`intervalMs` (k >= 1) còn rơi trong cùng
+ * ngày đó. Hết ngày là hết nhắc (giờ hẹn 23:00 thì không có mốc nào). Mặc định 2 giờ.
  */
 export const overdueSlots = (
   scheduledAt: Date,
   date: string,
-  timezone: string
+  timezone: string,
+  intervalMs: number = OVERDUE.intervalMs
 ): Date[] => {
   const slots: Date[] = [];
   for (let k = 1; k <= MAX_SLOTS_PER_DAY; k++) {
-    const at = new Date(scheduledAt.getTime() + k * OVERDUE.intervalMs);
+    const at = new Date(scheduledAt.getTime() + k * intervalMs);
     if (localDateOf(at, timezone) !== date) break;
     slots.push(at);
   }
@@ -96,12 +129,13 @@ export const isOverdueSlot = (
   scheduledAt: Date,
   runAt: Date,
   date: string,
-  timezone: string
+  timezone: string,
+  intervalMs: number = OVERDUE.intervalMs
 ): boolean => {
   const diff = runAt.getTime() - scheduledAt.getTime();
   return (
-    diff >= OVERDUE.intervalMs &&
-    diff % OVERDUE.intervalMs === 0 &&
+    diff >= intervalMs &&
+    diff % intervalMs === 0 &&
     localDateOf(runAt, timezone) === date
   );
 };
@@ -119,13 +153,14 @@ export const reconcileTodoOverdue = async (
   timezone: string,
   now: Date = new Date()
 ): Promise<void> => {
-  if (!todoWantsOverdue(todo)) {
+  const intervalMs = todoOverdueIntervalMs(todo);
+  if (intervalMs === null || !todo.time || !todo.scheduled_date) {
     await jobsRepo.cancelSlotJobsExcept(userId, "todo_overdue", todo.id, []);
     return;
   }
   const scheduledAt = localDateTimeToUtc(todo.scheduled_date, todo.time, timezone);
   const slots = creatableOverdueSlots(
-    overdueSlots(scheduledAt, todo.scheduled_date, timezone),
+    overdueSlots(scheduledAt, todo.scheduled_date, timezone, intervalMs),
     "todo_overdue",
     now
   ).map((slot) => slot.toISOString());
@@ -175,7 +210,10 @@ export const backfillTodoOverdue = async (now: Date = new Date()): Promise<numbe
       ? todo.timezone
       : DEFAULT_NOTIFICATION_SETTINGS.timezone;
     const scheduledAt = localDateTimeToUtc(todo.scheduled_date, todo.time, timezone);
-    const all = overdueSlots(scheduledAt, todo.scheduled_date, timezone);
+    const intervalMs = overdueIntervalForFlags(todo.is_important, todo.is_urgent);
+    // Nhóm không nhắc lặp theo từng todo (câu truy vấn đã loại sẵn): không có mốc nào để vá.
+    if (intervalMs === null) continue;
+    const all = overdueSlots(scheduledAt, todo.scheduled_date, timezone, intervalMs);
     const slots = creatableOverdueSlots(all, "todo_overdue", now);
 
     if (slots.length === 0) {

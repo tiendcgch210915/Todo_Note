@@ -7,13 +7,13 @@ import {
   NOTIFICATION_KINDS,
   OCCURRENCE_KINDS,
   OVERDUE,
-  OVERDUE_KINDS,
+  SLOT_KINDS,
   type DigestKind,
   type EventKind,
   type NotificationJobKind,
   type NotificationJobStatus,
   type OccurrenceKind,
-  type OverdueKind,
+  type SlotKind,
 } from "../config/notification-policy.js";
 
 export type JobRow = {
@@ -43,7 +43,8 @@ const sqlList = (values: readonly string[]): string =>
 const EVENT_KIND_SQL = sqlList(EVENT_KINDS);
 const DIGEST_KIND_SQL = sqlList(DIGEST_KINDS);
 const OCCURRENCE_KIND_SQL = sqlList(OCCURRENCE_KINDS);
-const OVERDUE_KIND_SQL = sqlList(OVERDUE_KINDS);
+// Phải khớp đúng điều kiện của chỉ mục uq_notification_jobs_slot (migration 0020).
+const SLOT_KIND_SQL = sqlList(SLOT_KINDS);
 
 /**
  * Khi upsert đè lên một dòng có sẵn: giữ nguyên trạng thái nếu run_at (và đích) không đổi và job
@@ -418,7 +419,7 @@ export const cancelOccurrenceJobsExcept = async (
  */
 export const upsertSlotJob = async (input: {
   userId: string;
-  kind: OverdueKind;
+  kind: SlotKind;
   refId: string;
   localDate: string;
   runAt: string;
@@ -429,7 +430,7 @@ export const upsertSlotJob = async (input: {
           (id, user_id, kind, ref_id, target_device_id, local_date, run_at,
            status, attempts, created_at)
           VALUES (?, ?, ?, ?, NULL, ?, ?, 'pending', 0, ?)
-          ON CONFLICT(user_id, kind, ref_id, run_at) WHERE kind IN (${OVERDUE_KIND_SQL})
+          ON CONFLICT(user_id, kind, ref_id, run_at) WHERE kind IN (${SLOT_KIND_SQL})
           DO UPDATE SET
             status = CASE WHEN ${keep} THEN notification_jobs.status ELSE 'pending' END,
             attempts = CASE WHEN ${keep} THEN notification_jobs.attempts ELSE 0 END,
@@ -454,7 +455,7 @@ export const upsertSlotJob = async (input: {
  */
 export const insertSlotJobIfAbsent = async (input: {
   userId: string;
-  kind: OverdueKind;
+  kind: SlotKind;
   refId: string;
   localDate: string;
   runAt: string;
@@ -465,7 +466,7 @@ export const insertSlotJobIfAbsent = async (input: {
           (id, user_id, kind, ref_id, target_device_id, local_date, run_at,
            status, attempts, created_at)
           VALUES (?, ?, ?, ?, NULL, ?, ?, ?, 0, ?)
-          ON CONFLICT(user_id, kind, ref_id, run_at) WHERE kind IN (${OVERDUE_KIND_SQL})
+          ON CONFLICT(user_id, kind, ref_id, run_at) WHERE kind IN (${SLOT_KIND_SQL})
           DO NOTHING`,
     args: [
       newId(),
@@ -487,7 +488,7 @@ export const insertSlotJobIfAbsent = async (input: {
  */
 export const cancelSlotJobsExcept = async (
   userId: string,
-  kind: OverdueKind,
+  kind: SlotKind,
   refId: string,
   keepRunAts: readonly string[]
 ): Promise<number> => {
@@ -505,7 +506,7 @@ export const cancelSlotJobsExcept = async (
 /** Khóa (user|ref_id|run_at) của mọi mốc đã có dòng trong các ngày địa phương `dates`. */
 export const listSlotJobKeys = async (
   userIds: readonly string[],
-  kind: OverdueKind,
+  kind: SlotKind,
   dates: readonly string[]
 ): Promise<Set<string>> => {
   const keys = new Set<string>();
@@ -528,7 +529,7 @@ export const listSlotJobKeys = async (
 
 /** Hủy job sự kiện (hoặc nhắc lặp) còn pending/processing theo ref_id. Trả số job đã hủy. */
 export const cancelEventJobs = async (
-  kind: EventKind | OverdueKind,
+  kind: EventKind | SlotKind,
   refIds: readonly string[]
 ): Promise<number> => {
   let cancelled = 0;
@@ -655,8 +656,11 @@ export const releaseForRetry = async (
 
 // ── Vá todo cũ chưa có job nhắc giờ ─────────────────────────────────────────
 
-/** Cùng hình dạng với todo cần vá job nhắc giờ. */
-export type TodoNeedingOverdue = TodoNeedingReminder;
+/** Todo cần vá mốc nhắc lặp: như todo cần vá nhắc giờ, kèm cờ để chọn nhịp nhắc. */
+export type TodoNeedingOverdue = TodoNeedingReminder & {
+  is_important: number | null;
+  is_urgent: number | null;
+};
 
 export type TodoNeedingReminder = {
   id: string;
@@ -707,8 +711,12 @@ export const listTodosMissingReminderJobs = async (
  * Todo thuộc diện nhắc lặp (cùng điều kiện với `todoWantsOverdue`) của người dùng có thiết bị mà
  * CHƯA có dòng job `todo_overdue` nào cho ngày đó (todo có trước tính năng, hoặc hook bị sót).
  *
- * `time <= '21:59'`: giờ là giờ địa phương dạng chuỗi nên so sánh được không cần múi giờ; từ
- * 22:00 trở đi, giờ hẹn + 2h đã sang ngày khác nên chắc chắn không có mốc nào để nhắc.
+ * Nhóm không nhắc lặp theo từng todo được loại ngay trong SQL: quan trọng & không khẩn cấp (đã có
+ * tổng kết 17:00/07:00) và không quan trọng & không khẩn cấp (chỉ nhắc đúng giờ hẹn).
+ *
+ * `time <= '22:59'`: giờ là giờ địa phương dạng chuỗi nên so sánh được không cần múi giờ; từ
+ * 23:00 trở đi, giờ hẹn + 1h (nhịp ngắn nhất) đã sang ngày khác nên chắc chắn không có mốc nào.
+ * Nhóm nhắc 2 giờ hẹn từ 22:00 cũng không có mốc: bước vá ghi dấu `missed` cho chúng.
  * `fromDate` chặn dưới để không quét lại toàn bộ lịch sử.
  */
 export const listTodosMissingOverdueJobs = async (
@@ -716,11 +724,11 @@ export const listTodosMissingOverdueJobs = async (
   limit: number
 ): Promise<TodoNeedingOverdue[]> => {
   const res = await turso.execute({
-    sql: `SELECT t.id, t.user_id, t.scheduled_date, t.time, u.timezone
+    sql: `SELECT t.id, t.user_id, t.scheduled_date, t.time, t.is_important, t.is_urgent, u.timezone
           FROM todos t
           JOIN users u ON u.id = t.user_id AND u.deleted_at IS NULL
           WHERE t.time IS NOT NULL
-            AND t.time <= '21:59'
+            AND t.time <= '22:59'
             AND t.scheduled_date IS NOT NULL
             AND t.scheduled_date >= ?
             AND t.parent_id IS NULL
@@ -728,6 +736,8 @@ export const listTodosMissingOverdueJobs = async (
             AND t.status IN ('open', 'in_progress')
             AND (t.estimated_minutes IS NULL OR t.estimated_minutes <= ${OVERDUE.maxEstimatedMinutes})
             AND NOT (COALESCE(t.is_important, 1) = 0 AND COALESCE(t.is_urgent, 1) = 0)
+            -- quan trọng & BIẾT chắc là không khẩn cấp (chưa phân loại thì vẫn thuộc diện nhắc)
+            AND NOT (COALESCE(t.is_important, 0) = 1 AND COALESCE(t.is_urgent, 1) = 0)
             AND EXISTS (SELECT 1 FROM user_devices d WHERE d.user_id = t.user_id)
             AND NOT EXISTS (
               SELECT 1 FROM notification_jobs j
@@ -743,6 +753,50 @@ export const listTodosMissingOverdueJobs = async (
     user_id: row.user_id as string,
     scheduled_date: row.scheduled_date as string,
     time: row.time as string,
+    timezone: row.timezone as string,
+    is_important: row.is_important === null || row.is_important === undefined ? null : Number(row.is_important),
+    is_urgent: row.is_urgent === null || row.is_urgent === undefined ? null : Number(row.is_urgent),
+  }));
+};
+
+// ── Vá run đang chạy chưa có job nhắc ───────────────────────────────────────
+
+export type RunNeedingNudges = {
+  id: string;
+  user_id: string;
+  started_at: string;
+  timezone: string;
+};
+
+/**
+ * Run còn `in_progress` của người dùng có thiết bị mà CHƯA có dòng `checklist_running` nào (run bắt
+ * đầu trước khi có tính năng, hoặc một đường ghi bị sót hook). `startedAfterIso` chặn dưới: run mở
+ * quá lâu thì mốc 06:00 hôm sau đã qua từ lâu, không đáng xét lại mỗi phút.
+ */
+export const listRunsMissingNudgeJobs = async (
+  startedAfterIso: string,
+  limit: number
+): Promise<RunNeedingNudges[]> => {
+  const res = await turso.execute({
+    sql: `SELECT r.id, r.user_id, r.started_at, u.timezone
+          FROM checklist_runs r
+          JOIN users u ON u.id = r.user_id AND u.deleted_at IS NULL
+          WHERE r.status = 'in_progress'
+            AND r.deleted_at IS NULL
+            AND r.started_at >= ?
+            AND EXISTS (SELECT 1 FROM user_devices d WHERE d.user_id = r.user_id)
+            AND NOT EXISTS (
+              SELECT 1 FROM notification_jobs j
+              WHERE j.user_id = r.user_id AND j.kind = 'checklist_running' AND j.ref_id = r.id
+            )
+          ORDER BY r.started_at ASC, r.id ASC
+          LIMIT ?`,
+    args: [startedAfterIso, limit],
+  });
+  return (res.rows as unknown as Record<string, unknown>[]).map((row) => ({
+    id: row.id as string,
+    user_id: row.user_id as string,
+    started_at: row.started_at as string,
     timezone: row.timezone as string,
   }));
 };
