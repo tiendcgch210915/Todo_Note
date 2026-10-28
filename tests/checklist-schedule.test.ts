@@ -13,9 +13,7 @@ const {
   toScheduleRule,
   MAX_OCCURRENCE_RANGE_DAYS,
 } = await import("../src/services/checklist-schedule.js");
-const { completedLocalDates, creatableSlots, dueSlotsFor } = await import(
-  "../src/services/checklist-due.js"
-);
+const { creatableSlots, dueSlotsFor } = await import("../src/services/checklist-due.js");
 const { isoWeekdayOf, nextRecurrenceDateAfter, parseWeekdays } = await import(
   "../src/utils/recurrence.js"
 );
@@ -374,13 +372,6 @@ test("a day that already has a completed run is dropped from the slots", () => {
   const done = new Set(["2026-06-23"]);
   const slots = dueSlotsFor(r, [], done, "Asia/Ho_Chi_Minh", "2026-06-22", "2026-06-24");
   assert.deepEqual(slots.map((s) => s.date), ["2026-06-22", "2026-06-24"]);
-});
-
-test("a completion belongs to the user's LOCAL day, not the UTC day", () => {
-  // 2026-06-20T17:30Z is already 21 June in Vietnam but still 20 June in New York.
-  assert.deepEqual([...completedLocalDates(["2026-06-20T17:30:00.000Z"], "Asia/Ho_Chi_Minh")], ["2026-06-21"]);
-  assert.deepEqual([...completedLocalDates(["2026-06-20T17:30:00.000Z"], "America/New_York")], ["2026-06-20"]);
-  assert.deepEqual([...completedLocalDates(["not a date"], "Asia/Ho_Chi_Minh")], []);
 });
 
 test("slots already beyond the 30 minute lateness window are not created", () => {

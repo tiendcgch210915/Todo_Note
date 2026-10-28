@@ -30,6 +30,7 @@ export const EntityTypeEnum = z.enum([
   "checklist_run_item",
   "checklist_schedule",
   "checklist_schedule_override",
+  "checklist_occurrence_mark",
   "user",
 ]);
 

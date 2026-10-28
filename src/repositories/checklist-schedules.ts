@@ -34,6 +34,20 @@ export type OverrideRow = {
   deleted_at: string | null;
 };
 
+export type MarkStatus = "done" | "open";
+
+/** Đánh dấu tay "Đã xong / Chưa hoàn thành" cho MỘT ngày của checklist (xem migration 0023). */
+export type MarkRow = {
+  id: string;
+  user_id: string;
+  template_id: string;
+  local_date: string;
+  status: MarkStatus;
+  created_at: string;
+  updated_at: string;
+  deleted_at: string | null;
+};
+
 /** Trường người dùng được phép đặt cho một lịch (đã chuẩn hóa/kiểm tra ở lớp trên). */
 export type ScheduleFields = {
   start_date: string;
@@ -58,6 +72,9 @@ const SCHEDULE_COLUMNS =
 
 const OVERRIDE_COLUMNS =
   "id, user_id, template_id, local_date, time, created_at, updated_at, deleted_at";
+
+const MARK_COLUMNS =
+  "id, user_id, template_id, local_date, status, created_at, updated_at, deleted_at";
 
 const CHUNK = 200;
 
@@ -97,6 +114,17 @@ const mapOverride = (row: Record<string, unknown>): OverrideRow => ({
   template_id: row.template_id as string,
   local_date: row.local_date as string,
   time: row.time as string,
+  created_at: row.created_at as string,
+  updated_at: row.updated_at as string,
+  deleted_at: (row.deleted_at as string | null) ?? null,
+});
+
+const mapMark = (row: Record<string, unknown>): MarkRow => ({
+  id: row.id as string,
+  user_id: row.user_id as string,
+  template_id: row.template_id as string,
+  local_date: row.local_date as string,
+  status: row.status as MarkStatus,
   created_at: row.created_at as string,
   updated_at: row.updated_at as string,
   deleted_at: (row.deleted_at as string | null) ?? null,
@@ -319,6 +347,92 @@ export const listLiveOverridesForUsers = async (
   return out;
 };
 
+// ── Đánh dấu tay theo ngày ───────────────────────────────────────────────────
+
+export const getMarkById = async (id: string): Promise<MarkRow | null> => {
+  const res = await turso.execute({
+    sql: `SELECT ${MARK_COLUMNS} FROM checklist_occurrence_marks WHERE id = ?`,
+    args: [id],
+  });
+  return res.rows.length === 0 ? null : mapMark(rowsOf(res)[0]);
+};
+
+export const getLiveMark = async (
+  userId: string,
+  templateId: string,
+  localDate: string
+): Promise<MarkRow | null> => {
+  const res = await turso.execute({
+    sql: `SELECT ${MARK_COLUMNS} FROM checklist_occurrence_marks
+          WHERE user_id = ? AND template_id = ? AND local_date = ? AND deleted_at IS NULL`,
+    args: [userId, templateId, localDate],
+  });
+  return res.rows.length === 0 ? null : mapMark(rowsOf(res)[0]);
+};
+
+/** Đặt (hoặc hồi sinh) dấu của một ngày; `updated_at` mới là mốc để so với lần hoàn thành sau đó. */
+export const upsertMark = async (
+  userId: string,
+  templateId: string,
+  localDate: string,
+  status: MarkStatus
+): Promise<MarkRow> => {
+  const now = nowISO();
+  await turso.execute({
+    sql: `INSERT INTO checklist_occurrence_marks
+          (id, user_id, template_id, local_date, status, created_at, updated_at, deleted_at)
+          VALUES (?, ?, ?, ?, ?, ?, ?, NULL)
+          ON CONFLICT(user_id, template_id, local_date) DO UPDATE SET
+            status = excluded.status,
+            updated_at = excluded.updated_at,
+            deleted_at = NULL`,
+    args: [newId(), userId, templateId, localDate, status, now, now],
+  });
+  const row = await getLiveMark(userId, templateId, localDate);
+  if (!row) throw new Error("upsertMark: row missing after upsert");
+  return row;
+};
+
+/** Trả true nếu có dấu còn hiệu lực bị xóa (về lại chế độ tự động). */
+export const softDeleteMark = async (
+  userId: string,
+  templateId: string,
+  localDate: string
+): Promise<boolean> => {
+  const now = nowISO();
+  const res = await turso.execute({
+    sql: `UPDATE checklist_occurrence_marks SET deleted_at = ?, updated_at = ?
+          WHERE user_id = ? AND template_id = ? AND local_date = ? AND deleted_at IS NULL`,
+    args: [now, now, userId, templateId, localDate],
+  });
+  return res.rowsAffected > 0;
+};
+
+/** Dấu còn hiệu lực trong [from, to] (ngày địa phương) của các người dùng. */
+export const listLiveMarksForUsers = async (
+  userIds: readonly string[],
+  from: string,
+  to: string,
+  templateIds?: readonly string[]
+): Promise<MarkRow[]> => {
+  const out: MarkRow[] = [];
+  const templateFilter =
+    templateIds && templateIds.length > 0
+      ? `AND template_id IN (${placeholders(templateIds.length)})`
+      : "";
+  for (const part of chunks(userIds)) {
+    const res = await turso.execute({
+      sql: `SELECT ${MARK_COLUMNS} FROM checklist_occurrence_marks
+            WHERE deleted_at IS NULL AND local_date >= ? AND local_date <= ?
+              AND user_id IN (${placeholders(part.length)})
+              ${templateFilter}`,
+      args: [from, to, ...part, ...(templateIds ?? [])],
+    });
+    out.push(...rowsOf(res).map(mapMark));
+  }
+  return out;
+};
+
 // ── Dữ liệu phụ cho occurrences ──────────────────────────────────────────────
 
 /** Số bước (chưa xóa) của mỗi checklist. */
@@ -338,13 +452,20 @@ export const countStepsByTemplate = async (
   return counts;
 };
 
-export type CompletedRun = { user_id: string; template_id: string; completed_at: string };
+/** Một lần chạy đã hoàn thành. Ngày của nó tính theo `started_at`, không phải `completed_at`. */
+export type CompletedRun = {
+  user_id: string;
+  template_id: string;
+  started_at: string;
+  completed_at: string;
+};
 
 /**
- * Run đã hoàn thành (status = 'completed', chưa xóa) có completed_at trong [fromIso, toIso).
- * Run bị bỏ dở (abandoned) cũng có completed_at nhưng KHÔNG tính là xong.
+ * Run đã hoàn thành (status = 'completed', chưa xóa) có started_at trong [fromIso, toIso). Ngày của
+ * một lần chạy là ngày BẮT ĐẦU: bắt đầu 23:30 và xong 00:30 vẫn thuộc ngày hôm trước. Run bị bỏ dở
+ * (abandoned) cũng có completed_at nhưng KHÔNG tính là xong.
  */
-export const listCompletedRuns = async (
+export const listCompletedRunsStartedBetween = async (
   userIds: readonly string[],
   fromIso: string,
   toIso: string,
@@ -357,9 +478,9 @@ export const listCompletedRuns = async (
       : "";
   for (const part of chunks(userIds)) {
     const res = await turso.execute({
-      sql: `SELECT user_id, template_id, completed_at FROM checklist_runs
+      sql: `SELECT user_id, template_id, started_at, completed_at FROM checklist_runs
             WHERE status = 'completed' AND deleted_at IS NULL
-              AND completed_at >= ? AND completed_at < ?
+              AND started_at >= ? AND started_at < ?
               AND user_id IN (${placeholders(part.length)})
               ${templateFilter}`,
       args: [fromIso, toIso, ...part, ...(templateIds ?? [])],
@@ -368,7 +489,8 @@ export const listCompletedRuns = async (
       out.push({
         user_id: row.user_id as string,
         template_id: row.template_id as string,
-        completed_at: row.completed_at as string,
+        started_at: row.started_at as string,
+        completed_at: (row.completed_at as string | null) ?? (row.started_at as string),
       });
     }
   }

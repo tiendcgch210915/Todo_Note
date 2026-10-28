@@ -7,14 +7,15 @@ import * as schedulesRepo from "../repositories/checklist-schedules.js";
 import * as templatesRepo from "../repositories/checklist-templates.js";
 import * as settingsRepo from "../repositories/notification-settings.js";
 import { addDays, localDateTimeToUtc } from "../utils/time.js";
+import { doneDatesOf } from "./checklist-occurrence-done.js";
 import {
   isOccurrenceDate,
   occurrencesBetween,
   toScheduleRule,
 } from "./checklist-schedule.js";
-import { completedLocalDates } from "./checklist-due.js";
 import { finishSchedulesForUserSafely } from "./checklist-schedule-expiry.js";
 import { resolveSettings } from "./notification-schedule.js";
+import { autoLogHabitsForMarkedDaySafely } from "./checklist-habit-logs.js";
 import * as notificationTriggers from "./notification-triggers.js";
 
 export class ScheduleServiceError extends Error {
@@ -115,7 +116,10 @@ export type OccurrenceItem = {
   date: string;
   time: string;
   overridden: boolean;
+  /** Đã xong chưa: có lần chạy hoàn thành (tính theo ngày BẮT ĐẦU) hoặc đánh dấu tay, xem `doneDatesOf`. */
   done: boolean;
+  /** Dấu tay còn hiệu lực của ngày này (`done` | `open`), null = tự động. */
+  manual: schedulesRepo.MarkStatus | null;
 };
 
 /** GET /checklists/occurrences: các lần xuất hiện của mọi lịch đang bật trong [from, to]. */
@@ -134,13 +138,14 @@ export const listOccurrences = async (
   if (schedules.length === 0) return [];
   const templateIds = schedules.map((s) => s.template_id);
 
-  const [overrideRows, runs, steps] = await Promise.all([
+  const [overrideRows, runs, marks, steps] = await Promise.all([
     schedulesRepo.listLiveOverridesForUsers([userId], from, to),
-    schedulesRepo.listCompletedRuns(
+    schedulesRepo.listCompletedRunsStartedBetween(
       [userId],
       localDateTimeToUtc(from, "00:00", timezone).toISOString(),
       localDateTimeToUtc(addDays(to, 1), "00:00", timezone).toISOString()
     ),
+    schedulesRepo.listLiveMarksForUsers([userId], from, to),
     schedulesRepo.countStepsByTemplate(templateIds),
   ]);
 
@@ -149,9 +154,11 @@ export const listOccurrences = async (
     const overrides = overrideRows
       .filter((row) => row.template_id === schedule.template_id)
       .map((row) => ({ localDate: row.local_date, time: row.time }));
-    const done = completedLocalDates(
-      runs.filter((run) => run.template_id === schedule.template_id).map((run) => run.completed_at),
-      timezone
+    const done = doneDatesOf({ userId, templateId: schedule.template_id }, runs, marks, timezone);
+    const manual = new Map(
+      marks
+        .filter((mark) => mark.template_id === schedule.template_id)
+        .map((mark) => [mark.local_date, mark.status] as const)
     );
     for (const occurrence of occurrencesBetween(toScheduleRule(schedule), overrides, from, to)) {
       items.push({
@@ -162,6 +169,7 @@ export const listOccurrences = async (
         time: occurrence.time,
         overridden: occurrence.overridden,
         done: done.has(occurrence.date),
+        manual: manual.get(occurrence.date) ?? null,
       });
     }
   }
@@ -190,6 +198,44 @@ export const putOccurrence = async (
   await schedulesRepo.upsertOverride(userId, templateId, date, time);
   await notificationTriggers.onChecklistScheduleChanged(userId, templateId);
   return { checklistId: templateId, date, time, overridden: true };
+};
+
+/**
+ * PUT /checklists/templates/:id/occurrences/:date/status: đánh dấu tay "Đã xong" (tick ngay, không
+ * cần chạy từng bước) hoặc "Chưa hoàn thành" (hạ một ngày đã xong về chưa xong; làm thêm một lần
+ * nữa thì ngày đó lại xong). Ngày phải thật sự là một lần xuất hiện của lịch.
+ */
+export const putOccurrenceStatus = async (
+  userId: string,
+  templateId: string,
+  date: string,
+  status: schedulesRepo.MarkStatus
+): Promise<{ checklistId: string; date: string; manual: schedulesRepo.MarkStatus; done: boolean }> => {
+  await requireVisibleTemplate(userId, templateId);
+  const schedule = await schedulesRepo.getLiveSchedule(userId, templateId);
+  if (!schedule) throw new ScheduleServiceError("not_found");
+  if (!isOccurrenceDate(toScheduleRule(schedule), date)) {
+    throw new ScheduleServiceError("not_an_occurrence");
+  }
+  await schedulesRepo.upsertMark(userId, templateId, date, status);
+  await notificationTriggers.onChecklistOccurrenceMarkChanged(userId, templateId);
+  if (status === "done") await autoLogHabitsForMarkedDaySafely(userId, templateId, date);
+  // Dấu vừa đặt là mới nhất nên chưa thể có lần hoàn thành nào sau nó: done = (status === "done").
+  return { checklistId: templateId, date, manual: status, done: status === "done" };
+};
+
+/**
+ * DELETE …/occurrences/:date/status: bỏ dấu tay, ngày đó về chế độ tự động (xong nếu có lần chạy
+ * hoàn thành bắt đầu trong ngày). Idempotent, không kiểm tra ngày còn thuộc lịch.
+ */
+export const deleteOccurrenceStatus = async (
+  userId: string,
+  templateId: string,
+  date: string
+): Promise<void> => {
+  await requireVisibleTemplate(userId, templateId);
+  await schedulesRepo.softDeleteMark(userId, templateId, date);
+  await notificationTriggers.onChecklistOccurrenceMarkChanged(userId, templateId);
 };
 
 /** Idempotent. Không kiểm tra ngày còn thuộc lịch: ghi đè mồ côi vẫn phải xóa được. */

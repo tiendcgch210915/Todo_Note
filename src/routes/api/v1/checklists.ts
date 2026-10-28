@@ -20,6 +20,7 @@ import {
   OccurrencesQuerySchema,
   PutChecklistScheduleSchema,
   PutOccurrenceSchema,
+  PutOccurrenceStatusSchema,
 } from "../../../schemas/api/checklist-schedules.js";
 import * as checklists from "../../../services/checklists.js";
 import * as schedules from "../../../services/checklist-schedules.js";
@@ -333,6 +334,50 @@ export default async function checklistsRoutes(app: FastifyInstance) {
       }
       try {
         await schedules.deleteOccurrence(req.userId, req.params.id, date.data.date);
+        return reply.code(204).send();
+      } catch (e) {
+        return mapErr(e, reply);
+      }
+    }
+  );
+
+  // Đánh dấu tay "Đã xong / Chưa hoàn thành" của một ngày (giữ checklist trong timeline).
+  app.put<{ Params: { id: string; date: string } }>(
+    "/templates/:id/occurrences/:date/status",
+    async (req, reply) => {
+      const date = OccurrenceDateParamSchema.safeParse(req.params);
+      const body = PutOccurrenceStatusSchema.safeParse(req.body);
+      if (!date.success || !body.success) {
+        const issues = [
+          ...(date.success ? [] : date.error.issues),
+          ...(body.success ? [] : body.error.issues),
+        ];
+        return reply.code(400).send({ error: "bad_input", issues });
+      }
+      try {
+        return await schedules.putOccurrenceStatus(
+          req.userId,
+          req.params.id,
+          date.data.date,
+          body.data.status
+        );
+      } catch (e) {
+        return mapErr(e, reply);
+      }
+    }
+  );
+
+  app.delete<{ Params: { id: string; date: string } }>(
+    "/templates/:id/occurrences/:date/status",
+    async (req, reply) => {
+      const date = OccurrenceDateParamSchema.safeParse(req.params);
+      if (!date.success) {
+        return reply
+          .code(400)
+          .send({ error: "bad_input", issues: date.error.issues });
+      }
+      try {
+        await schedules.deleteOccurrenceStatus(req.userId, req.params.id, date.data.date);
         return reply.code(204).send();
       } catch (e) {
         return mapErr(e, reply);

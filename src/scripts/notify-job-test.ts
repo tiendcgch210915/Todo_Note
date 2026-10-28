@@ -5,7 +5,6 @@
  *   npm run notify:job-test -- <userId> digest_morning
  *   npm run notify:job-test -- <userId> checklist_due           # checklist có lịch hôm nay, đúng giờ chạy
  *   npm run notify:job-test -- <userId> todo_overdue            # nhắc lặp "Quá giờ" của một todo trễ 2 giờ
- *   npm run notify:job-test -- <userId> checklist_overdue       # nhắc lặp "Quá giờ" của một checklist trễ 2 giờ
  *   npm run notify:job-test -- <userId> checklist_running       # nhắc "đã làm 1 giờ" của một checklist đang chạy
  *   npm run notify:job-test -- <userId> digest_review           # thông báo rà soát cuối ngày
  *   npm run notify:job-test -- <userId> digest_overdue_evening  # "⏰ x todo quan trọng quá hạn" (tổng kết 17:00)
@@ -17,7 +16,7 @@
  * đồ thử tối thiểu tiêu đề bắt đầu bằng "[TEST]" (todo, đếm ngược, checklist, checklist có lịch) trong tài khoản đó; chúng
  * sẽ đồng bộ xuống app như dữ liệu bình thường cho tới khi chạy --cleanup. Tổng kết hôm nay
  * (digest_*) dùng lại dòng job sẵn có của ngày hôm nay và dời nó lên +1 phút. Nhắc lặp
- * (*_overdue) dựng todo/checklist có giờ hẹn = giờ chạy - 2 giờ rồi tạo đúng mốc +2h; các mốc sau
+ * (todo_overdue) dựng todo có giờ hẹn = giờ chạy - 2 giờ rồi tạo đúng mốc +2h; các mốc sau
  * trong ngày (nếu có) sẽ do planner thêm như bình thường cho tới khi chạy --cleanup.
  *
  * Dùng chung DB Turso trong .env. Sau khi tạo, gọi tick (hoặc chờ NOTIFY_INPROCESS_TICK):
@@ -29,6 +28,7 @@ import { turso } from "../config/db.js";
 import {
   CHECKLIST_RUNNING,
   EVENT_KINDS,
+  LEGACY_SLOT_KINDS,
   NOTIFICATION_KINDS,
   OVERDUE,
   isDigestKind,
@@ -45,8 +45,11 @@ import { addDays, nowISO, localDateOf, minutesToHhmm } from "../utils/time.js";
 
 const TEST_PREFIX = "[TEST]";
 
-/** Loại cũ (nhắc 30 phút) không còn được tạo; tick luôn hủy nó nên không có gì để thử. */
-const LEGACY_KIND = EVENT_KINDS[2];
+/**
+ * Loại cũ không còn được tạo (nhắc 30 phút của checklist, nhắc lặp quá giờ của checklist); tick
+ * luôn hủy chúng nên không có gì để thử.
+ */
+const LEGACY_KINDS: readonly string[] = [EVENT_KINDS[2], ...LEGACY_SLOT_KINDS];
 
 type Args = {
   userId: string | null;
@@ -69,13 +72,15 @@ const parseArgs = (argv: string[]): Args | string => {
     else if (kindArg === null) kindArg = arg;
     else return `Thừa tham số: ${arg}`;
   }
+  const testable = NOTIFICATION_KINDS.filter((kind) => !LEGACY_KINDS.includes(kind));
   if (kindArg !== null && kindArg !== "all" && !(NOTIFICATION_KINDS as readonly string[]).includes(kindArg)) {
-    return `Loại không hợp lệ: ${kindArg}. Chọn một trong: all, ${NOTIFICATION_KINDS.join(", ")}`;
+    return `Loại không hợp lệ: ${kindArg}. Chọn một trong: all, ${testable.join(", ")}`;
+  }
+  if (kindArg !== null && LEGACY_KINDS.includes(kindArg)) {
+    return `Loại ${kindArg} đã bỏ, không còn được tạo. Chọn một trong: all, ${testable.join(", ")}`;
   }
   const kinds =
-    kindArg === null || kindArg === "all"
-      ? NOTIFICATION_KINDS.filter((kind) => kind !== LEGACY_KIND)
-      : [kindArg as NotificationJobKind];
+    kindArg === null || kindArg === "all" ? testable : [kindArg as NotificationJobKind];
   return { userId, kinds, deviceId, cleanup };
 };
 
@@ -223,7 +228,6 @@ const cleanup = async (userId: string): Promise<void> => {
   const templateIds = (templates.rows as unknown as { id: string }[]).map((r) => r.id);
   for (const templateId of templateIds) {
     await jobsRepo.cancelOccurrenceJobsExcept(userId, "checklist_due", templateId, []);
-    await jobsRepo.cancelSlotJobsExcept(userId, "checklist_overdue", templateId, []);
     await schedulesRepo.softDeleteSchedule(userId, templateId);
   }
   await turso.batch(
@@ -364,19 +368,6 @@ const main = async (): Promise<number> => {
         const id = await insertTestTodo(userId, "Nhắc lặp", today, scheduledTime, true);
         await jobsRepo.upsertSlotJob({ userId, kind, refId: id, localDate: today, runAt });
         console.log(`✓ ${kind}: todo thử quan trọng hẹn ${scheduledTime}, nhắc "Quá giờ" lúc ${time}.`);
-        break;
-      }
-      case "checklist_overdue": {
-        const scheduledAt = new Date(target.getTime() - OVERDUE.intervalMs);
-        const scheduledDate = localDateOf(scheduledAt, settings.timezone);
-        if (scheduledDate !== today) {
-          console.log(`- ${kind}: bỏ qua, giờ hẹn (chạy - 2 giờ) rơi sang ngày hôm trước. Thử lại sau 02:00.`);
-          break;
-        }
-        const scheduledTime = localHhmm(scheduledAt, settings.timezone);
-        const templateId = await createScheduledChecklist(userId, today, scheduledTime);
-        await jobsRepo.upsertSlotJob({ userId, kind, refId: templateId, localDate: today, runAt });
-        console.log(`✓ ${kind}: checklist thử hẹn ${scheduledTime}, nhắc "Quá giờ" lúc ${time}.`);
         break;
       }
       default: {

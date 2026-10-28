@@ -14,7 +14,7 @@
  *  - planner (`backfillTodoOverdue`): vá todo chưa có dòng nào (todo có trước tính năng);
  *  - kiểm tra lại ngay trước khi gửi (`todoWantsOverdue` + `isOverdueSlot` trong notification-tick).
  *
- * Phần dùng chung cho checklist (`overdueSlots`, `isOverdueSlot`) là hàm thuần ở đầu file.
+ * Các hàm thuần ở đầu file (`overdueSlots`, `isOverdueSlot`) chỉ còn todo dùng: checklist không nhắc lặp.
  */
 import {
   DEFAULT_NOTIFICATION_SETTINGS,

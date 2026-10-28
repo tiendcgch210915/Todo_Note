@@ -107,6 +107,8 @@ export const createNotificationTables = async (db: TestDb): Promise<void> => {
     const ddl = String((table.rows[0] as unknown as { sql?: string } | undefined)?.sql ?? "");
     return !ddl.includes("digest_overdue_evening");
   });
+  // 0023 thêm bảng dấu tay "Đã xong / Chưa hoàn thành" theo ngày (và chuyển chỉ mục run sang started_at).
+  await applyMigrationFileOnce(db, "0023_checklist_occurrence_marks.sql", "checklist_occurrence_marks");
 };
 
 /**

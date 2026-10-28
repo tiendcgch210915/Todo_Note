@@ -410,7 +410,7 @@ export const cancelOccurrenceJobsExcept = async (
   return res.rowsAffected;
 };
 
-// ── Job nhắc LẶP (todo_overdue, checklist_overdue): một dòng cho mỗi mốc ────
+// ── Job theo mốc (todo_overdue, checklist_running): một dòng cho mỗi mốc ────
 
 /**
  * Tạo hoặc sửa job của MỘT mốc nhắc lặp: duy nhất theo (user, kind, ref_id, run_at).

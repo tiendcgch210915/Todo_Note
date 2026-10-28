@@ -621,7 +621,7 @@ test("nothing is sent when push is turned off by the tick (dry run still records
   assert.equal(fake.messages.length, 0, "dry run never talks to FCM");
 });
 
-// ── checklists ───────────────────────────────────────────────────────────────
+// ── checklists: no repeating nudge, only the on-time reminder ────────────────
 
 type ScheduleFields = Parameters<typeof schedulesRepo.upsertSchedule>[2];
 const scheduleAt = (hhmm: string, overrides: Partial<ScheduleFields> = {}): ScheduleFields => ({
@@ -634,212 +634,98 @@ const scheduleAt = (hhmm: string, overrides: Partial<ScheduleFields> = {}): Sche
   enabled: true,
   ...overrides,
 });
-const CHECKLIST_SLOTS = ["09:30", "11:30", "13:30", "15:30", "17:30", "19:30", "21:30", "23:30"];
-const checklistRunAts = () => pendingRunAts("checklist_overdue", TPL);
 const reconcile = (now: Date) => dueService.reconcileChecklistDue(USER_ID, TPL, now);
+const dueJobs = () => fx.jobsFor(turso, USER_ID, "AND kind = 'checklist_due'");
+/** Everything the user's devices were sent about this checklist. */
+const checklistMessages = () => fake.messages.filter((m) => m.data?.id === TPL);
+const HALF_HOURLY = ["07:30", "09:30", "11:30", "13:30", "15:30", "17:30", "19:30", "21:30", "23:30"];
 
-test("a checklist scheduled for 07:30 gets nudges at 09:30 ... 23:30, for today only", async () => {
+test("a daily checklist has exactly one reminder per day and never a repeating nudge", async () => {
   await schedulesRepo.upsertSchedule(USER_ID, TPL, scheduleAt("07:30"));
 
   await reconcile(at(TODAY, "07:00"));
 
-  assert.deepEqual(await checklistRunAts(), slotsVn(TODAY, CHECKLIST_SLOTS));
-  const rows = await overdueRows("checklist_overdue");
-  assert.ok(rows.every((row) => row.local_date === TODAY && row.ref_id === TPL), "tomorrow has none yet");
+  assert.deepEqual(
+    (await dueJobs()).map((j) => [j.local_date, j.run_at, j.status]),
+    [
+      [TODAY, runAtVn(TODAY, "07:30"), "pending"],
+      [addDays(TODAY, 1), runAtVn(addDays(TODAY, 1), "07:30"), "pending"],
+    ]
+  );
+  assert.deepEqual(await overdueRows("checklist_overdue"), [], "no checklist_overdue row of any status");
 });
 
-test("the nudges start from the appointment even when its normal reminder is long gone", async () => {
+test("being hours late and not done still creates no nudge (hook and planner)", async () => {
+  await fx.insertDevice(turso, USER_ID, "reg-A", { id: "device-A" });
   await schedulesRepo.upsertSchedule(USER_ID, TPL, scheduleAt("07:30"));
 
-  // 12:00: the 11:30 slot is exactly 30 minutes late (kept), 09:30 is not.
-  await reconcile(at(TODAY, "12:00"));
+  await reconcile(at(TODAY, "12:00")); // 4.5 hours after the appointment
+  await maintenance(at(TODAY, "12:01"));
 
-  assert.deepEqual(await checklistRunAts(), slotsVn(TODAY, ["11:30", "13:30", "15:30", "17:30", "19:30", "21:30", "23:30"]));
-  assert.equal((await fx.jobsFor(turso, USER_ID, "AND kind = 'checklist_due'")).filter((j) => j.local_date === TODAY).length, 0, "the on-time reminder itself is too late to create");
+  assert.deepEqual(await overdueRows("checklist_overdue"), []);
 });
 
-test("an override moves the nudges with the day's time; a completed run today removes them", async () => {
-  await schedulesRepo.upsertSchedule(USER_ID, TPL, scheduleAt("07:30"));
-  await reconcile(at(TODAY, "07:00"));
-
-  await schedulesRepo.upsertOverride(USER_ID, TPL, TODAY, "09:00");
-  await reconcile(at(TODAY, "07:00"));
-  assert.deepEqual(await checklistRunAts(), slotsVn(TODAY, ["11:00", "13:00", "15:00", "17:00", "19:00", "21:00", "23:00"]));
-
-  await fx.insertRun(turso, { id: "run-1", templateId: TPL, completedAt: iso(at(TODAY, "10:00")) });
-  await reconcile(at(TODAY, "10:05"));
-  assert.deepEqual(await checklistRunAts(), []);
-  assert.ok((await statusesOf("checklist_overdue", TPL)).every((s) => s === "cancelled"));
-});
-
-test("abandoned and in-progress runs do not stop the nudges", async () => {
-  await schedulesRepo.upsertSchedule(USER_ID, TPL, scheduleAt("07:30"));
-  await fx.insertRun(turso, { id: "run-a", templateId: TPL, status: "abandoned", completedAt: iso(at(TODAY, "08:00")) });
-  await fx.insertRun(turso, { id: "run-b", templateId: TPL, status: "in_progress", completedAt: null });
-
-  await reconcile(at(TODAY, "08:30"));
-
-  assert.equal((await checklistRunAts()).length, 8, "09:30 ... 23:30");
-});
-
-test("no nudges for a disabled or deleted schedule, or a deleted checklist", async () => {
-  await schedulesRepo.upsertSchedule(USER_ID, TPL, scheduleAt("07:30"));
-  await reconcile(at(TODAY, "07:00"));
-  assert.equal((await checklistRunAts()).length, 8);
-
-  await schedulesRepo.upsertSchedule(USER_ID, TPL, scheduleAt("07:30", { enabled: false }));
-  await reconcile(at(TODAY, "07:01"));
-  assert.deepEqual(await checklistRunAts(), []);
-
-  await schedulesRepo.upsertSchedule(USER_ID, TPL, scheduleAt("07:30"));
-  await reconcile(at(TODAY, "07:02"));
-  assert.equal((await checklistRunAts()).length, 8, "re-enabling re-arms the same slots");
-
-  await schedulesRepo.softDeleteSchedule(USER_ID, TPL);
-  await reconcile(at(TODAY, "07:03"));
-  assert.deepEqual(await checklistRunAts(), []);
-});
-
-test("a schedule that does not occur today has no nudges (weekday, start date, end date)", async () => {
-  // 2026-06-20 is a Saturday (6).
-  await schedulesRepo.upsertSchedule(USER_ID, TPL, scheduleAt("07:30", { recurrence_type: "weekly", recurrence_days_of_week: "1,3", start_date: "2026-06-15" }));
-  await reconcile(at(TODAY, "07:00"));
-  assert.deepEqual(await checklistRunAts(), []);
-
-  await schedulesRepo.upsertSchedule(USER_ID, TPL, scheduleAt("07:30", { start_date: "2026-06-25" }));
-  await reconcile(at(TODAY, "07:00"));
-  assert.deepEqual(await checklistRunAts(), []);
-
-  await schedulesRepo.upsertSchedule(USER_ID, TPL, scheduleAt("07:30", { start_date: "2026-06-01", recurrence_end_date: "2026-06-19" }));
-  await reconcile(at(TODAY, "07:00"));
-  assert.deepEqual(await checklistRunAts(), []);
-});
-
-test("a late-evening appointment has no nudges because 2 hours later is tomorrow", async () => {
-  await schedulesRepo.upsertSchedule(USER_ID, TPL, scheduleAt("22:30"));
-  await reconcile(at(TODAY, "07:00"));
-  assert.deepEqual(await checklistRunAts(), []);
-});
-
-test("the planner creates the checklist nudges too, once, and writes nothing in steady state", async () => {
-  await fx.insertDevice(turso, USER_ID, "reg-A");
-  await schedulesRepo.upsertSchedule(USER_ID, TPL, scheduleAt("07:30"));
-
-  const first = await maintenance(at(TODAY, "07:00"));
-  assert.deepEqual(await checklistRunAts(), slotsVn(TODAY, CHECKLIST_SLOTS));
-  assert.ok(first.planned >= 8);
-
-  const originalExecute = turso.execute.bind(turso);
-  const writes: string[] = [];
-  (turso as { execute: unknown }).execute = (statement: unknown) => {
-    const sql = typeof statement === "object" && statement ? String((statement as { sql?: string }).sql) : String(statement);
-    // Housekeeping UPDATEs (stuck jobs, missed sweep) run every beat; the planner must INSERT nothing.
-    if (/^\s*INSERT/i.test(sql) && /notification_jobs/.test(sql)) writes.push(sql);
-    return originalExecute(statement as never);
-  };
-  try {
-    await maintenance(at(TODAY, "07:01"));
-  } finally {
-    (turso as { execute: unknown }).execute = originalExecute;
-  }
-  assert.deepEqual(writes, []);
-});
-
-test("the planner does not undo a cancellation: a completed run keeps its nudges cancelled", async () => {
-  await fx.insertDevice(turso, USER_ID, "reg-A");
-  await schedulesRepo.upsertSchedule(USER_ID, TPL, scheduleAt("07:30"));
-  await maintenance(at(TODAY, "07:00"));
-  await fx.insertRun(turso, { id: "run-1", templateId: TPL, completedAt: iso(at(TODAY, "08:00")) });
-  await reconcile(at(TODAY, "08:01"));
-
-  await maintenance(at(TODAY, "08:02"));
-  await maintenance(at(TODAY, "08:03"));
-
-  assert.deepEqual(await checklistRunAts(), []);
-});
-
-const armChecklist = async () => {
+test("the reminder is sent once at its time and nothing follows during the rest of the day", async () => {
   await fx.insertDevice(turso, USER_ID, "reg-A", { id: "device-A" });
   await fx.insertDevice(turso, USER_ID, "reg-B", { id: "device-B", kind: "fid" });
   await schedulesRepo.upsertSchedule(USER_ID, TPL, scheduleAt("07:30"));
   await reconcile(at(TODAY, "07:00"));
-};
 
-test("the checklist nudge reaches every device with the checklist title and the missed time", async () => {
-  await armChecklist();
+  for (const hhmm of HALF_HOURLY) await dispatchAt(TODAY, hhmm);
+
+  const messages = checklistMessages();
+  assert.equal(messages.length, 2, "one message per device, all of them the on-time reminder");
+  assert.ok(messages.every((m) => m.data?.type === "checklist_due" && m.data?.date === TODAY));
+  assert.ok(messages.every((m) => !/Quá giờ/.test(m.notification?.body ?? "")));
+  assert.equal(overdueMessages().length, 0);
+});
+
+test("a one-off checklist is notified exactly once", async () => {
+  await fx.insertDevice(turso, USER_ID, "reg-A", { id: "device-A" });
+  await schedulesRepo.upsertSchedule(
+    USER_ID,
+    TPL,
+    scheduleAt("07:30", { recurrence_type: null, recurrence_interval: null })
+  );
+  await reconcile(at(TODAY, "07:00"));
+  assert.equal((await dueJobs()).length, 1, "a single occurrence, a single job");
+
+  for (const hhmm of HALF_HOURLY) await dispatchAt(TODAY, hhmm);
+
+  assert.equal(checklistMessages().length, 1);
+});
+
+test("the next day gets its own single reminder: the daily repeat is unchanged", async () => {
+  await fx.insertDevice(turso, USER_ID, "reg-A", { id: "device-A" });
+  await schedulesRepo.upsertSchedule(USER_ID, TPL, scheduleAt("07:30"));
+  await reconcile(at(TODAY, "07:00"));
+
+  for (const hhmm of HALF_HOURLY) await dispatchAt(TODAY, hhmm);
+  const tomorrow = addDays(TODAY, 1);
+  await reconcile(at(tomorrow, "07:00"));
+  for (const hhmm of HALF_HOURLY) await dispatchAt(tomorrow, hhmm);
+
+  assert.deepEqual(
+    checklistMessages().map((m) => m.data?.date),
+    [TODAY, tomorrow]
+  );
+});
+
+test("a checklist_overdue job left over from before is cancelled, never sent", async () => {
+  await fx.insertDevice(turso, USER_ID, "reg-A", { id: "device-A" });
+  await schedulesRepo.upsertSchedule(USER_ID, TPL, scheduleAt("07:30"));
+  await fx.insertRawJob(turso, {
+    id: "stray",
+    kind: "checklist_overdue",
+    refId: TPL,
+    localDate: TODAY,
+    runAt: runAtVn(TODAY, "09:30"),
+  });
 
   await dispatchAt(TODAY, "09:30");
 
-  const messages = overdueMessages();
-  assert.deepEqual(fake.targets().sort(), ["reg-A", "reg-B"]);
-  const [message] = messages;
-  assert.equal(message.notification?.title, "Rời nhà");
-  assert.equal(message.notification?.body, "⏰ Quá giờ 07:30 · Làm ngay hoặc dời lịch!");
-  assert.deepEqual(message.data, { type: "checklist_due", id: TPL, date: TODAY });
-  assert.equal(message.android?.priority, "high");
-  assert.equal(message.android?.ttl, 3_600_000);
-  assert.equal(message.android?.notification?.channelId, "checklist_reminders");
-});
-
-test("the body shows the overridden time of that day", async () => {
-  await armChecklist();
-  await schedulesRepo.upsertOverride(USER_ID, TPL, TODAY, "09:00");
-  await reconcile(at(TODAY, "07:01"));
-
-  await dispatchAt(TODAY, "11:00");
-
-  assert.equal(overdueMessages()[0].notification?.body, "⏰ Quá giờ 09:00 · Làm ngay hoặc dời lịch!");
-});
-
-const checklistInvalidations: Array<[string, () => Promise<unknown>]> = [
-  ["the schedule was turned off", () => turso.execute("UPDATE checklist_schedules SET enabled = 0")],
-  ["the schedule was deleted", () => turso.execute("UPDATE checklist_schedules SET deleted_at = '2026-06-20T01:00:00.000Z'")],
-  ["the checklist was deleted", () => turso.execute({ sql: "UPDATE checklist_templates SET deleted_at = '2026-06-20T01:00:00.000Z' WHERE id = ?", args: [TPL] })],
-  ["a run was completed today", () => fx.insertRun(turso, { id: "run-1", templateId: TPL, completedAt: iso(at(TODAY, "08:00")) })],
-  ["the time of the day was overridden", () => schedulesRepo.upsertOverride(USER_ID, TPL, TODAY, "09:00")],
-  ["the schedule time changed", () => turso.execute("UPDATE checklist_schedules SET time = '08:00'")],
-  ["the schedule now ended yesterday", () => turso.execute("UPDATE checklist_schedules SET start_date = '2026-06-10', recurrence_end_date = '2026-06-19'")],
-  ["the user was disabled", () => turso.execute({ sql: "UPDATE users SET deleted_at = ? WHERE id = ?", args: ["2026-06-20T01:00:00.000Z", USER_ID] })],
-];
-
-for (const [label, mutate] of checklistInvalidations) {
-  test(`checklist re-validation right before sending: nothing is sent when ${label}`, async () => {
-    await armChecklist();
-    await mutate();
-
-    await dispatchAt(TODAY, "09:30");
-
-    assert.equal(overdueMessages().length, 0);
-    assert.equal((await overdueRows("checklist_overdue")).find((r) => r.run_at === runAtVn(TODAY, "09:30"))?.status, "cancelled");
-  });
-}
-
-test("a run completed between two slots stops the rest of the day", async () => {
-  await armChecklist();
-  await dispatchAt(TODAY, "09:30");
-  assert.equal(overdueMessages().length, 2);
-
-  await fx.insertRun(turso, { id: "run-1", templateId: TPL, completedAt: iso(at(TODAY, "10:00")) });
-  await triggers.onChecklistRunChanged(USER_ID, "run-1");
-
-  for (const hhmm of CHECKLIST_SLOTS.slice(1)) await dispatchAt(TODAY, hhmm);
-  assert.equal(overdueMessages().length, 2, "still only the first one");
-});
-
-test("the run-completion hook cancels pending checklist nudges", async () => {
-  // Real clock on purpose: rows for the real today, then a run completed right now.
-  const today = localDateOf(new Date(), VN);
-  await schedulesRepo.upsertSchedule(USER_ID, TPL, scheduleAt("00:30", { start_date: today }));
-  await turso.execute({
-    sql: `INSERT INTO notification_jobs (id, user_id, kind, ref_id, local_date, run_at, status, attempts, created_at)
-          VALUES ('n1', ?, 'checklist_overdue', ?, ?, ?, 'pending', 0, ?)`,
-    args: [USER_ID, TPL, today, new Date(Date.now() + 3600_000).toISOString(), new Date().toISOString()],
-  });
-  await fx.insertRun(turso, { id: "run-now", templateId: TPL, completedAt: new Date().toISOString() });
-
-  await triggers.onChecklistRunChanged(USER_ID, "run-now");
-
-  assert.equal(await fx.statusOf(turso, "n1"), "cancelled");
+  assert.equal(await fx.statusOf(turso, "stray"), "cancelled");
+  assert.equal(fake.messages.length, 0, "the checklist is late and not done, and still nothing is sent");
 });
 
 // ── isolation ────────────────────────────────────────────────────────────────

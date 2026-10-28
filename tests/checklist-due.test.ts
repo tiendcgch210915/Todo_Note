@@ -322,7 +322,9 @@ test("a run completing on a scheduled day cancels that day's job; deleting that 
 });
 
 test("changing the user's time zone moves the pending jobs to the new zone", async () => {
-  const date = tomorrow();
+  // Starts today (Vietnam): between 00:00 and 05:00 UTC it is still the day before in New York, whose
+  // planning window then ends before Vietnam's tomorrow, so a schedule starting tomorrow had no job.
+  const date = localDateOf(new Date(), VN);
   await schedulesService.putSchedule(USER_ID, TPL, dailyFrom(date));
 
   await usersService.updateUserProfile(USER_ID, { timezone: "America/New_York" });
@@ -467,20 +469,33 @@ test("pause: the planner skips the paused days and the reminder returns the day 
   assert.deepEqual((await dueJobs()).map((j) => j.local_date), ["2026-06-21"]);
 });
 
-test("pause: pausing cancels today's reminder and its overdue nudges, lifting it brings them back", async () => {
+test("pause: pausing cancels today's reminder, lifting the pause brings it back", async () => {
   await setup(dailyFrom("2026-06-20"));
-  const lateMorning = plus(NOW, 180); // 10:00 in Vietnam, 2.5h after the 07:30 slot
-  await reconcileChecklistDue(USER_ID, TPL, lateMorning);
-  const pendingNudges = () =>
-    fx.jobsFor(turso, USER_ID, "AND kind = 'checklist_overdue' AND status = 'pending'");
-  assert.ok((await pendingNudges()).length > 0, "unpaused: overdue nudges are planned");
+  await reconcileChecklistDue(USER_ID, TPL, NOW); // 07:00, the 07:30 reminder is still ahead
+  assert.equal((await job("2026-06-20"))?.status, "pending");
 
   await schedulesRepo.upsertSchedule(USER_ID, TPL, dailyFrom("2026-06-20", { paused_from: "2026-06-20", paused_until: "2026-06-22" }));
-  await reconcileChecklistDue(USER_ID, TPL, lateMorning);
-  assert.equal((await pendingNudges()).length, 0, "paused: no overdue nudge is left pending");
-  assert.notEqual((await job("2026-06-20"))?.status, "pending");
+  await reconcileChecklistDue(USER_ID, TPL, NOW);
+  assert.equal((await job("2026-06-20"))?.status, "cancelled", "paused: today is not reminded");
+  assert.equal((await job("2026-06-21"))?.status, "cancelled", "paused: tomorrow is not reminded either");
 
   await schedulesRepo.upsertSchedule(USER_ID, TPL, dailyFrom("2026-06-20", { paused_from: null, paused_until: null }));
+  await reconcileChecklistDue(USER_ID, TPL, NOW);
+  assert.equal((await job("2026-06-20"))?.status, "pending", "resumed: reminded again");
+  assert.equal((await job("2026-06-21"))?.status, "pending");
+});
+
+test("a checklist is reminded once at its time: being late and not done creates no repeating nudge", async () => {
+  await setup(dailyFrom("2026-06-20"));
+  const lateMorning = plus(NOW, 180); // 10:00 in Vietnam, 2.5h after the 07:30 slot
+
   await reconcileChecklistDue(USER_ID, TPL, lateMorning);
-  assert.ok((await pendingNudges()).length > 0, "resumed: nudges are planned again");
+  await planner.planAllUsers(plus(lateMorning, 1));
+
+  assert.deepEqual(await fx.jobsFor(turso, USER_ID, "AND kind = 'checklist_overdue'"), []);
+  assert.deepEqual(
+    (await dueJobs()).map((j) => j.local_date),
+    ["2026-06-21"],
+    "today's 07:30 reminder is too late to create; only tomorrow's is planned"
+  );
 });

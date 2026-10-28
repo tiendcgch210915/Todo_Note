@@ -65,7 +65,7 @@ export const CHECKLIST_DUE_BODY = {
 } as const;
 
 /**
- * Nhắc LẶP khi bỏ lỡ giờ hẹn (todo_overdue, checklist_overdue). Tiêu đề vẫn là tên todo/checklist,
+ * Nhắc LẶP khi bỏ lỡ giờ hẹn của todo (todo_overdue; checklist không còn nhắc lặp). Tiêu đề vẫn là tên todo,
  * nội dung chỉ nói giờ đã lỡ và việc nên làm: "⏰ Quá giờ 10:00 · Làm ngay hoặc dời lịch!".
  */
 export const OVERDUE_BODY = {

@@ -24,6 +24,7 @@ export type EntityType =
   | "checklist_run_item"
   | "checklist_schedule"
   | "checklist_schedule_override"
+  | "checklist_occurrence_mark"
   | "user";
 
 // ── Association bundles (pre-fetched in bulk by sync.repo) ──────────────────
@@ -256,6 +257,18 @@ export type SyncChecklistScheduleOverride = {
   template_id: string;
   local_date: string;
   time: string;
+  created_at: string;
+  updated_at: string;
+  deleted_at: string | null;
+};
+
+/** Đánh dấu tay "Đã xong / Chưa hoàn thành" của MỘT ngày trong timeline checklist. */
+export type SyncChecklistOccurrenceMark = {
+  id: string;
+  user_id: string;
+  template_id: string;
+  local_date: string;
+  status: "done" | "open";
   created_at: string;
   updated_at: string;
   deleted_at: string | null;

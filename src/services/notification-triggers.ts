@@ -155,6 +155,19 @@ export const onChecklistScheduleChanged = (
 ): Promise<void> =>
   safely("checklist_schedule_changed", () => reconcileChecklistDue(userId, templateId));
 
+/**
+ * Người dùng đánh dấu tay "Đã xong / Chưa hoàn thành" cho một ngày của checklist (REST hoặc sync):
+ * ngày đó đổi từ chưa xong sang xong (hoặc ngược lại) nên job nhắc phải hủy/lập lại, và lịch không
+ * lặp đã xong thì hết nhiệm vụ.
+ */
+export const onChecklistOccurrenceMarkChanged = async (
+  userId: string,
+  templateId: string
+): Promise<void> => {
+  await finishSchedulesForUserSafely(userId);
+  await safely("checklist_mark_due", () => reconcileChecklistDue(userId, templateId));
+};
+
 /** Đổi múi giờ (API, sync, admin): dời tổng kết chưa gửi và bổ sung job còn thiếu. */
 export const onUserSettingsChanged = async (userId: string): Promise<void> => {
   await safely("user_settings_changed", async () => {

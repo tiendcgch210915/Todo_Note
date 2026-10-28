@@ -9,9 +9,9 @@
  *  - planner (`planChecklistDueForUsers`): bổ sung job còn thiếu cho hôm nay + ngày mai;
  *  - kiểm tra lại ngay trước khi gửi (`checkDueForSend`).
  *
- * Cùng module còn lo job nhắc LẶP `checklist_overdue` (giờ hẹn + 2h, +4h, ... trong ngày, khi
- * checklist hôm nay vẫn chưa có run hoàn thành). Chỉ lập cho HÔM NAY: mốc đầu của ngày mai
- * cách nửa đêm ít nhất 2 giờ nên planner kịp lập khi sang ngày.
+ * Checklist chỉ nhắc MỘT lần đúng giờ hẹn của mỗi lần xuất hiện: KHÔNG có nhắc lặp quá giờ (loại
+ * `checklist_overdue` cũ đã bỏ, xem `LEGACY_SLOT_KINDS`). Lịch lặp hằng ngày thì mỗi ngày có đúng
+ * một job của riêng ngày đó; lịch không lặp thì chỉ một job duy nhất.
  */
 import { LATENESS_MS } from "../config/notification-policy.js";
 import * as schedulesRepo from "../repositories/checklist-schedules.js";
@@ -19,6 +19,7 @@ import * as templatesRepo from "../repositories/checklist-templates.js";
 import * as jobsRepo from "../repositories/notification-jobs.js";
 import * as settingsRepo from "../repositories/notification-settings.js";
 import { addDays, localDateOf, localDateTimeToUtc } from "../utils/time.js";
+import { dayBoundsUtc, doneDatesOf, loadDoneDates } from "./checklist-occurrence-done.js";
 import {
   occurrencesBetween,
   toScheduleRule,
@@ -26,7 +27,6 @@ import {
   type ScheduleRule,
 } from "./checklist-schedule.js";
 import { resolveSettings } from "./notification-schedule.js";
-import { creatableOverdueSlots, overdueSlots } from "./overdue-nudges.js";
 
 export type DueSlot = {
   templateId: string;
@@ -37,20 +37,9 @@ export type DueSlot = {
   runAt: Date;
 };
 
-/** Ngày địa phương của các run đã hoàn thành. */
-export const completedLocalDates = (
-  completedAts: readonly string[],
-  timezone: string
-): Set<string> => {
-  const dates = new Set<string>();
-  for (const iso of completedAts) {
-    const at = new Date(iso);
-    if (!Number.isNaN(at.getTime())) dates.add(localDateOf(at, timezone));
-  }
-  return dates;
-};
-
-/** HÀM THUẦN: lần xuất hiện trong [from, to] chưa có run hoàn thành, kèm thời điểm UTC để gửi. */
+/**
+ * HÀM THUẦN: lần xuất hiện trong [from, to] chưa xong (xem `doneDatesOf`), kèm thời điểm UTC để gửi.
+ */
 export const dueSlotsFor = (
   rule: ScheduleRule,
   overrides: readonly ScheduleOverride[],
@@ -72,16 +61,6 @@ export const dueSlotsFor = (
 export const creatableSlots = (slots: readonly DueSlot[], now: Date): DueSlot[] =>
   slots.filter((slot) => now.getTime() - slot.runAt.getTime() <= LATENESS_MS.checklist_due);
 
-/** [00:00 của from, 00:00 của (to + 1 ngày)) theo múi giờ, dạng ISO UTC. */
-export const dayBoundsUtc = (
-  from: string,
-  to: string,
-  timezone: string
-): { fromIso: string; toIso: string } => ({
-  fromIso: localDateTimeToUtc(from, "00:00", timezone).toISOString(),
-  toIso: localDateTimeToUtc(addDays(to, 1), "00:00", timezone).toISOString(),
-});
-
 const toOverrides = (
   rows: readonly schedulesRepo.OverrideRow[]
 ): ScheduleOverride[] => rows.map((row) => ({ localDate: row.local_date, time: row.time }));
@@ -100,8 +79,6 @@ export const reconcileChecklistDue = async (
   const tomorrow = addDays(today, 1);
 
   let slots: DueSlot[] = [];
-  /** Hôm nay: giờ hẹn của lần xuất hiện CHƯA xong (kể cả đã trễ), để nhắc lặp tính từ đó. */
-  let todaySlot: DueSlot | undefined;
   if (ctx.active) {
     const [schedule, template] = await Promise.all([
       schedulesRepo.getLiveSchedule(userId, templateId),
@@ -111,18 +88,15 @@ export const reconcileChecklistDue = async (
       const overrides = (
         await schedulesRepo.listLiveOverridesForUsers([userId], today, tomorrow)
       ).filter((row) => row.template_id === templateId);
-      const { fromIso, toIso } = dayBoundsUtc(today, tomorrow, timezone);
-      const runs = await schedulesRepo.listCompletedRuns([userId], fromIso, toIso, [templateId]);
       const open = dueSlotsFor(
         toScheduleRule(schedule),
         toOverrides(overrides),
-        completedLocalDates(runs.map((run) => run.completed_at), timezone),
+        await loadDoneDates(userId, templateId, today, tomorrow, timezone),
         timezone,
         today,
         tomorrow
       );
       slots = creatableSlots(open, now);
-      todaySlot = open.find((slot) => slot.date === today);
     }
   }
 
@@ -140,25 +114,6 @@ export const reconcileChecklistDue = async (
       refId: templateId,
       localDate: slot.date,
       runAt: slot.runAt.toISOString(),
-    });
-  }
-
-  // Nhắc lặp: hôm nay chưa xong thì mỗi 2 giờ sau giờ hẹn; xong rồi (hoặc lịch mất) thì hủy hết.
-  const overdue = todaySlot
-    ? creatableOverdueSlots(
-        overdueSlots(todaySlot.runAt, today, timezone),
-        "checklist_overdue",
-        now
-      ).map((slot) => slot.toISOString())
-    : [];
-  await jobsRepo.cancelSlotJobsExcept(userId, "checklist_overdue", templateId, overdue);
-  for (const runAt of overdue) {
-    await jobsRepo.upsertSlotJob({
-      userId,
-      kind: "checklist_overdue",
-      refId: templateId,
-      localDate: today,
-      runAt,
     });
   }
 };
@@ -206,14 +161,12 @@ export const planChecklistDueForUsers = async (
   const fromIso = bounds.reduce((m, b) => (b.fromIso < m ? b.fromIso : m), bounds[0].fromIso);
   const toIso = bounds.reduce((m, b) => (b.toIso > m ? b.toIso : m), bounds[0].toIso);
 
-  const [overrideRows, runs, existing, existingOverdue] = await Promise.all([
+  const [overrideRows, runs, marks, existing] = await Promise.all([
     schedulesRepo.listLiveOverridesForUsers(userIds, minDate, maxDate),
-    schedulesRepo.listCompletedRuns(userIds, fromIso, toIso),
+    schedulesRepo.listCompletedRunsStartedBetween(userIds, fromIso, toIso),
+    schedulesRepo.listLiveMarksForUsers(userIds, minDate, maxDate),
     jobsRepo.listOccurrenceJobsForUsers(userIds, "checklist_due", [
       ...new Set(allFrames.flatMap((f) => [f.today, f.tomorrow])),
-    ]),
-    jobsRepo.listSlotJobKeys(userIds, "checklist_overdue", [
-      ...new Set(allFrames.map((f) => f.today)),
     ]),
   ]);
 
@@ -229,10 +182,10 @@ export const planChecklistDueForUsers = async (
         (row) => row.user_id === schedule.user_id && row.template_id === schedule.template_id
       )
     );
-    const done = completedLocalDates(
-      runs
-        .filter((run) => run.user_id === schedule.user_id && run.template_id === schedule.template_id)
-        .map((run) => run.completed_at),
+    const done = doneDatesOf(
+      { userId: schedule.user_id, templateId: schedule.template_id },
+      runs,
+      marks,
       frame.timezone
     );
     const open = dueSlotsFor(
@@ -244,28 +197,6 @@ export const planChecklistDueForUsers = async (
       frame.tomorrow
     );
     const slots = creatableSlots(open, now);
-
-    // Nhắc lặp của hôm nay: chỉ thêm mốc còn thiếu (hook mới là nơi hủy/đặt lại mốc đã có).
-    const todaySlot = open.find((slot) => slot.date === frame.today);
-    if (todaySlot) {
-      for (const at of creatableOverdueSlots(
-        overdueSlots(todaySlot.runAt, frame.today, frame.timezone),
-        "checklist_overdue",
-        now
-      )) {
-        const runAt = at.toISOString();
-        if (existingOverdue.has(`${schedule.user_id}|${schedule.template_id}|${runAt}`)) continue;
-        const inserted = await jobsRepo.insertSlotJobIfAbsent({
-          userId: schedule.user_id,
-          kind: "checklist_overdue",
-          refId: schedule.template_id,
-          localDate: frame.today,
-          runAt,
-          status: "pending",
-        });
-        if (inserted) written++;
-      }
-    }
 
     for (const slot of slots) {
       const runAt = slot.runAt.toISOString();
@@ -303,8 +234,8 @@ export type OpenOccurrence = DueCheck & {
 
 /**
  * Lần xuất hiện của (checklist, ngày) có đang "còn chờ" không: checklist còn tồn tại, lịch bật và
- * còn hiệu lực cho đúng ngày đó (trong start..end, đúng thứ), và chưa có run hoàn thành trong
- * ngày. Không thì null. Dùng chung cho `checklist_due` và `checklist_overdue`.
+ * còn hiệu lực cho đúng ngày đó (trong start..end, đúng thứ), và chưa xong trong
+ * ngày (xem `doneDatesOf`: tính theo giờ bắt đầu, có tính dấu tay). Không thì null. Dùng cho `checklist_due`.
  */
 export const checkOccurrenceOpen = async (
   userId: string,
@@ -325,9 +256,7 @@ export const checkOccurrenceOpen = async (
   if (!occurrence) return null;
   const scheduledAt = localDateTimeToUtc(date, occurrence.time, timezone);
 
-  const { fromIso, toIso } = dayBoundsUtc(date, date, timezone);
-  const runs = await schedulesRepo.listCompletedRuns([userId], fromIso, toIso, [templateId]);
-  if (completedLocalDates(runs.map((run) => run.completed_at), timezone).has(date)) return null;
+  if ((await loadDoneDates(userId, templateId, date, date, timezone)).has(date)) return null;
 
   const steps = await schedulesRepo.countStepsByTemplate([templateId]);
   return { template, stepCount: steps.get(templateId) ?? 0, time: occurrence.time, scheduledAt };

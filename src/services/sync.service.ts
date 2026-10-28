@@ -22,13 +22,17 @@ import * as notesRepo from "../repositories/notes.js";
 import * as todosService from "./todos.js";
 import * as notesService from "./notes.js";
 import { autoLogHabitForCompletedTodo } from "./todo-habit-logs.js";
-import { autoLogHabitsForCompletedRunSafely } from "./checklist-habit-logs.js";
+import {
+  autoLogHabitsForCompletedRunSafely,
+  autoLogHabitsForMarkedDaySafely,
+} from "./checklist-habit-logs.js";
 import * as runsRepo from "../repositories/checklist-runs.js";
 import { ensurePastTodoDayClosedForMutation } from "./daily-todo-logs.js";
 import * as notificationTriggers from "./notification-triggers.js";
 import * as schedulesRepo from "../repositories/checklist-schedules.js";
 import {
   normalizeScheduleFields,
+  OccurrenceMarkFieldsSchema,
   ScheduleFieldsSchema,
   ScheduleOverrideFieldsSchema,
 } from "../schemas/api/checklist-schedules.js";
@@ -63,13 +67,17 @@ const todoDeleteScope = (
 };
 
 /**
- * Kiểm tra và chuẩn hóa payload lịch/ghi đè checklist từ sync (cùng quy tắc với REST). Trả null
- * nếu không hợp lệ -> thao tác báo `bad_input`.
+ * Kiểm tra và chuẩn hóa payload lịch/ghi đè/dấu tay checklist từ sync (cùng quy tắc với REST). Trả
+ * null nếu không hợp lệ -> thao tác báo `bad_input`.
  */
 const normalizeSyncSchedulePayload = (
-  type: "checklist_schedule" | "checklist_schedule_override",
+  type: "checklist_schedule" | "checklist_schedule_override" | "checklist_occurrence_mark",
   payload: Record<string, unknown>
 ): Record<string, unknown> | null => {
+  if (type === "checklist_occurrence_mark") {
+    const parsed = OccurrenceMarkFieldsSchema.safeParse(payload);
+    return parsed.success ? parsed.data : null;
+  }
   if (type === "checklist_schedule") {
     if (typeof payload.template_id !== "string" || payload.template_id === "") return null;
     const parsed = ScheduleFieldsSchema.safeParse(payload);
@@ -102,6 +110,30 @@ const afterScheduleEntityChange = async (
     row?.template_id ??
     (typeof payload.template_id === "string" ? payload.template_id : null);
   if (templateId) await notificationTriggers.onChecklistScheduleChanged(userId, templateId);
+};
+
+/**
+ * Sau khi dấu tay "Đã xong / Chưa hoàn thành" của một ngày đổi qua sync: hủy/lập lại job nhắc, dọn
+ * lịch không lặp đã xong, và nếu ngày đó đang là "Đã xong" thì tick habit gắn checklist.
+ */
+const afterMarkChange = async (
+  userId: string,
+  id: string,
+  payload: Record<string, unknown>,
+  upserted: boolean
+): Promise<void> => {
+  const byId = await schedulesRepo.getMarkById(id);
+  // Gộp theo khóa tự nhiên có thể giữ id khác id đã đẩy lên: lấy checklist từ payload nếu cần.
+  const templateId =
+    byId?.template_id ??
+    (typeof payload.template_id === "string" ? payload.template_id : null);
+  if (!templateId) return;
+  await notificationTriggers.onChecklistOccurrenceMarkChanged(userId, templateId);
+  if (!upserted || typeof payload.local_date !== "string") return;
+  const mark = await schedulesRepo.getLiveMark(userId, templateId, payload.local_date);
+  if (mark?.status === "done") {
+    await autoLogHabitsForMarkedDaySafely(userId, templateId, mark.local_date);
+  }
 };
 
 // ── Result type ───────────────────────────────────────────────────────────────
@@ -233,7 +265,9 @@ async function processOp(
   const dbPayload = fromSyncEntity(payload, type);
 
   if (
-    (type === "checklist_schedule" || type === "checklist_schedule_override") &&
+    (type === "checklist_schedule" ||
+      type === "checklist_schedule_override" ||
+      type === "checklist_occurrence_mark") &&
     opType !== "delete"
   ) {
     const normalized = normalizeSyncSchedulePayload(type, payload);
@@ -495,6 +529,9 @@ async function processOp(
         await notificationTriggers.onChecklistRunChanged(userId, id);
       }
       await afterScheduleEntityChange(userId, type, id, payload);
+      if (type === "checklist_occurrence_mark") {
+        await afterMarkChange(userId, id, payload, false);
+      }
     }
   } else {
     await upsertEntity(userId, type, dbPayload, {
@@ -545,6 +582,9 @@ async function processOp(
       (type === "checklist_template" && payload.deleted_at)
     ) {
       await afterScheduleEntityChange(userId, type, id, payload);
+    }
+    if (type === "checklist_occurrence_mark") {
+      await afterMarkChange(userId, id, payload, true);
     }
     if (type === "user") {
       // The pushed user entity can change `timezone`, which moves every digest.

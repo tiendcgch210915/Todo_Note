@@ -31,13 +31,12 @@ import * as timersRepo from "../repositories/todo-timers.js";
 import * as todosRepo from "../repositories/todos.js";
 import { addDays, localDateOf, localDateTimeToUtc } from "../utils/time.js";
 import { isPushConfigured, pushLogger, type PushLogger } from "./firebase.js";
-import { checkDueForSend, checkOccurrenceOpen } from "./checklist-due.js";
+import { checkDueForSend } from "./checklist-due.js";
 import { backfillChecklistRunNudges, findRunNudge } from "./checklist-run-nudges.js";
 import { expireChecklistSchedules } from "./checklist-schedule-expiry.js";
 import {
   buildChecklistCarryover,
   buildChecklistDue,
-  buildChecklistOverdue,
   buildChecklistRunning,
   buildHabitsDigest,
   buildMorningDigest,
@@ -260,25 +259,10 @@ const prepare = async (job: jobsRepo.JobRow): Promise<Prepared> => {
       };
     }
 
-    case "checklist_overdue": {
-      if (!job.ref_id || !job.local_date) return CANCEL;
-      // Cùng điều kiện "còn chờ" với checklist_due (lịch bật, đúng ngày, chưa có run xong).
-      const open = await checkOccurrenceOpen(
-        job.user_id,
-        job.ref_id,
-        job.local_date,
-        settings.timezone
-      );
-      if (!open) return CANCEL;
-      if (!isOverdueSlot(open.scheduledAt, new Date(runAtMs), job.local_date, settings.timezone)) {
-        return CANCEL;
-      }
-      return {
-        text: buildChecklistOverdue(open.template.title, open.time),
-        id: open.template.id,
-        date: job.local_date,
-      };
-    }
+    case "checklist_overdue":
+      // Loại CŨ (nhắc lặp giờ hẹn + 2h, +4h... của checklist): checklist chỉ còn nhắc MỘT lần đúng
+      // giờ hẹn (checklist_due), nên dòng cũ nào còn sót cũng không được gửi.
+      return CANCEL;
 
     case "digest_morning": {
       const stats = await digestStats(job.user_id, date);

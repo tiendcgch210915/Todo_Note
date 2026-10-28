@@ -193,18 +193,16 @@ test("a one-off completed on its day is reset: no schedule on the detail page, n
   assert.deepEqual((await get(`/checklists/occurrences?from=${today}&to=${today}`)).body.items, []);
 });
 
-test("the pending reminder and nudges of a finished one-off are cancelled", async () => {
+test("the pending reminder of a finished one-off is cancelled", async () => {
   const today = TODAY_REAL();
   await schedulesRepo.upsertSchedule(USER_ID, A, oneOff(today));
   const future = new Date(Date.now() + 3_600_000).toISOString();
   await fx.insertRawJob(turso, { id: "due", kind: "checklist_due", refId: A, localDate: today, runAt: future });
-  await fx.insertRawJob(turso, { id: "nudge", kind: "checklist_overdue", refId: A, localDate: today, runAt: future });
 
   await fx.insertRun(turso, { id: "run-1", templateId: A, completedAt: new Date().toISOString() });
   await triggers.onChecklistRunChanged(USER_ID, "run-1");
 
   assert.equal(await fx.statusOf(turso, "due"), "cancelled");
-  assert.equal(await fx.statusOf(turso, "nudge"), "cancelled");
 });
 
 test("completing on the scheduled day works for any time of that day, in the user's own zone", async () => {
@@ -368,16 +366,14 @@ test("a disabled schedule expires too, and so does one of a user without any dev
   assert.equal(await expiry.expireChecklistSchedules(at("2026-06-11", "00:00")), 1);
 });
 
-test("the pending reminder and nudges of an expired schedule are cancelled", async () => {
+test("the pending reminder of an expired schedule is cancelled", async () => {
   await schedulesRepo.upsertSchedule(USER_ID, A, repeating("2026-06-01", { recurrence_end_date: "2026-06-10" }));
   const future = iso(at("2026-06-11", "09:00"));
   await fx.insertRawJob(turso, { id: "due", kind: "checklist_due", refId: A, localDate: "2026-06-11", runAt: future });
-  await fx.insertRawJob(turso, { id: "nudge", kind: "checklist_overdue", refId: A, localDate: "2026-06-11", runAt: future });
 
   await expiry.expireChecklistSchedules(at("2026-06-11", "00:00"));
 
   assert.equal(await fx.statusOf(turso, "due"), "cancelled");
-  assert.equal(await fx.statusOf(turso, "nudge"), "cancelled");
 });
 
 test("the maintenance tick runs the sweep (and reports how many it removed), even without devices", async () => {

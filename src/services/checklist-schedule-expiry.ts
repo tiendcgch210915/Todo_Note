@@ -3,25 +3,23 @@
  * hình chi tiết của checklist trở về như chưa từng đặt lịch ("Nhắc theo lịch" tắt, không còn lịch
  * nào hiển thị). Hai trường hợp, quy tắc thuần nằm ở `scheduleFinishReason`:
  *  - qua ngày kết thúc (đúng 00:00 ngày kế tiếp theo múi giờ người dùng);
- *  - lịch KHÔNG lặp mà checklist đã được hoàn thành đúng vào ngày của lịch.
+ *  - lịch KHÔNG lặp mà checklist đã xong đúng vào ngày của lịch (`isDoneOn`: tính theo giờ bắt đầu
+ *    của lần chạy, hoặc người dùng đánh dấu tay "Đã xong").
  *
  * Ba nơi gọi, cùng một logic:
  *  - `expireChecklistSchedules`: quét định kỳ (maintenance, mỗi 60 giây) mọi người dùng, kể cả
  *    người không có thiết bị, vì lịch hiển thị trong app không phụ thuộc thông báo;
  *  - `finishSchedulesForUser`: ngay khi một lần chạy checklist đổi (hook) và trước khi đọc lịch
  *    qua REST, để màn chi tiết không bao giờ thấy một lịch đã xong dù lần quét chưa tới.
- * Cả hai đều hủy luôn job `checklist_due` / `checklist_overdue` còn chờ của lịch vừa xóa.
+ * Cả hai đều hủy luôn job `checklist_due` còn chờ của lịch vừa xóa.
  *
  * Module này KHÔNG import env/firebase để dùng được trong test không có cấu hình.
  */
 import * as schedulesRepo from "../repositories/checklist-schedules.js";
 import * as settingsRepo from "../repositories/notification-settings.js";
 import { localDateOf } from "../utils/time.js";
-import {
-  completedLocalDates,
-  dayBoundsUtc,
-  reconcileChecklistDue,
-} from "./checklist-due.js";
+import { reconcileChecklistDue } from "./checklist-due.js";
+import { isDoneOn } from "./checklist-occurrence-done.js";
 import {
   effectiveEndDate,
   scheduleFinishReason,
@@ -40,21 +38,9 @@ const removeSchedule = async (
   now: Date
 ): Promise<boolean> => {
   const removed = await schedulesRepo.softDeleteSchedule(userId, templateId);
-  // Không còn lịch -> reconcile hủy mọi job checklist_due / checklist_overdue đang chờ.
+  // Không còn lịch -> reconcile hủy mọi job checklist_due đang chờ.
   await reconcileChecklistDue(userId, templateId, now);
   return removed;
-};
-
-/** Checklist có run hoàn thành trong ngày địa phương `date` không. */
-const completedOn = async (
-  userId: string,
-  templateId: string,
-  date: string,
-  timezone: string
-): Promise<boolean> => {
-  const { fromIso, toIso } = dayBoundsUtc(date, date, timezone);
-  const runs = await schedulesRepo.listCompletedRuns([userId], fromIso, toIso, [templateId]);
-  return completedLocalDates(runs.map((run) => run.completed_at), timezone).has(date);
 };
 
 /**
@@ -75,7 +61,7 @@ export const finishSchedulesForUser = async (
     const rule = toScheduleRule(schedule);
     let reason = scheduleFinishReason(rule, today, false);
     if (reason === null && rule.recurrenceType === null && rule.startDate <= today) {
-      const done = await completedOn(userId, schedule.template_id, rule.startDate, timezone);
+      const done = await isDoneOn(userId, schedule.template_id, rule.startDate, timezone);
       reason = scheduleFinishReason(rule, today, done);
     }
     if (reason !== null && (await removeSchedule(userId, schedule.template_id, now))) removed++;

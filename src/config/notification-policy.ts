@@ -33,11 +33,20 @@ export const DIGEST_KINDS = [
 export const OCCURRENCE_KINDS = ["checklist_due"] as const;
 
 /**
- * Nhắc LẶP khi người dùng bỏ lỡ giờ hẹn: giờ hẹn + 2h, +4h, ... trong cùng ngày địa phương.
+ * Nhắc LẶP khi người dùng bỏ lỡ giờ hẹn của TODO: giờ hẹn + 1h/2h, ... trong cùng ngày địa phương.
  * Mỗi mốc là MỘT dòng job riêng, duy nhất theo (user, kind, ref_id, run_at): một mốc bị lỡ
- * (server ngủ) không làm đứt các mốc sau.
+ * (server ngủ) không làm đứt các mốc sau. Checklist KHÔNG còn nhắc lặp (xem `LEGACY_SLOT_KINDS`).
  */
-export const OVERDUE_KINDS = ["todo_overdue", "checklist_overdue"] as const;
+export const OVERDUE_KINDS = ["todo_overdue"] as const;
+
+/**
+ * `checklist_overdue` là loại CŨ (nhắc lặp giờ hẹn + 2h, +4h... của checklist): không còn được tạo,
+ * checklist chỉ nhắc MỘT lần đúng giờ hẹn (`checklist_due`). Vẫn nằm ở đây vì bảng còn các dòng cũ
+ * và chỉ mục `uq_notification_jobs_slot` (migration 0020) liệt kê nó; khi gặp job loại này, tick hủy.
+ * Đứng GIỮA `todo_overdue` và `checklist_running` trong `SLOT_KINDS` để câu `ON CONFLICT ... WHERE`
+ * khớp từng chữ với điều kiện của chỉ mục.
+ */
+export const LEGACY_SLOT_KINDS = ["checklist_overdue"] as const;
 
 /**
  * Nhắc checklist ĐANG LÀM DỞ (đã bấm "bắt đầu" mà chưa hoàn thành): mỗi 1 giờ kể từ lúc bắt đầu
@@ -47,12 +56,17 @@ export const OVERDUE_KINDS = ["todo_overdue", "checklist_overdue"] as const;
 export const RUNNING_KINDS = ["checklist_running"] as const;
 
 /** Mọi loại "mỗi mốc một dòng": duy nhất theo (user, kind, ref_id, run_at). */
-export const SLOT_KINDS = [...OVERDUE_KINDS, ...RUNNING_KINDS] as const;
+export const SLOT_KINDS = [
+  ...OVERDUE_KINDS,
+  ...LEGACY_SLOT_KINDS,
+  ...RUNNING_KINDS,
+] as const;
 
 export const NOTIFICATION_KINDS = [
   ...EVENT_KINDS,
   ...OCCURRENCE_KINDS,
   ...OVERDUE_KINDS,
+  ...LEGACY_SLOT_KINDS,
   ...RUNNING_KINDS,
   ...DIGEST_KINDS,
 ] as const;

@@ -118,6 +118,18 @@ export const ScheduleOverrideFieldsSchema = z.object({
   time: TimeHm,
 });
 
+const MarkStatus = z.enum(["done", "open"]);
+
+/** Payload đồng bộ của một dấu tay theo ngày (`checklist_occurrence_mark`). */
+export const OccurrenceMarkFieldsSchema = z.object({
+  template_id: z.string().min(1),
+  local_date: IsoDate,
+  status: MarkStatus,
+});
+
+/** Body của PUT /checklists/templates/:id/occurrences/:date/status. */
+export const PutOccurrenceStatusSchema = z.object({ status: MarkStatus });
+
 export const OccurrencesQuerySchema = z
   .object({ from: IsoDate, to: IsoDate })
   .superRefine((value, ctx) => {

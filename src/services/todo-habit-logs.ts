@@ -1,8 +1,8 @@
 import * as habitsRepo from "../repositories/habits.js";
 import * as todosRepo from "../repositories/todos.js";
-import * as schedulesRepo from "../repositories/checklist-schedules.js";
 import * as usersRepo from "../repositories/users.js";
-import { addDays, effectiveTimeZone, localDateTimeToUtc } from "../utils/time.js";
+import { effectiveTimeZone } from "../utils/time.js";
+import { isDoneOn } from "./checklist-occurrence-done.js";
 
 const isDoneOnSchedule = (todo: todosRepo.TodoRow): boolean => {
   if (todo.status !== "done" || !todo.completed_at || !todo.scheduled_date) {
@@ -19,14 +19,7 @@ const hasCompletedChecklistRunOn = async (
   date: string
 ): Promise<boolean> => {
   const user = await usersRepo.getUserById(userId);
-  const timeZone = effectiveTimeZone(user?.timezone);
-  const runs = await schedulesRepo.listCompletedRuns(
-    [userId],
-    localDateTimeToUtc(date, "00:00", timeZone).toISOString(),
-    localDateTimeToUtc(addDays(date, 1), "00:00", timeZone).toISOString(),
-    [templateId]
-  );
-  return runs.length > 0;
+  return isDoneOn(userId, templateId, date, effectiveTimeZone(user?.timezone));
 };
 
 export const autoLogHabitForCompletedTodo = async (

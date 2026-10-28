@@ -248,15 +248,6 @@ export const buildTodoOverdue = (
   body: overdueBody(scheduledTime),
 });
 
-/** checklist_overdue: tiêu đề = tiêu đề checklist; `scheduledTime` = giờ của lần xuất hiện hôm nay. */
-export const buildChecklistOverdue = (
-  checklistTitle: string,
-  scheduledTime: string
-): NotificationText => ({
-  title: normalizePushTitle(checklistTitle, FALLBACK_TITLE.checklist),
-  body: overdueBody(scheduledTime),
-});
-
 /**
  * digest_overdue_evening (17:00): "⏰ {x} todo quan trọng quá hạn" + "Làm ngay hoặc dời lịch!".
  * x = số todo quan trọng & không khẩn cấp của hôm nay đã quá giờ hẹn mà chưa xong; null nếu x = 0.

@@ -178,7 +178,11 @@ export const insertSystemTemplate = async (
   }
 };
 
-/** Một lần chạy checklist đã kết thúc (mặc định hoàn thành) vào thời điểm `completedAt`. */
+/**
+ * Một lần chạy checklist đã kết thúc (mặc định hoàn thành) vào thời điểm `completedAt`. Không nêu
+ * `startedAt` thì lần chạy bắt đầu đúng lúc kết thúc (ngày của nó = ngày hoàn thành); test về lần
+ * chạy qua nửa đêm phải truyền `startedAt` riêng.
+ */
 export const insertRun = async (
   db: Db,
   row: {
@@ -202,7 +206,7 @@ export const insertRun = async (
       row.templateId,
       row.userId ?? USER_ID,
       status,
-      row.startedAt ?? SEED_TIME,
+      row.startedAt ?? row.completedAt ?? SEED_TIME,
       row.completedAt === undefined && status !== "in_progress" ? SEED_TIME : (row.completedAt ?? null),
       SEED_TIME,
       SEED_TIME,

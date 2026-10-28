@@ -36,6 +36,7 @@ const NOT_NULL: Record<string, string[]> = {
   checklist_run_items: ["id", "run_id", "template_item_id", "status", "created_at", "updated_at"],
   checklist_schedules: ["id", "user_id", "template_id", "start_date", "time", "enabled", "created_at", "updated_at"],
   checklist_schedule_overrides: ["id", "user_id", "template_id", "local_date", "time", "created_at", "updated_at"],
+  checklist_occurrence_marks: ["id", "user_id", "template_id", "local_date", "status", "created_at", "updated_at"],
 };
 
 // ── REQUIRED KEYS per entity type (must be present even if null) ─────────────
@@ -65,6 +66,7 @@ const REQUIRED_KEYS: Record<string, string[]> = {
     "created_at", "updated_at", "deleted_at",
   ],
   checklist_schedule_overrides: ["id", "user_id", "template_id", "local_date", "time", "created_at", "updated_at", "deleted_at"],
+  checklist_occurrence_marks: ["id", "user_id", "template_id", "local_date", "status", "created_at", "updated_at", "deleted_at"],
 };
 
 async function createTestData(userId: string): Promise<void> {
@@ -152,6 +154,12 @@ async function createTestData(userId: string): Promise<void> {
             (id, user_id, template_id, local_date, time, created_at, updated_at)
             VALUES (?,?,?,?,?,?,?)`,
       args: [newId(), userId, tplId, now.slice(0, 10), "08:15", now, now],
+    },
+    {
+      sql: `INSERT INTO checklist_occurrence_marks
+            (id, user_id, template_id, local_date, status, created_at, updated_at)
+            VALUES (?,?,?,?,?,?,?)`,
+      args: [newId(), userId, tplId, now.slice(0, 10), "open", now, now],
     },
   ], "write");
   const item1 = newId(); const item2 = newId();

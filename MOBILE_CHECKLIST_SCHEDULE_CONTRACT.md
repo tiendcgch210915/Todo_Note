@@ -5,7 +5,7 @@
 - API base: `/api/v1`. All endpoints need the usual Bearer token.
 - A checklist (`checklist_templates` row, including the shared system templates) can have **at most one schedule per user**: a start date, a time of day (`HH:mm`, the user's local time) and an optional repeat rule. The schedule belongs to the user, so scheduling a system checklist never edits the shared template.
 - A single day can be moved to another time with a **per-day override**.
-- The server pushes an FCM notification at the scheduled time (kind `checklist_due`) unless the checklist was already completed that local day.
+- The server pushes an FCM notification at the scheduled time (kind `checklist_due`) unless that local day is already **done** (see "When is a day done").
 - `GET /checklists/occurrences` is the single source of truth for "what is scheduled when". The reminder job uses the exact same function, so the list and the notification cannot disagree.
 - Repeat vocabulary is the one todos use (`recurrence_type`, `recurrence_interval`, `recurrence_days_of_week`, `recurrence_end_date`).
 - "Local" always means `users.timezone` (default `Asia/Ho_Chi_Minh`).
@@ -45,12 +45,36 @@ Normalisation applied by the server (REST and sync alike):
 - A non-repeating schedule has exactly one occurrence, on `start_date`. A later `recurrence_end_date` does not add occurrences; it only decides when the schedule is removed.
 - **Pause:** a date inside `[paused_from, paused_until]` (both ends inclusive) is not an occurrence. Apply it last, after the rules above; it never shifts the remaining dates.
 
+## When is a day done (`done`)
+
+ONE rule, used by `GET /checklists/occurrences`, the reminder (`checklist_due`: planning, hooks and the re-check right before sending), the removal of finished one-off schedules and the habit auto-tick. The Flutter timeline computes the same thing locally, so keep both in step.
+
+1. **A run counts for the day it STARTED** (`started_at` in the user's local time), not the day it finished. Started 23:30 on the 1st and finished 00:30 on the 2nd = done on the 1st; the 2nd stays open. Only `status = completed` runs count (in-progress, abandoned and deleted runs do not).
+2. **A manual mark** (`checklist_occurrence_mark`, at most one per user + checklist + local day) can override it. A checklist may legitimately be done twice a day, so one finished run does not always settle the day: the user long-presses the checklist in the timeline and picks "Chưa hoàn thành" or "Hoàn thành".
+
+| Mark of that day | The day is done when |
+| --- | --- |
+| none | at least one completed run **started** that day |
+| `done` | always, with no run and no steps needed |
+| `open` | a run that started that day was **completed after the mark's `updated_at`** (the user reset the day by hand and then did the checklist again) |
+
+Reference implementation: `doneDatesOf()` in `src/services/checklist-occurrence-done.ts`.
+
+Consequences worth knowing:
+
+- Marking a day `done` is exactly like completing a run for reminders: that day's `checklist_due` job is cancelled; marking it `open` (or deleting the mark) re-arms them.
+- Marking a day `done` ticks the habits linked to the checklist for **that** day. Marking it `open` does **not** remove a log that was already written (same rule as for runs: logs are history). A completed run ticks the linked habits on its **start** day.
+- A non-repeating schedule is finished (removed, see below) when its day is done, whether by a run or by a `done` mark. After that there is no occurrence left to long-press; the schedule is not recreated by an `open` mark.
+- A repeating schedule is never removed by a mark.
+- A mark belongs to the checklist's day, not to the schedule: deleting or re-creating the schedule keeps the marks; deleting the checklist soft-deletes them.
+- `updated_at` of the mark is the moment of the user's tap and is part of the rule (`open` only holds against runs completed before it), so the app must set it to the real tap time (client clock, same clock that stamps run `completed_at`).
+
 ## Pausing a schedule
 
 For days the user wants to skip without losing the schedule ("pause until the end of the 7th"). While a day is paused the checklist has **no occurrence** that day, so:
 
 - it is not returned by `GET /checklists/occurrences` and must not be on the app's 24h timeline;
-- no `checklist_due` reminder is created or sent, and no `checklist_overdue` nudges either (pending ones are cancelled right away; the server also re-checks right before sending);
+- no `checklist_due` reminder is created or sent, (a pending one is cancelled right away; the server also re-checks right before sending);
 - a time override for a paused day is rejected like any non-occurrence (`400 not_an_occurrence`), and an orphan override is ignored;
 - the schedule comes back **by itself** the day after `paused_until`: no job and no extra write is needed.
 
@@ -71,7 +95,7 @@ A schedule that is "finished" is deleted entirely, as if it had never been set. 
 
 | Finished when | Applies to |
 | --- | --- |
-| The checklist was **completed on the scheduled day** (a run with `status = completed` whose `completed_at` is on `start_date` in the user's local day) | Non-repeating schedules only |
+| The checklist was **done on the scheduled day** (see "When is a day done": a completed run that **started** on `start_date` in the user's local day, or a `done` mark for that day) | Non-repeating schedules only |
 | The **end date has passed**, i.e. from 00:00 of the next local day (end date the 10th -> removed at 00:00 on the 11th) | Every schedule. The end date is `recurrence_end_date`, or `start_date` for a non-repeating schedule without one. A repeating schedule without an end date never expires. |
 
 A repeating schedule is **not** removed by completing the checklist on one of its days: that day just shows `done: true`.
@@ -79,7 +103,7 @@ A repeating schedule is **not** removed by completing the checklist on one of it
 What the server does when a schedule is finished:
 
 - Soft-deletes the schedule **and all its per-day time overrides** (bumping `updated_at`), so the next `GET /sync/changes` carries tombstones (`deleted_at` set) for both.
-- Cancels the pending `checklist_due` reminder and the `checklist_overdue` nudges.
+- Cancels the pending `checklist_due` reminder.
 - `GET /checklists/templates/:id` returns `"schedule": null`, `GET /checklists/templates/:id/schedule` returns `404 not_found`, and `GET /checklists/occurrences` no longer lists that checklist. **This includes its past days**: the timeline is built from the schedule, so a removed schedule leaves no occurrence behind (the runs themselves stay in the history).
 - Checking happens right when a run changes (REST or sync), on every minute's maintenance beat, and before the three read endpoints above answer, so the app never reads a finished schedule even a moment after it finished.
 
@@ -162,6 +186,26 @@ Errors: `404 not_found` (no checklist, not yours, or no schedule), `400 not_an_o
 
 `204`. Idempotent. Restores the schedule's own time for that day.
 
+### `PUT /checklists/templates/:id/occurrences/:date/status`
+
+Marks ONE day by hand (long-press on the timeline). `:date` must be a real occurrence of an enabled schedule.
+
+```json
+{ "status": "done" }
+```
+
+`status` is `"done"` ("Hoàn thành", no steps needed) or `"open"` ("Chưa hoàn thành"). `200`:
+
+```json
+{ "checklistId": "0192f3b1-...", "date": "2026-06-02", "manual": "done", "done": true }
+```
+
+`done` is `status === "done"` here (the mark is the newest event, so nothing can have been completed after it). Errors: `404 not_found` (no checklist, not yours, or no schedule), `400 not_an_occurrence`, `400 bad_input` (status other than `done`/`open`, malformed date).
+
+### `DELETE /checklists/templates/:id/occurrences/:date/status`
+
+`204`. Idempotent. Removes the mark: the day goes back to the automatic rule (done if a run started that day was completed).
+
 ### `GET /checklists/occurrences?from=YYYY-MM-DD&to=YYYY-MM-DD`
 
 Occurrences of every enabled schedule of the user, both ends inclusive, **at most 62 days** (a longer range, `from > to` or a malformed date is `400 bad_input`). Sorted by `date`, then `time`, then `title`.
@@ -176,7 +220,8 @@ Occurrences of every enabled schedule of the user, both ends inclusive, **at mos
       "date": "2026-06-01",
       "time": "07:30",
       "overridden": false,
-      "done": true
+      "done": true,
+      "manual": null
     }
   ]
 }
@@ -184,7 +229,8 @@ Occurrences of every enabled schedule of the user, both ends inclusive, **at mos
 
 - `stepCount`: live steps of the checklist.
 - `overridden`: the time comes from a per-day override.
-- `done`: the user finished (status `completed`) **at least one run of that checklist during that local day**. An abandoned or deleted run does not count; neither does another user's run.
+- `done`: see "When is a day done": a completed run that **started** that local day, or a `done` mark, unless an `open` mark is newer than every such run. An abandoned or deleted run does not count; neither does another user's run.
+- `manual`: the live mark of that day, `"done"` | `"open"`, or `null` when the day is automatic.
 - Deleted checklists, deleted schedules and disabled schedules are not listed. An override left behind for a day the schedule no longer covers is ignored.
 
 ### Errors
@@ -193,14 +239,17 @@ Occurrences of every enabled schedule of the user, both ends inclusive, **at mos
 
 ## Sync Contract
 
-Two new entity types, both per user and soft-deleted like the rest:
+Three entity types, all per user and soft-deleted like the rest:
 
 - `checklist_schedule` -> pull array `checklist_schedules`
 - `checklist_schedule_override` -> pull array `checklist_schedule_overrides`
+- `checklist_occurrence_mark` -> pull array `checklist_occurrence_marks`
 
 `checklist_schedule` fields are the table above plus `user_id` and `deleted_at` (pulled rows carry them like every synced row); `enabled` is a boolean on the wire.
 
 `checklist_schedule_override` fields: `id`, `template_id`, `local_date` (`YYYY-MM-DD`), `time` (`HH:mm`), `created_at`, `updated_at`, `deleted_at`.
+
+`checklist_occurrence_mark` fields: `id`, `template_id`, `local_date` (`YYYY-MM-DD`), `status` (`"done"` | `"open"`), `created_at`, `updated_at`, `deleted_at` (plus `user_id` on pull). Removing a mark is an op `delete`.
 
 Push example:
 
@@ -243,22 +292,25 @@ Push example:
 Rules:
 
 - Validation is the REST validation. A bad payload returns that operation's `status: "error", error: "bad_input"`; nothing is written.
-- Natural keys are merged in place: one schedule per `(user, template_id)` and one override per `(user, template_id, local_date)`. If the server already has a row for the key under a different `id`, the push updates **that** row (no `conflict` status). Pull afterwards and keep the server's `id`.
+- Natural keys are merged in place: one schedule per `(user, template_id)`, one override and one mark per `(user, template_id, local_date)`. If the server already has a row for the key under a different `id`, the push updates **that** row (no `conflict` status). Pull afterwards and keep the server's `id`.
 - Last-Write-Wins on `updated_at`: an older push is ignored. Deleting is an op `delete` with `{ id, updated_at, deleted_at }` and is idempotent.
-- Deleting a schedule soft-deletes its overrides; deleting a checklist (REST or sync) soft-deletes its schedule and overrides. The tombstones arrive in the next pull with `since`.
+- Deleting a schedule soft-deletes its overrides (not its marks); deleting a checklist (REST or sync) soft-deletes its schedule, overrides and marks. The tombstones arrive in the next pull with `since`.
 - A schedule or override for a checklist the user cannot see (someone else's, or deleted) is acknowledged but not written, as `checklist_template_order` does. Push the checklist before its schedule in the same batch.
+- A mark for a checklist the user cannot see is acknowledged but not written, like the other two. `status` must be `done` or `open` and `local_date` a real date, otherwise `bad_input`.
+- Marks are not validated against the schedule (the app may push a mark and its schedule in one batch in any order). After pulling, resolve two local marks for the same `(template_id, local_date)` by keeping the one the server returned.
+- A pushed `done` mark also ticks the linked habits for that day on the server.
 - Every accepted change cancels and recreates the affected reminder jobs on the server.
 
 ## Push Notification `checklist_due`
 
-- Sent to **all** devices of the user at the occurrence time (the override time if any), unless the checklist was already completed that local day, the schedule was disabled/deleted/moved, or the checklist was deleted. The server re-checks all of this right before sending.
+- Sent to **all** devices of the user at the occurrence time (the override time if any), unless that local day is already done (completed run started that day, or a `done` mark), the schedule was disabled/deleted/moved, or the checklist was deleted. The server re-checks all of this right before sending.
 - A reminder that would be sent more than 30 minutes late is dropped, never sent. FCM `ttl` 1 hour, priority `high`.
 - Android channel id: `checklist_reminders` (the app must create it; the "still running" nudges below use it too).
 - `notification.title`: the checklist title (newlines removed, whitespace collapsed, at most 60 characters including a trailing `…`).
 - `notification.body`: `Đến giờ thực hiện · {n} bước`, or only `Đến giờ thực hiện` when the checklist has no steps.
 - `data` (all strings): `{ "type": "checklist_due", "id": "<checklist id>", "date": "YYYY-MM-DD" }`. Open the checklist `id` and start a run.
 
-If the checklist is still not done 2 hours after its time, the server keeps nudging every 2 hours until the end of the day: see `MOBILE_NOTIFICATION_REMINDERS_CONTRACT.md`.
+A checklist is reminded **once**, at its time. There is no repeated "overdue" nudge: the old `checklist_overdue` (every 2 hours after the time while not done) was removed, so being late or leaving it undone never triggers another push. A repeating schedule still reminds once on each of its days; a non-repeating one reminds exactly once. (A run the user has started and left unfinished is a different case and is still nudged, see `checklist_running` below.)
 
 ## Push Notification `checklist_running` (a started checklist that is not finished)
 
@@ -301,4 +353,6 @@ Other copy changed in the same release:
 - `npm test` passes, including `tests/checklist-schedule.test.ts` (pure expansion), `tests/checklist-due.test.ts` (planner, hooks, send, re-validation), `tests/checklist-schedule-api.test.ts` (REST and sync) and `tests/checklist-schedule-expiry.test.ts` (finished schedules are removed).
 - Migration `0017_checklist_schedules.sql` creates `checklist_schedules`, `checklist_schedule_overrides` and rebuilds `notification_jobs` so its `kind` CHECK accepts `checklist_due`. Apply it with `npm run db:migrate` **before** deploying the code, because the new code inserts the new kind.
 - Manual send: `npm run notify:job-test -- <userId> checklist_due` (then `--cleanup`).
+- Day marks and start-day rule: migration `0023_checklist_occurrence_marks.sql` creates `checklist_occurrence_marks` and indexes `checklist_runs` by `started_at` (dropping the unused `completed_at` index). Apply it with `npm run db:migrate` **before** deploying the code: the sync pull selects the new table, so an unmigrated database fails every pull. Covered by `tests/checklist-occurrence-marks.test.ts` (rule, REST, sync, reminders, habits) and `tests/migration-0023.test.ts`.
+- Removed overdue nudge: migration `0024_cancel_checklist_overdue.sql` cancels the pending `checklist_overdue` jobs (history is kept and the kind stays allowed in the table). It is a data cleanup only: even if it has not run yet, the server cancels any leftover `checklist_overdue` job when it comes due instead of sending it. Tests: `tests/overdue-nudges.test.ts` (checklist section), `tests/checklist-due.test.ts`, `tests/migration-0024.test.ts`.
 - Pause: migration `0021_checklist_schedule_pause.sql` adds the two nullable columns `paused_from` / `paused_until` (existing rows = not paused). Apply it with `npm run db:migrate` **before** deploying the code, because the code selects and writes them. Covered by the `pause` tests in `tests/checklist-schedule.test.ts` (expansion), `tests/checklist-schedule-api.test.ts` (REST, sync, jobs) and `tests/checklist-due.test.ts` (planner, overdue nudges, re-validation before sending).

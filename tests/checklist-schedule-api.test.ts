@@ -358,10 +358,10 @@ test("occurrences are returned in the documented shape, sorted by date, time the
   assert.equal(res.status, 200);
   assert.deepEqual(res.body, {
     items: [
-      { checklistId: B, title: "Đi ngủ", stepCount: 2, date: "2099-06-01", time: "07:00", overridden: false, done: false },
-      { checklistId: A, title: "Rời nhà", stepCount: 3, date: "2099-06-01", time: "08:00", overridden: false, done: false },
-      { checklistId: B, title: "Đi ngủ", stepCount: 2, date: "2099-06-02", time: "07:00", overridden: false, done: false },
-      { checklistId: A, title: "Rời nhà", stepCount: 3, date: "2099-06-02", time: "08:00", overridden: false, done: false },
+      { checklistId: B, title: "Đi ngủ", stepCount: 2, date: "2099-06-01", time: "07:00", overridden: false, done: false, manual: null },
+      { checklistId: A, title: "Rời nhà", stepCount: 3, date: "2099-06-01", time: "08:00", overridden: false, done: false, manual: null },
+      { checklistId: B, title: "Đi ngủ", stepCount: 2, date: "2099-06-02", time: "07:00", overridden: false, done: false, manual: null },
+      { checklistId: A, title: "Rời nhà", stepCount: 3, date: "2099-06-02", time: "08:00", overridden: false, done: false, manual: null },
     ],
   });
 });
