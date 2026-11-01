@@ -8,6 +8,7 @@ import {
   OCCURRENCE_KINDS,
   OVERDUE,
   SLOT_KINDS,
+  TODO_CARD_KINDS,
   type DigestKind,
   type EventKind,
   type NotificationJobKind,
@@ -412,95 +413,85 @@ export const cancelOccurrenceJobsExcept = async (
 
 // ── Job theo mốc (todo_overdue, checklist_running): một dòng cho mỗi mốc ────
 
-/**
- * Tạo hoặc sửa job của MỘT mốc nhắc lặp: duy nhất theo (user, kind, ref_id, run_at).
- * Quy tắc giữ trạng thái giống `upsertEventJob`: mốc đã sent/failed/missed/processing giữ
- * nguyên (sửa tên todo không làm nhắc lại), mốc đã bị hủy mà nay hợp lệ lại thì đặt về pending.
- */
-export const upsertSlotJob = async (input: {
+type SlotSchedule = {
   userId: string;
   kind: SlotKind;
   refId: string;
   localDate: string;
-  runAt: string;
-}): Promise<void> => {
-  const keep = KEEP_STATE_SQL;
-  await turso.execute({
-    sql: `INSERT INTO notification_jobs
-          (id, user_id, kind, ref_id, target_device_id, local_date, run_at,
-           status, attempts, created_at)
-          VALUES (?, ?, ?, ?, NULL, ?, ?, 'pending', 0, ?)
-          ON CONFLICT(user_id, kind, ref_id, run_at) WHERE kind IN (${SLOT_KIND_SQL})
-          DO UPDATE SET
-            status = CASE WHEN ${keep} THEN notification_jobs.status ELSE 'pending' END,
-            attempts = CASE WHEN ${keep} THEN notification_jobs.attempts ELSE 0 END,
-            locked_at = CASE WHEN ${keep} THEN notification_jobs.locked_at ELSE NULL END,
-            sent_at = CASE WHEN ${keep} THEN notification_jobs.sent_at ELSE NULL END,
-            local_date = excluded.local_date`,
-    args: [
-      newId(),
-      input.userId,
-      input.kind,
-      input.refId,
-      input.localDate,
-      input.runAt,
-      nowISO(),
-    ],
-  });
 };
 
-/**
- * Chỉ thêm khi chưa có dòng cho mốc này (planner và bước vá todo cũ). Trả true nếu thật sự tạo.
- * `missed` dùng làm dấu "đã xét, không còn mốc nào để nhắc" để lần quét sau bỏ qua.
- */
-export const insertSlotJobIfAbsent = async (input: {
-  userId: string;
-  kind: SlotKind;
-  refId: string;
-  localDate: string;
-  runAt: string;
-  status: "pending" | "missed";
-}): Promise<boolean> => {
-  const res = await turso.execute({
+const upsertSlot = `DO UPDATE SET
+  status = CASE WHEN ${KEEP_STATE_SQL} THEN notification_jobs.status ELSE 'pending' END,
+  attempts = CASE WHEN ${KEEP_STATE_SQL} THEN notification_jobs.attempts ELSE 0 END,
+  locked_at = CASE WHEN ${KEEP_STATE_SQL} THEN notification_jobs.locked_at ELSE NULL END,
+  sent_at = CASE WHEN ${KEEP_STATE_SQL} THEN notification_jobs.sent_at ELSE NULL END,
+  local_date = excluded.local_date`;
+
+// Callers supply at most one local day's slots for a single todo or run.
+const slotInsert = (
+  schedule: SlotSchedule,
+  runAts: readonly string[],
+  status: "pending" | "missed",
+  onConflict: "ignore" | "update"
+) => {
+  const createdAt = nowISO();
+  return {
     sql: `INSERT INTO notification_jobs
-          (id, user_id, kind, ref_id, target_device_id, local_date, run_at,
-           status, attempts, created_at)
-          VALUES (?, ?, ?, ?, NULL, ?, ?, ?, 0, ?)
+          (id, user_id, kind, ref_id, local_date, run_at, status, attempts, created_at)
+          VALUES ${runAts.map(() => "(?, ?, ?, ?, ?, ?, ?, 0, ?)").join(", ")}
           ON CONFLICT(user_id, kind, ref_id, run_at) WHERE kind IN (${SLOT_KIND_SQL})
-          DO NOTHING`,
-    args: [
-      newId(),
-      input.userId,
-      input.kind,
-      input.refId,
-      input.localDate,
-      input.runAt,
-      input.status,
-      nowISO(),
-    ],
-  });
-  return res.rowsAffected > 0;
+          ${onConflict === "update" ? upsertSlot : "DO NOTHING"}`,
+    args: runAts.flatMap((at) => [
+      newId(), schedule.userId, schedule.kind, schedule.refId, schedule.localDate, at, status, createdAt,
+    ]),
+  };
 };
 
-/**
- * Hủy job pending/processing của một todo/checklist TRỪ các mốc còn hợp lệ (`keepRunAts`).
- * Giống `cancelOccurrenceJobsExcept`: không có khoảng hở hủy-rồi-tạo mà vòng nhanh lọt vào.
- */
+export const upsertSlotJob = async (input: SlotSchedule & { runAt: string }): Promise<void> => {
+  await turso.execute(slotInsert(input, [input.runAt], "pending", "update"));
+};
+
+// Backfill must leave any existing job (including terminal jobs) untouched.
+export const insertSlotJobsIfAbsent = async (
+  schedule: SlotSchedule,
+  runAts: readonly string[],
+  status: "pending" | "missed"
+): Promise<number> => {
+  if (runAts.length === 0) return 0;
+  const res = await turso.execute(slotInsert(schedule, runAts, status, "ignore"));
+  return res.rowsAffected;
+};
+
+const cancelSlotStatement = (
+  userId: string,
+  kind: SlotKind,
+  refId: string,
+  keepRunAts: readonly string[]
+) => ({
+  sql: `UPDATE notification_jobs SET status = 'cancelled'
+        WHERE user_id = ? AND kind = ? AND ref_id = ?
+          AND status IN ('pending', 'processing')
+          ${keepRunAts.length ? `AND run_at NOT IN (${placeholders(keepRunAts.length)})` : ""}`,
+  args: [userId, kind, refId, ...keepRunAts],
+});
+
 export const cancelSlotJobsExcept = async (
   userId: string,
   kind: SlotKind,
   refId: string,
   keepRunAts: readonly string[]
 ): Promise<number> => {
-  const keep =
-    keepRunAts.length > 0 ? `AND run_at NOT IN (${placeholders(keepRunAts.length)})` : "";
-  const res = await turso.execute({
-    sql: `UPDATE notification_jobs SET status = 'cancelled'
-          WHERE user_id = ? AND kind = ? AND ref_id = ?
-            AND status IN ('pending', 'processing') ${keep}`,
-    args: [userId, kind, refId, ...keepRunAts],
-  });
+  const res = await turso.execute(cancelSlotStatement(userId, kind, refId, keepRunAts));
   return res.rowsAffected;
+};
+
+export const reconcileSlotJobs = async (schedule: SlotSchedule, runAts: readonly string[]) => {
+  const cancel = cancelSlotStatement(schedule.userId, schedule.kind, schedule.refId, runAts);
+  if (runAts.length === 0) {
+    await turso.execute(cancel);
+    return;
+  }
+  await turso.batch([cancel, slotInsert(schedule, runAts, "pending", "update")], "write");
 };
 
 /** Khóa (user|ref_id|run_at) của mọi mốc đã có dòng trong các ngày địa phương `dates`. */
@@ -544,6 +535,48 @@ export const cancelEventJobs = async (
     cancelled += res.rowsAffected;
   }
   return cancelled;
+};
+
+// ── Thông báo đã gửi còn nằm trên máy ───────────────────────────────────────
+
+const TODO_CARD_KIND_SQL = sqlList(TODO_CARD_KINDS);
+
+/**
+ * Xóa `card_key` của các dòng nhắc giờ / nhắc lặp của một todo mà khóa KHÁC khóa lịch hiện tại
+ * (`currentKey`; chuỗi rỗng nếu todo không còn nhắc theo giờ). Mỗi dòng bị xóa là một thông báo đã gửi
+ * theo lịch cũ có thể còn nằm trên máy. Trả số dòng bị xóa; 0 = không có gì cần gỡ.
+ *
+ * Làm trong MỘT câu lệnh nên hai lần gọi đồng thời chỉ một bên thấy kết quả > 0 (không gửi tin gỡ hai lần).
+ */
+export const clearStaleCardKeys = async (
+  userId: string,
+  refId: string,
+  currentKey: string
+): Promise<number> => {
+  const res = await turso.execute({
+    sql: `UPDATE notification_jobs SET card_key = NULL
+          WHERE user_id = ? AND ref_id = ? AND kind IN (${TODO_CARD_KIND_SQL})
+            AND card_key IS NOT NULL AND card_key <> ?`,
+    args: [userId, refId, currentKey],
+  });
+  return res.rowsAffected;
+};
+
+/** Todo có nhắc giờ / nhắc lặp đang chờ gửi mà đến hạn trong khoảng [fromIso, toIso] không? */
+export const hasCardJobDueBetween = async (
+  userId: string,
+  refId: string,
+  fromIso: string,
+  toIso: string
+): Promise<boolean> => {
+  const res = await turso.execute({
+    sql: `SELECT 1 FROM notification_jobs
+          WHERE user_id = ? AND ref_id = ? AND kind IN (${TODO_CARD_KIND_SQL})
+            AND status IN ('pending', 'processing') AND run_at >= ? AND run_at <= ?
+          LIMIT 1`,
+    args: [userId, refId, fromIso, toIso],
+  });
+  return res.rows.length > 0;
 };
 
 // ── Vòng đời khi xử lý ───────────────────────────────────────────────────────
@@ -615,15 +648,21 @@ export const claimJob = async (
 // Các hàm kết thúc chỉ tác động khi job vẫn là `processing` với đúng run_at đã giành:
 // nếu giữa chừng run_at bị đổi (người dùng sửa giờ), kết quả cũ không được ghi đè.
 
+/**
+ * `cardKey` = khóa lịch (ngày + giờ hẹn) của todo lúc gửi, để sau này biết thông báo đang nằm trên máy
+ * còn đúng không (xem `clearStaleCardKeys`). Không truyền thì giữ nguyên giá trị cũ của cột.
+ */
 export const markSent = async (
   id: string,
   runAt: string,
-  sentAtIso: string
+  sentAtIso: string,
+  cardKey: string | null = null
 ): Promise<boolean> => {
   const res = await turso.execute({
-    sql: `UPDATE notification_jobs SET status = 'sent', sent_at = ?
+    sql: `UPDATE notification_jobs
+          SET status = 'sent', sent_at = ?, card_key = COALESCE(?, card_key)
           WHERE id = ? AND status = 'processing' AND run_at = ?`,
-    args: [sentAtIso, id, runAt],
+    args: [sentAtIso, cardKey, id, runAt],
   });
   return res.rowsAffected > 0;
 };

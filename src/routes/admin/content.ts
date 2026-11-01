@@ -13,10 +13,7 @@ export default async function contentRoutes(app: FastifyInstance) {
       setFlash(reply, "error", "Không tìm thấy user.");
       return reply.redirect("/admin/users");
     }
-    const [todos, notes] = await Promise.all([
-      content.listTodosByUser(user.id),
-      content.listNotesByUser(user.id),
-    ]);
+    const { todos, notes } = await content.getUserContent(user.id);
     return reply.view(
       "admin/content/user.ejs",
       {

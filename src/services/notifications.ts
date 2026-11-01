@@ -1,6 +1,9 @@
+import { DISMISS, DISMISS_DATA_TYPE } from "../config/notification-policy.js";
+import { env } from "../config/env.js";
 import * as notificationsRepo from "../repositories/notifications.js";
 import {
   pushLogger,
+  sendFirebaseData,
   sendFirebasePush,
   type PushMessage,
   type PushResult,
@@ -75,6 +78,7 @@ const sendToUser = async (input: {
   data?: Record<string, string>;
   targetDeviceId?: string | null;
   channelId?: string;
+  tag?: string;
   ttlMs?: number;
 }): Promise<PushResult & { deviceCount: number }> => {
   const allDevices = await notificationsRepo.listDevicesByUser(input.userId);
@@ -100,8 +104,11 @@ const sendToUser = async (input: {
     })),
     title: input.title,
     body: input.body,
-    data: input.data,
+    // The tag also travels in `data` so the app can give its own foreground notification the same
+    // tag (FCM only shows a notification by itself while the app is in the background).
+    data: input.tag ? { ...input.data, tag: input.tag } : input.data,
     channelId: input.channelId,
+    tag: input.tag,
     ttlMs: input.ttlMs,
   });
 
@@ -125,6 +132,11 @@ export type NotifyOptions = {
   targetDeviceId?: string | null;
   /** Android notification channel (defaults to the app's general channel). */
   channelId?: string;
+  /**
+   * Replace-in-tray key: a notification with the same tag already shown on the device is replaced
+   * instead of stacked. Also added to `data.tag` (overriding any `data.tag` the caller passed).
+   */
+  tag?: string;
   /** FCM lifespan in milliseconds. */
   ttlMs?: number;
 };
@@ -170,6 +182,79 @@ export const notifyUser = async (
         errorMessage: error instanceof Error ? error.message : String(error),
       },
       "notifyUser failed"
+    );
+    return {
+      devices: 0,
+      sent: 0,
+      failed: 0,
+      removed: 0,
+      error: error instanceof Error ? error.message : "unknown",
+    };
+  }
+};
+
+export type DismissInput = {
+  /** Tag of the notification(s) to remove from the tray (the same `tag` they were sent with). */
+  tag: string;
+  /** What the notification was about (todo id): context for the app, not used to find the card. */
+  id: string;
+};
+
+/**
+ * Ask every device of `userId` to remove the notification carrying `input.tag` from its tray.
+ *
+ * The server cannot delete a notification that is already on a phone, so this sends a DATA-ONLY
+ * message (`type: "dismiss"`); the app's background handler cancels the notification by tag.
+ * `before` is the moment of the decision: an app that can read when a notification was posted should
+ * only remove the ones posted before it. The message is short-lived (`DISMISS.ttlMs`) so a late
+ * delivery cannot remove a newer notification that reuses the tag.
+ *
+ * Never throws (best effort). With `NOTIFY_DRY_RUN` it only logs, like the tick.
+ */
+export const dismissNotification = async (
+  userId: string,
+  input: DismissInput,
+  now: Date = new Date()
+): Promise<NotifyUserResult> => {
+  try {
+    const devices = await notificationsRepo.listDevicesByUser(userId);
+    if (devices.length === 0) return { devices: 0, sent: 0, failed: 0, removed: 0 };
+    if (env.NOTIFY_DRY_RUN) {
+      pushLogger.info({ devices: devices.length }, "dismiss push skipped (NOTIFY_DRY_RUN)");
+      return { devices: devices.length, sent: 0, failed: 0, removed: 0 };
+    }
+
+    const result = await sendFirebaseData({
+      devices: devices.map((device) => ({
+        id: device.id,
+        registrationId: device.registration_id,
+        kind: device.kind,
+      })),
+      data: {
+        type: DISMISS_DATA_TYPE,
+        id: input.id,
+        tag: input.tag,
+        before: now.toISOString(),
+      },
+      ttlMs: DISMISS.ttlMs,
+    });
+    if (result.invalidDeviceIds.length > 0) {
+      await notificationsRepo.deleteDevicesByIds(result.invalidDeviceIds);
+    }
+    return {
+      devices: devices.length,
+      sent: result.successCount,
+      failed: result.failureCount,
+      removed: result.invalidDeviceIds.length,
+    };
+  } catch (error) {
+    pushLogger.error(
+      {
+        userId,
+        errorName: error instanceof Error ? error.name : "unknown",
+        errorMessage: error instanceof Error ? error.message : String(error),
+      },
+      "dismissNotification failed"
     );
     return {
       devices: 0,

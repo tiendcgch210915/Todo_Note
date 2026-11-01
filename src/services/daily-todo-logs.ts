@@ -2,11 +2,7 @@ import * as dailyRepo from "../repositories/daily-todo-logs.js";
 import * as dashRepo from "../repositories/dashboard.js";
 import { addDays, daysInRange, nowISO } from "../utils/time.js";
 import { getVietnamNowParts } from "../utils/vietnam-time.js";
-import {
-  computeScore,
-  isCompletedForScore,
-  type ScorableTodo,
-} from "./dashboard-scoring.js";
+import { computeScore, isCompletedForScore } from "./dashboard-scoring.js";
 import type { TodoRow } from "../repositories/todos.js";
 
 export type DailyTodoLog = dailyRepo.DailyTodoLogRow;
@@ -29,31 +25,30 @@ const toLogStatus = (
   return "open";
 };
 
-const toScorable = (
-  todo: dailyRepo.DailyTodoSnapshotRow
-): ScorableTodo => ({
-  status: todo.status,
-  completed_at: todo.completed_at,
-  is_important: todo.is_important,
-  is_urgent: todo.is_urgent,
-  is_frog: todo.is_frog,
-  frog_date: todo.frog_date,
-});
-
 export const closeUserTodoDay = async (
   userId: string,
   date: string,
   closedAt = nowISO()
 ): Promise<DailyTodoSummary> => {
   const existing = await dailyRepo.getDailyTodoSummary(userId, date);
-  if (existing) return existing;
+  return existing ?? createDailySnapshot(userId, date, closedAt);
+};
 
+const createDailySnapshot = async (
+  userId: string,
+  date: string,
+  closedAt: string
+): Promise<DailyTodoSummary> => {
   const [snapshots, habits] = await Promise.all([
     dailyRepo.listTodoSnapshotsForDailyClose(userId, date),
     dashRepo.countDayHabits(userId, date),
   ]);
+  const subtaskTrees = await dashRepo.listSubtaskTrees(
+    userId,
+    snapshots.map((todo) => todo.id)
+  );
   const logs = snapshots.map((todo) => {
-    const completed = isCompletedForScore(toScorable(todo), date);
+    const completed = isCompletedForScore(todo, date);
     return {
       user_id: userId,
       log_date: date,
@@ -79,19 +74,12 @@ export const closeUserTodoDay = async (
   });
   const doneTodos = logs.filter((log) => log.completed === 1).length;
   const score = computeScore(
-    logs.map((log) => ({
-      status: log.status,
-      completed_at: log.completed_at,
-      is_important: log.is_important,
-      is_urgent: log.is_urgent,
-      is_frog: log.is_frog,
-      frog_date: log.frog_date,
-    })),
+    logs.map((log) => ({ ...log, subtasks: subtaskTrees.get(log.todo_id) ?? [] })),
     date,
     habits
   );
 
-  await dailyRepo.insertDailyTodoClose({
+  return dailyRepo.insertDailyTodoClose({
     userId,
     date,
     logs,
@@ -100,19 +88,6 @@ export const closeUserTodoDay = async (
     score,
     closedAt,
   });
-
-  return (
-    (await dailyRepo.getDailyTodoSummary(userId, date)) ?? {
-      user_id: userId,
-      log_date: date,
-      total_todos: logs.length,
-      done_todos: doneTodos,
-      score,
-      closed_at: closedAt,
-      created_at: closedAt,
-      updated_at: closedAt,
-    }
-  );
 };
 
 export const ensureUserTodoDayClosed = async (
@@ -124,18 +99,28 @@ export const ensureUserTodoDayClosed = async (
   return closeUserTodoDay(userId, date);
 };
 
-export const ensureUserTodoDaysClosed = async (
+export const getClosedTodoSummaries = async (
   userId: string,
   from: string,
   to: string,
   now: Date = new Date()
-): Promise<void> => {
+): Promise<DailyTodoSummary[]> => {
   const today = vietnamToday(now);
   const closeTo = to < today ? to : addDays(today, -1);
-  if (from > closeTo) return;
-  for (const date of daysInRange(from, closeTo)) {
-    await closeUserTodoDay(userId, date);
+  if (from > closeTo) return [];
+  const summaries = await dailyRepo.listDailyTodoSummariesInRange(userId, from, closeTo);
+  const existing = new Set(summaries.map((summary) => summary.log_date));
+  const missing = daysInRange(from, closeTo).filter((date) => !existing.has(date));
+  if (missing.length > 1) {
+    for (const summary of await dailyRepo.closeEmptyTodoDays(userId, missing, nowISO())) {
+      summaries.push(summary);
+      existing.add(summary.log_date);
+    }
   }
+  for (const date of missing) {
+    if (!existing.has(date)) summaries.push(await createDailySnapshot(userId, date, nowISO()));
+  }
+  return summaries;
 };
 
 export const ensurePastTodoDayClosedForMutation = async (
@@ -147,10 +132,25 @@ export const ensurePastTodoDayClosedForMutation = async (
   await closeUserTodoDay(userId, date);
 };
 
+// A subtask counts toward the day of the top-level todo it hangs under, whatever its own
+// scheduled_date says, so a subtask mutation must freeze that day's score as well.
+export const ensureTodoDayClosedForMutation = async (
+  userId: string,
+  todo: {
+    scheduled_date: string | null | undefined;
+    parent_id: string | null | undefined;
+  },
+  now: Date = new Date()
+): Promise<void> => {
+  await ensurePastTodoDayClosedForMutation(userId, todo.scheduled_date, now);
+  if (!todo.parent_id) return;
+  const rootDate = await dailyRepo.getRootScheduledDate(userId, todo.parent_id);
+  await ensurePastTodoDayClosedForMutation(userId, rootDate, now);
+};
+
 export const listDailyTodoLogs = dailyRepo.listDailyTodoLogs;
 export const getDailyTodoSummary = dailyRepo.getDailyTodoSummary;
-export const listDailyTodoSummariesInRange =
-  dailyRepo.listDailyTodoSummariesInRange;
+export const countTimedLogsInRange = dailyRepo.countTimedLogsInRange;
 
 export const closeAllUsersWithTodosForDate = async (
   date: string

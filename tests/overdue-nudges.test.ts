@@ -471,9 +471,9 @@ const armTodo = async (overrides: Partial<Parameters<typeof fx.insertTodo>[1]> =
 
 const dispatchAt = (date: string, hhmm: string, seconds = 10) =>
   runDispatch({ now: at(date, hhmm, seconds), logger: fx.silentLogger });
-const overdueMessages = () => fake.messages.filter((m) => /Quá giờ/.test(m.notification?.body ?? ""));
+const overdueMessages = () => fake.messages.filter((m) => /^⏰ Trễ /.test(m.notification?.body ?? ""));
 
-test("the 12:00 nudge reaches every device with the todo title, the missed time and what to do", async () => {
+test("the 12:00 nudge reaches every device with the todo title, how late it is and what to do", async () => {
   await armTodo();
 
   await dispatchAt(TODAY, "12:00");
@@ -483,12 +483,61 @@ test("the 12:00 nudge reaches every device with the todo title, the missed time 
   assert.equal(messages.length, 2);
   const [message] = messages;
   assert.equal(message.notification?.title, "Nộp báo cáo");
-  assert.equal(message.notification?.body, "⏰ Quá giờ 10:00 · Làm ngay hoặc dời lịch!");
-  assert.deepEqual(message.data, { type: "todo", id: "t1", date: TODAY });
+  assert.equal(message.notification?.body, "⏰ Trễ 2 giờ (hẹn 10:00) · Làm ngay hoặc dời lịch!");
+  assert.deepEqual(message.data, { type: "todo", id: "t1", date: TODAY, tag: "todo:t1" });
   assert.equal(message.android?.priority, "high");
   assert.equal(message.android?.ttl, 3_600_000);
   assert.equal(message.android?.notification?.channelId, "todo_reminders");
+  assert.equal(message.android?.notification?.tag, "todo:t1");
   for (const value of Object.values(message.data ?? {})) assert.equal(typeof value, "string");
+});
+
+test("every nudge of one todo shares its tag, so the tray keeps a single card that reports the growing delay", async () => {
+  await armTodo();
+
+  for (const hhmm of EVEN_SLOTS) await dispatchAt(TODAY, hhmm);
+
+  const targets = fake.targets();
+  const forDeviceA = fake.messages.filter(
+    (m, i) => targets[i] === "reg-A" && /^⏰ Trễ /.test(m.notification?.body ?? "")
+  );
+  assert.deepEqual(
+    forDeviceA.map((m) => m.notification?.body?.split(" (")[0]),
+    ["⏰ Trễ 2 giờ", "⏰ Trễ 4 giờ", "⏰ Trễ 6 giờ", "⏰ Trễ 8 giờ", "⏰ Trễ 10 giờ", "⏰ Trễ 12 giờ"]
+  );
+  assert.deepEqual([...new Set(overdueMessages().map((m) => m.android?.notification?.tag))], ["todo:t1"]);
+});
+
+test("the on-time reminder and the later nudges are one card: 10:00, then 12:00 replaces it", async () => {
+  await armTodo();
+
+  await dispatchAt(TODAY, "10:00");
+  await dispatchAt(TODAY, "12:00");
+
+  const targets = fake.targets();
+  const forDeviceA = fake.messages.filter((_, i) => targets[i] === "reg-A");
+  assert.equal(forDeviceA.length, 2);
+  assert.equal(forDeviceA[0].notification?.body, "Khẩn cấp → Xử lý nhanh rồi chuyển việc.");
+  assert.match(forDeviceA[1].notification?.body ?? "", /^⏰ Trễ 2 giờ \(hẹn 10:00\)/);
+  assert.deepEqual(
+    forDeviceA.map((m) => m.android?.notification?.tag),
+    ["todo:t1", "todo:t1"],
+    "same tag: Android drops the 10:00 notification when the 12:00 one arrives"
+  );
+});
+
+test("different todos get different tags, so one task never replaces another", async () => {
+  await fx.insertDevice(turso, USER_ID, "reg-A", { id: "device-A" });
+  await fx.insertTodo(turso, { id: "t1", title: "Một", scheduledDate: TODAY, time: "10:00", isImportant: 0, isUrgent: 1 });
+  await fx.insertTodo(turso, { id: "t2", title: "Hai", scheduledDate: TODAY, time: "10:00", isImportant: 0, isUrgent: 1 });
+  await maintenance(at(TODAY, "09:00"));
+
+  await dispatchAt(TODAY, "12:00");
+
+  assert.deepEqual(
+    overdueMessages().map((m) => m.android?.notification?.tag).sort(),
+    ["todo:t1", "todo:t2"]
+  );
 });
 
 test("it repeats every 2 hours until the end of the day, one push per slot", async () => {
@@ -601,7 +650,7 @@ test("a running timer only skips the slot it overlaps; a later slot is judged on
 test("an unclassified todo still gets the same short message", async () => {
   await armTodo({ isImportant: null, isUrgent: null });
   await dispatchAt(TODAY, "12:00");
-  assert.equal(overdueMessages()[0].notification?.body, "⏰ Quá giờ 10:00 · Làm ngay hoặc dời lịch!");
+  assert.equal(overdueMessages()[0].notification?.body, "⏰ Trễ 2 giờ (hẹn 10:00) · Làm ngay hoặc dời lịch!");
 });
 
 test("a long multi-line title is normalised like the other pushes", async () => {
@@ -676,7 +725,7 @@ test("the reminder is sent once at its time and nothing follows during the rest 
   const messages = checklistMessages();
   assert.equal(messages.length, 2, "one message per device, all of them the on-time reminder");
   assert.ok(messages.every((m) => m.data?.type === "checklist_due" && m.data?.date === TODAY));
-  assert.ok(messages.every((m) => !/Quá giờ/.test(m.notification?.body ?? "")));
+  assert.ok(messages.every((m) => !/Trễ/.test(m.notification?.body ?? "")));
   assert.equal(overdueMessages().length, 0);
 });
 
@@ -844,7 +893,9 @@ test("an important and urgent todo is pushed every hour, one push per slot", asy
   for (const hhmm of HOURLY) await dispatchAt(TODAY, hhmm);
 
   assert.equal(overdueMessages().length, 13);
-  assert.equal(overdueMessages()[0].notification?.body, "⏰ Quá giờ 10:00 · Làm ngay hoặc dời lịch!");
+  assert.equal(overdueMessages()[0].notification?.body, "⏰ Trễ 1 giờ (hẹn 10:00) · Làm ngay hoặc dời lịch!");
+  assert.equal(overdueMessages()[12].notification?.body, "⏰ Trễ 13 giờ (hẹn 10:00) · Làm ngay hoặc dời lịch!");
+  assert.deepEqual([...new Set(overdueMessages().map((m) => m.android?.notification?.tag))], ["todo:t1"]);
 });
 
 test("a leftover odd-hour slot is dropped when the todo has since become urgent-only (2h)", async () => {

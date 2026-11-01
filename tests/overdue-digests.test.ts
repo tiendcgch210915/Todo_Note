@@ -158,10 +158,11 @@ test("17:00 counts only today's important-but-not-urgent todos whose time has al
   const [message] = messages;
   assert.equal(message.notification?.title, "⏰ 3 todo quan trọng quá hạn");
   assert.equal(message.notification?.body, "Làm ngay hoặc dời lịch!");
-  assert.deepEqual(message.data, { type: "digest_todos", id: TODAY, date: TODAY });
+  assert.deepEqual(message.data, { type: "digest_todos", id: TODAY, date: TODAY, tag: "digest:overdue" });
   assert.equal(message.android?.priority, "high");
   assert.equal(message.android?.ttl, 3_600_000);
   assert.equal(message.android?.notification?.channelId, "todo_reminders");
+  assert.equal(message.android?.notification?.tag, "digest:overdue");
   assert.equal((await digestRows("digest_overdue_evening"))[0].status, "sent");
 });
 
@@ -224,7 +225,7 @@ test("07:00 counts yesterday's important-but-not-urgent todos that are still not
   const [message] = overdueMessages();
   assert.equal(message.notification?.title, "⏰ 3 todo quan trọng hôm qua chưa xong");
   assert.equal(message.notification?.body, "Làm ngay hoặc dời lịch!");
-  assert.deepEqual(message.data, { type: "digest_todos", id: NEXT, date: NEXT });
+  assert.deepEqual(message.data, { type: "digest_todos", id: NEXT, date: NEXT, tag: "digest:overdue" });
   assert.equal((await digestRows("digest_overdue_morning")).find((r) => r.local_date === NEXT)?.status, "sent");
 });
 

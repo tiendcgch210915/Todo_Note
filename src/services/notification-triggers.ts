@@ -23,6 +23,7 @@ import {
   reconcileChecklistDue,
 } from "./checklist-due.js";
 import { finishSchedulesForUserSafely } from "./checklist-schedule-expiry.js";
+import { dismissStaleTodoCard } from "./notification-cards.js";
 import { recomputePendingDigests, planUser } from "./notification-planner.js";
 import { resolveSettings } from "./notification-schedule.js";
 import { reconcileAllTodoOverdue, reconcileTodoOverdue } from "./overdue-nudges.js";
@@ -63,57 +64,74 @@ const clearTodoArtifacts = async (
   }
 };
 
+/** Tạo/sửa/hủy job nhắc giờ và nhắc lặp của một todo cho khớp trạng thái hiện tại. */
+const rearmTodoJobs = async (
+  userId: string,
+  todoId: string,
+  now: Date
+): Promise<void> => {
+  const todo = await todosRepo.getTodoByIdScoped(todoId, userId);
+  if (!todo) {
+    // Đã xóa (hoặc không thuộc người dùng): dọn nhắc giờ và đếm ngược.
+    await clearTodoArtifacts([todoId], true);
+    return;
+  }
+
+  if (!isLive(todo.status)) {
+    // Hoàn thành / cất đi: hết nhắc giờ, đếm ngược về idle (giữ mốc thứ tự sự kiện).
+    await clearTodoArtifacts([todo.id], false);
+    return;
+  }
+
+  if (!todo.time || !todo.scheduled_date || todo.parent_id !== null) {
+    await jobsRepo.cancelEventJobs("todo_reminder", [todo.id]);
+    await jobsRepo.cancelEventJobs("todo_overdue", [todo.id]);
+    return;
+  }
+
+  const ctx = await settingsRepo.getUserContext(userId);
+  const { timezone } = resolveSettings(
+    ctx ?? { timezone: null, morning_time: null, evening_time: null }
+  );
+
+  // Nhắc lặp tính trước: nó cần cả khi giờ hẹn đã qua (đó chính là lúc bắt đầu nhắc), còn nhắc
+  // đúng giờ bên dưới thì chỉ dành cho giờ ở tương lai và có thể return sớm.
+  await safely("todo_overdue_changed", () =>
+    reconcileTodoOverdue(userId, todo, timezone, now)
+  );
+
+  const runAt = localDateTimeToUtc(todo.scheduled_date, todo.time, timezone);
+  if (runAt.getTime() <= now.getTime()) {
+    // Chỉ nhắc giờ ở TƯƠNG LAI; giờ đã qua thì bỏ job đang chờ (nếu có).
+    await jobsRepo.cancelEventJobs("todo_reminder", [todo.id]);
+    return;
+  }
+
+  await jobsRepo.upsertEventJob({
+    userId,
+    kind: "todo_reminder",
+    refId: todo.id,
+    runAt: runAt.toISOString(),
+    localDate: todo.scheduled_date,
+  });
+};
+
 /**
  * Gọi sau MỌI thay đổi của một todo (tạo, sửa, dời ngày, hoàn thành, bỏ hoàn thành, hồi sinh
- * bản lặp, sync). Đọc trạng thái hiện tại rồi tạo/sửa/hủy job nhắc giờ và nhắc lặp cho khớp.
+ * bản lặp, sync). Đọc trạng thái hiện tại rồi tạo/sửa/hủy job nhắc giờ và nhắc lặp cho khớp, rồi gỡ
+ * khỏi máy thông báo đã gửi theo giờ/ngày hẹn CŨ (xem `dismissStaleTodoCard`). Phải gỡ SAU khi tính lại
+ * job, vì việc gỡ xét xem thông báo kế tiếp của todo có đến ngay không. `now` chỉ để test.
  */
-export const onTodoChanged = (userId: string, todoId: string): Promise<void> =>
-  safely("todo_changed", async () => {
-    const todo = await todosRepo.getTodoByIdScoped(todoId, userId);
-    if (!todo) {
-      // Đã xóa (hoặc không thuộc người dùng): dọn nhắc giờ và đếm ngược.
-      await clearTodoArtifacts([todoId], true);
-      return;
-    }
-
-    if (!isLive(todo.status)) {
-      // Hoàn thành / cất đi: hết nhắc giờ, đếm ngược về idle (giữ mốc thứ tự sự kiện).
-      await clearTodoArtifacts([todo.id], false);
-      return;
-    }
-
-    if (!todo.time || !todo.scheduled_date || todo.parent_id !== null) {
-      await jobsRepo.cancelEventJobs("todo_reminder", [todo.id]);
-      await jobsRepo.cancelEventJobs("todo_overdue", [todo.id]);
-      return;
-    }
-
-    const ctx = await settingsRepo.getUserContext(userId);
-    const { timezone } = resolveSettings(
-      ctx ?? { timezone: null, morning_time: null, evening_time: null }
-    );
-
-    // Nhắc lặp tính trước: nó cần cả khi giờ hẹn đã qua (đó chính là lúc bắt đầu nhắc), còn nhắc
-    // đúng giờ bên dưới thì chỉ dành cho giờ ở tương lai và có thể return sớm.
-    await safely("todo_overdue_changed", () =>
-      reconcileTodoOverdue(userId, todo, timezone)
-    );
-
-    const runAt = localDateTimeToUtc(todo.scheduled_date, todo.time, timezone);
-    if (runAt.getTime() <= Date.now()) {
-      // Chỉ nhắc giờ ở TƯƠNG LAI; giờ đã qua thì bỏ job đang chờ (nếu có).
-      await jobsRepo.cancelEventJobs("todo_reminder", [todo.id]);
-      return;
-    }
-
-    await jobsRepo.upsertEventJob({
-      userId,
-      kind: "todo_reminder",
-      refId: todo.id,
-      runAt: runAt.toISOString(),
-      localDate: todo.scheduled_date,
-    });
+export const onTodoChanged = async (
+  userId: string,
+  todoId: string,
+  now: Date = new Date()
+): Promise<void> => {
+  await safely("todo_changed", () => rearmTodoJobs(userId, todoId, now));
+  await safely("todo_stale_card", async () => {
+    await dismissStaleTodoCard(userId, todoId, now);
   });
+};
 
 /** Todo bị xóa (kể cả xóa lan xuống todo con / cả chuỗi lặp). */
 export const onTodosRemoved = (

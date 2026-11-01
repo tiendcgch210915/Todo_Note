@@ -12,6 +12,7 @@ import {
   CHECKLIST_DUE_BODY,
   CHECKLIST_RUNNING_BODY,
   DIGEST_LABELS,
+  DIGEST_SEPARATOR,
   FALLBACK_TITLE,
   OVERDUE_BODY,
   OVERDUE_DIGEST_TEXT,
@@ -79,10 +80,11 @@ const lines = (...parts: Array<string | null>): string =>
 
 /**
  * digest_morning: luôn gửi. Hai khối cách nhau MỘT dòng trống:
- *   📋 Nhiệm vụ: <số liệu todo + thói quen, một dòng>
+ *   📋 Hôm nay: <số liệu todo + thói quen, một dòng ngắn: số trước, chữ sau>
  *   (dòng trống)
  *   💪 Động lực: “<câu cổ vũ>”
  *   💡 Suy ngẫm: <câu triết lý>
+ * Phần nào bằng 0 thì bỏ khỏi dòng số liệu (không in "0 todo").
  */
 export const buildMorningDigest = (
   rawStats: DigestStats,
@@ -93,20 +95,22 @@ export const buildMorningDigest = (
 
   let summary: string;
   if (t === 0 && h === 0) {
-    summary =
-      "Hôm nay chưa có todo hay thói quen nào. Thử thêm một mục tiêu nhỏ để khởi động ngày mới nhé!";
-  } else if (done === 0) {
-    summary = `Hôm nay bạn có ${t} todo cần hoàn thành & ${h} thói quen cần duy trì.`;
-  } else if (done < t) {
-    summary = `Hôm nay bạn có ${t} todo (đã xong ${done}, còn ${remaining}) & ${h} thói quen cần duy trì.`;
+    summary = `${DIGEST_LABELS.progress}Hôm nay chưa có todo hay thói quen. Thêm một mục tiêu nhỏ nhé!`;
   } else {
-    summary = `Bạn đã hoàn thành cả ${t} todo hôm nay! Còn ${h} thói quen để duy trì.`;
+    let todos: string | null = null;
+    if (t > 0 && done === 0) todos = `${t} todo`;
+    else if (t > 0 && done < t) todos = `${t} todo (xong ${done}, còn ${remaining})`;
+    else if (t > 0) todos = `xong cả ${t} todo`;
+    const habits = h > 0 ? `${h} thói quen` : null;
+    summary = `${DIGEST_LABELS.today}${[todos, habits]
+      .filter((part): part is string => part !== null)
+      .join(DIGEST_SEPARATOR)}`;
   }
 
   return {
     title: "Chào buổi sáng",
     body: lines(
-      `${DIGEST_LABELS.tasks}${summary}`,
+      summary,
       "",
       `${DIGEST_LABELS.motivation}${QUOTE.open}${cheerForDate(localDate)}${QUOTE.close}`,
       `${DIGEST_LABELS.reflection}${philosophyForDate(localDate)}`
@@ -116,7 +120,7 @@ export const buildMorningDigest = (
 
 /**
  * digest_todos: bỏ qua (null) nếu hôm nay không có todo nào.
- *   📋 Tiến độ: <số liệu>
+ *   📋 Xong <x>/<T> todo · còn <R> đang chờ     (hoặc "Xong cả <T> todo hôm nay")
  *   💪 <phần khích lệ>      (chỉ khi có)
  */
 export const buildTodosDigest = (
@@ -128,14 +132,12 @@ export const buildTodosDigest = (
 
   let progress: string;
   let encouragement: string | null = null;
-  if (done === 0) {
-    progress = `Hôm nay chưa có todo nào hoàn thành, còn ${remaining} todo đang chờ bạn.`;
-    encouragement = "Hãy bắt đầu bằng việc nhỏ nhất!";
-  } else if (remaining > 0) {
-    progress = `Bạn đã hoàn thành ${done} todo rồi, còn lại ${remaining} todo nữa vẫn đang chờ bạn.`;
-  } else {
-    progress = `Bạn đã hoàn thành cả ${done} todo hôm nay.`;
+  if (remaining === 0) {
+    progress = `Xong cả ${t} todo hôm nay`;
     encouragement = "Tuyệt vời!";
+  } else {
+    progress = `Xong ${done}/${t} todo${DIGEST_SEPARATOR}còn ${remaining} đang chờ`;
+    if (done === 0) encouragement = "Hãy bắt đầu bằng việc nhỏ nhất!";
   }
   return {
     title: "Tổng kết todo hôm nay",
@@ -148,7 +150,7 @@ export const buildTodosDigest = (
 
 /**
  * digest_habits: bỏ qua (null) nếu hôm nay không có thói quen nào cần duy trì.
- *   📋 Thói quen: <số liệu>
+ *   📋 Đã duy trì <x>/<H> thói quen     (hoặc "Đã duy trì đủ <H>/<H> thói quen")
  *   💪 <phần khích lệ>      (chỉ khi có)
  */
 export const buildHabitsDigest = (
@@ -160,18 +162,18 @@ export const buildHabitsDigest = (
   let progress: string;
   let encouragement: string | null = null;
   if (x === 0) {
-    progress = "Hôm nay bạn chưa duy trì thói quen nào.";
+    progress = `Đã duy trì 0/${h} thói quen`;
     encouragement = "Vẫn còn thời gian để làm một thói quen nhỏ trước khi hết ngày!";
   } else if (x < h) {
-    progress = `Hôm nay bạn đã duy trì được ${x}/${h} thói quen.`;
+    progress = `Đã duy trì ${x}/${h} thói quen`;
   } else {
-    progress = `Bạn đã duy trì đủ ${h}/${h} thói quen hôm nay.`;
+    progress = `Đã duy trì đủ ${h}/${h} thói quen`;
     encouragement = "Tuyệt vời!";
   }
   return {
     title: "Tổng kết thói quen",
     body: lines(
-      `${DIGEST_LABELS.habits}${progress}`,
+      `${DIGEST_LABELS.progress}${progress}`,
       encouragement === null ? null : `${DIGEST_LABELS.encouragement}${encouragement}`
     ),
   };
@@ -235,17 +237,30 @@ export const buildTodoReminder = (
   body: todoPriorityBody(isImportant, isUrgent),
 });
 
-/** Nội dung nhắc lặp: giờ hẹn đã lỡ (HH:mm) + việc nên làm. */
-const overdueBody = (scheduledTime: string): string =>
-  `${OVERDUE_BODY.prefix}${scheduledTime}${OVERDUE_BODY.suffix}`;
+/** Khoảng trễ dễ đọc: "1 giờ", "2 giờ", "45 phút", "1 giờ 30 phút"; tối thiểu 1 phút. */
+const formatLate = (lateMinutes: number): string => {
+  const total = Math.max(1, nonNegativeInt(lateMinutes));
+  const hours = Math.floor(total / 60);
+  const minutes = total % 60;
+  if (hours === 0) return `${minutes}${OVERDUE_BODY.minute}`;
+  const hoursText = `${hours}${OVERDUE_BODY.hour}`;
+  return minutes === 0 ? hoursText : `${hoursText} ${minutes}${OVERDUE_BODY.minute}`;
+};
 
-/** todo_overdue: tiêu đề = tiêu đề todo; `scheduledTime` = giờ đặt của todo (HH:mm). */
+/**
+ * todo_overdue: tiêu đề = tiêu đề todo; `scheduledTime` = giờ đặt của todo (HH:mm); `lateMinutes` = đã
+ * trễ bao nhiêu phút tại mốc nhắc này. Mỗi nhắc lặp thay nhắc trước của cùng todo nên nội dung phải
+ * tự nói được mức trễ hiện tại: "⏰ Trễ 2 giờ (hẹn 10:00) · Làm ngay hoặc dời lịch!".
+ */
 export const buildTodoOverdue = (
   todoTitle: string,
-  scheduledTime: string
+  scheduledTime: string,
+  lateMinutes: number
 ): NotificationText => ({
   title: normalizePushTitle(todoTitle, FALLBACK_TITLE.todo),
-  body: overdueBody(scheduledTime),
+  body:
+    `${OVERDUE_BODY.prefix}${formatLate(lateMinutes)}` +
+    `${OVERDUE_BODY.scheduledPrefix}${scheduledTime}${OVERDUE_BODY.suffix}`,
 });
 
 /**

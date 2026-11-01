@@ -180,6 +180,20 @@ export const listDailyTodoLogs = async (
   return (res.rows as unknown as Record<string, unknown>[]).map(mapLogRow);
 };
 
+export const countTimedLogsInRange = async (
+  userId: string,
+  from: string,
+  to: string
+): Promise<Map<string, number>> => {
+  const res = await turso.execute({
+    sql: `SELECT log_date, COUNT(*) AS timed FROM daily_todo_logs
+          WHERE user_id = ? AND log_date BETWEEN ? AND ? AND time IS NOT NULL
+          GROUP BY log_date`,
+    args: [userId, from, to],
+  });
+  return new Map(res.rows.map((r) => [String(r.log_date), Number(r.timed)]));
+};
+
 export const listTodoSnapshotsForDailyClose = async (
   userId: string,
   date: string
@@ -201,6 +215,46 @@ export const listTodoSnapshotsForDailyClose = async (
   return (res.rows as unknown as Record<string, unknown>[]).map(mapSnapshotRow);
 };
 
+// scheduled_date of the top-level todo that `todoId` hangs under (itself when top-level).
+export const getRootScheduledDate = async (
+  userId: string,
+  todoId: string
+): Promise<string | null> => {
+  const res = await turso.execute({
+    sql: `WITH RECURSIVE up(id, parent_id, scheduled_date) AS (
+            SELECT id, parent_id, scheduled_date FROM todos WHERE id = ? AND user_id = ?
+            UNION
+            SELECT t.id, t.parent_id, t.scheduled_date FROM todos t
+            JOIN up ON t.id = up.parent_id WHERE t.user_id = ?
+          )
+          SELECT scheduled_date FROM up WHERE parent_id IS NULL LIMIT 1`,
+    args: [todoId, userId, userId],
+  });
+  if (res.rows.length === 0) return null;
+  return ((res.rows[0] as unknown as Record<string, unknown>).scheduled_date as string | null) ?? null;
+};
+
+// No top-level todos means no log rows and a zero score, regardless of habits.
+// The check and insert share a statement so a concurrent close cannot replace a snapshot.
+export const closeEmptyTodoDays = async (
+  userId: string,
+  dates: string[],
+  closedAt: string
+): Promise<DailyTodoSummaryRow[]> => {
+  const res = await turso.execute({
+    sql: `INSERT INTO daily_todo_summaries
+          (user_id, log_date, total_todos, done_todos, score, closed_at, created_at, updated_at)
+          SELECT ?, d.value, 0, 0, 0, ?, ?, ? FROM json_each(?) d
+          WHERE NOT EXISTS (
+            SELECT 1 FROM todos WHERE user_id = ? AND scheduled_date = d.value
+              AND parent_id IS NULL AND status != 'archived' AND deleted_at IS NULL
+          )
+          ON CONFLICT(user_id, log_date) DO NOTHING RETURNING *`,
+    args: [userId, closedAt, closedAt, closedAt, JSON.stringify(dates), userId],
+  });
+  return res.rows.map(mapSummaryRow);
+};
+
 export const insertDailyTodoClose = async (input: {
   userId: string;
   date: string;
@@ -209,42 +263,34 @@ export const insertDailyTodoClose = async (input: {
   doneTodos: number;
   score: number;
   closedAt: string;
-}): Promise<void> => {
-  const statements = input.logs.map((log) => ({
-    sql: `INSERT OR IGNORE INTO daily_todo_logs
-          (id, user_id, log_date, todo_id, title, description, status,
-           completed, completed_at, scheduled_date, time, due_at,
-           is_important, is_urgent, is_frog, frog_date,
-           estimated_minutes, actual_minutes, position,
-           todo_created_at, todo_updated_at, logged_at, created_at, updated_at)
-          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-    args: [
-      newId(),
-      log.user_id,
-      log.log_date,
-      log.todo_id,
-      log.title,
-      log.description,
-      log.status,
-      log.completed,
-      log.completed_at,
-      log.scheduled_date,
-      log.time,
-      log.due_at,
-      log.is_important,
-      log.is_urgent,
-      log.is_frog,
-      log.frog_date,
-      log.estimated_minutes,
-      log.actual_minutes,
-      log.position,
-      log.todo_created_at,
-      log.todo_updated_at,
-      input.closedAt,
-      input.closedAt,
-      input.closedAt,
-    ],
-  }));
+}): Promise<DailyTodoSummaryRow> => {
+  const statements: { sql: string; args: (string | number | null)[] }[] = [];
+  // 40 rows × 24 values plus two guard parameters fit the 999-variable limit.
+  const chunkSize = 40;
+  const tuple = `(${Array(24).fill("?").join(", ")})`;
+  for (let i = 0; i < input.logs.length; i += chunkSize) {
+    const chunk = input.logs.slice(i, i + chunkSize);
+    const args = chunk.flatMap((log) => [
+      newId(), log.user_id, log.log_date, log.todo_id, log.title, log.description,
+      log.status, log.completed, log.completed_at, log.scheduled_date, log.time,
+      log.due_at, log.is_important, log.is_urgent, log.is_frog, log.frog_date,
+      log.estimated_minutes, log.actual_minutes, log.position, log.todo_created_at,
+      log.todo_updated_at, input.closedAt, input.closedAt, input.closedAt,
+    ]);
+    statements.push({
+      sql: `WITH snapshots AS (VALUES ${chunk.map(() => tuple).join(", ")})
+            INSERT OR IGNORE INTO daily_todo_logs
+            (id, user_id, log_date, todo_id, title, description, status,
+             completed, completed_at, scheduled_date, time, due_at,
+             is_important, is_urgent, is_frog, frog_date,
+             estimated_minutes, actual_minutes, position,
+             todo_created_at, todo_updated_at, logged_at, created_at, updated_at)
+            SELECT * FROM snapshots WHERE NOT EXISTS (
+              SELECT 1 FROM daily_todo_summaries WHERE user_id = ? AND log_date = ?
+            )`,
+      args: [...args, input.userId, input.date],
+    });
+  }
 
   statements.push({
     sql: `INSERT OR IGNORE INTO daily_todo_summaries
@@ -263,7 +309,13 @@ export const insertDailyTodoClose = async (input: {
     ],
   });
 
-  await turso.batch(statements, "write");
+  // A concurrent closer may have won. Return the summary committed with its logs.
+  statements.push({
+    sql: "SELECT * FROM daily_todo_summaries WHERE user_id = ? AND log_date = ?",
+    args: [input.userId, input.date],
+  });
+  const results = await turso.batch(statements, "write");
+  return mapSummaryRow(results[results.length - 1].rows[0]);
 };
 
 export const listUserIdsWithTodosForDate = async (

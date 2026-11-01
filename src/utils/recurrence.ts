@@ -48,6 +48,43 @@ export const parseWeekdays = (raw: string | null): number[] => {
 };
 
 /**
+ * `date` có phải một ngày mà quy tắc cho phép xuất hiện không. Chỉ `weekly` có thứ mới lọc theo
+ * thứ trong tuần; các dạng còn lại tính từ lần trước nên ngày nào cũng hợp lệ. Cùng cách hiểu với
+ * `nextRecurrenceDateAfter` (kể cả `custom`: mỗi N ngày, bỏ qua thứ).
+ */
+export const ruleAllowsDate = (rule: RecurrenceRule, date: string): boolean => {
+  if (!rule.type || !ISO_DATE_RE.test(date)) return false;
+  if (rule.type !== "weekly") return true;
+  const weekdays = parseWeekdays(rule.daysOfWeek);
+  if (weekdays.length === 0) return true;
+  const weekday = isoWeekdayOf(date);
+  return weekday !== null && weekdays.includes(weekday);
+};
+
+/**
+ * Ngày hợp lệ ĐẦU TIÊN từ `from` trở đi (gồm cả `from`), hoặc null nếu không còn (quá `endDate`,
+ * không có quy tắc, ngày sai định dạng). Dùng để dời một lần xuất hiện đã tạo sẵn khi quy tắc đổi.
+ */
+export const firstRuleDateOnOrAfter = (
+  rule: RecurrenceRule,
+  from: string
+): string | null => {
+  if (!rule.type || !ISO_DATE_RE.test(from)) return null;
+
+  let date = from;
+  // Có ít nhất một thứ hợp lệ thì tối đa 7 ngày là gặp; vòng lặp chỉ là chốt chặn.
+  for (let i = 0; i < 7 && !ruleAllowsDate(rule, date); i++) {
+    date = addDays(date, 1);
+  }
+  if (!ruleAllowsDate(rule, date)) return null;
+
+  if (rule.endDate && ISO_DATE_RE.test(rule.endDate) && date > rule.endDate) {
+    return null;
+  }
+  return date;
+};
+
+/**
  * Lần xuất hiện KẾ TIẾP sau `from` theo quy tắc, hoặc null nếu không còn (hết `endDate`, không có
  * quy tắc, ngày sai định dạng).
  *  - daily / custom: cộng `interval` ngày.

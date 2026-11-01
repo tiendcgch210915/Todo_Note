@@ -72,14 +72,17 @@ export const insertTodo = async (
     isImportant?: number | null;
     isUrgent?: number | null;
     estimatedMinutes?: number | null;
+    /** Chuỗi lặp mà todo này là một lần xuất hiện của nó (todo gốc phải tồn tại: có khóa ngoại). */
+    recurrenceTemplateId?: string | null;
     deletedAt?: string | null;
   }
 ): Promise<void> => {
   await db.execute({
     sql: `INSERT INTO todos
           (id, user_id, parent_id, title, status, position, is_important, is_urgent,
-           estimated_minutes, scheduled_date, time, created_at, updated_at, deleted_at)
-          VALUES (?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?, ?, ?)`,
+           estimated_minutes, scheduled_date, time, recurrence_template_id,
+           created_at, updated_at, deleted_at)
+          VALUES (?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     args: [
       row.id,
       row.userId ?? USER_ID,
@@ -91,6 +94,7 @@ export const insertTodo = async (
       row.estimatedMinutes ?? null,
       row.scheduledDate === undefined ? null : row.scheduledDate,
       row.time ?? null,
+      row.recurrenceTemplateId ?? null,
       SEED_TIME,
       SEED_TIME,
       row.deletedAt ?? null,

@@ -1,0 +1,14 @@
+-- Migration 0026: remember which schedule a todo notification was sent for
+--
+-- A todo reminder / repeated overdue nudge that was already delivered stays on the phone's
+-- notification tray. When the user later changes the todo's reminder time or date the server asks
+-- the app to remove that card (a data-only "dismiss" push, see services/notification-cards.ts).
+-- To know whether the card is stale it has to remember the schedule the card was sent for, because
+-- the todo_reminder row itself is rewritten (new run_at, status back to pending) on every edit.
+--
+--   card_key = '<scheduled_date>T<HH:mm>' of the todo at SEND TIME, set for todo_reminder and
+--              todo_overdue jobs when they are sent. NULL = no card of this job to remove.
+--
+-- It is cleared (set back to NULL) when the server dismisses the card. Rows that were sent before
+-- this migration keep NULL, so their cards are simply never dismissed.
+ALTER TABLE notification_jobs ADD COLUMN card_key TEXT;

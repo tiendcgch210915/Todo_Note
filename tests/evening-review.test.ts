@@ -285,10 +285,11 @@ test("at 21:30 every device gets the review with today's real numbers", async ()
       "🌙 Rà lại phần chưa xong & lên kế hoạch cho ngày mai để tiến bộ hơn nhé!",
     ].join("\n")
   );
-  assert.deepEqual(message.data, { type: "digest_review", id: TODAY, date: TODAY });
+  assert.deepEqual(message.data, { type: "digest_review", id: TODAY, date: TODAY, tag: "digest:day" });
   assert.equal(message.android?.priority, "high");
   assert.equal(message.android?.ttl, 3_600_000);
   assert.equal(message.android?.notification?.channelId, "daily_digest");
+  assert.equal(message.android?.notification?.tag, "digest:day");
 });
 
 test("the review is sent even on an empty day, unlike the todo and habit digests", async () => {

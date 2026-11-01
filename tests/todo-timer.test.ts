@@ -144,6 +144,9 @@ test("the end-of-timer push goes ONLY to the counting device, never to the user'
   assert.equal(message.android?.priority, "high");
   assert.equal(message.android?.ttl, 900_000);
   assert.equal(message.android?.notification?.channelId, "todo_timer");
+  // Same card as the todo's reminder and overdue nudges: the countdown end replaces them in the tray.
+  assert.equal(message.android?.notification?.tag, `todo:${TODO_ID}`);
+  assert.equal(message.data?.tag, `todo:${TODO_ID}`);
   assert.equal((await timerJob())?.status, "sent");
   assert.equal((await timersRepo.getTimer(TODO_ID))?.status, "finished");
 });

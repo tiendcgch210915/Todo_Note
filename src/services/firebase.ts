@@ -22,6 +22,8 @@ export const ANDROID_CHANNEL_ID = "general_notifications";
 const MAX_PAYLOAD_BYTES = 4096;
 /** FCM: lifespan from 0 to 2,419,200 seconds (4 weeks). */
 const MAX_TTL_MS = 2_419_200 * 1000;
+/** Longest notification tag we send (ours are `kind:<uuid>`, well under this). */
+const MAX_TAG_CHARS = 128;
 /** sendEach() accepts up to 500 messages per call. */
 const SEND_BATCH_SIZE = 500;
 /** FCM reserved data keys / prefixes (set-message-type docs). */
@@ -60,9 +62,22 @@ export type PushMessage = {
   /** Android notification channel; defaults to ANDROID_CHANNEL_ID. */
   channelId?: string;
   /**
+   * Android notification tag. A notification with the same tag already in the tray is REPLACED
+   * by this one instead of stacking. Omitted = every push is a separate notification.
+   */
+  tag?: string;
+  /**
    * FCM message lifespan in MILLISECONDS (the Admin SDK converts it to the "3600s" string
    * HTTP v1 expects). Omitted = FCM default (4 weeks).
    */
+  ttlMs?: number;
+};
+
+/** A message with no visible notification: only `data` reaches the app. */
+export type DataPushMessage = {
+  devices: PushDevice[];
+  data: Record<string, string>;
+  /** FCM message lifespan in MILLISECONDS. Omitted = FCM default (4 weeks). */
   ttlMs?: number;
 };
 
@@ -141,31 +156,17 @@ export const initFirebase = async (logger?: PushLogger): Promise<boolean> => {
   }
 };
 
-/** Throws PushPayloadError unless the payload is one FCM will accept. */
-export const validatePushPayload = (
-  message: Pick<PushMessage, "title" | "body" | "data" | "channelId" | "ttlMs">
-): void => {
+const assertTtl = (ttlMs: number | undefined): void => {
   if (
-    message.ttlMs !== undefined &&
-    (!Number.isFinite(message.ttlMs) ||
-      message.ttlMs < 0 ||
-      message.ttlMs > MAX_TTL_MS)
+    ttlMs !== undefined &&
+    (!Number.isFinite(ttlMs) || ttlMs < 0 || ttlMs > MAX_TTL_MS)
   ) {
     throw new PushPayloadError("ttlMs must be between 0 and 4 weeks");
   }
-  if (
-    message.channelId !== undefined &&
-    (typeof message.channelId !== "string" || message.channelId.trim() === "")
-  ) {
-    throw new PushPayloadError("channelId must be a non-empty string");
-  }
-  if (typeof message.title !== "string" || message.title.trim() === "") {
-    throw new PushPayloadError("title must be a non-empty string");
-  }
-  if (typeof message.body !== "string" || message.body.trim() === "") {
-    throw new PushPayloadError("body must be a non-empty string");
-  }
-  for (const [key, value] of Object.entries(message.data ?? {})) {
+};
+
+const assertData = (data: Record<string, string> | undefined): void => {
+  for (const [key, value] of Object.entries(data ?? {})) {
     if (key === "" || typeof value !== "string") {
       throw new PushPayloadError("data keys must be non-empty and values strings");
     }
@@ -176,17 +177,67 @@ export const validatePushPayload = (
       throw new PushPayloadError(`data key "${key}" is reserved by FCM`);
     }
   }
-  const size = Buffer.byteLength(
-    JSON.stringify({
-      title: message.title,
-      body: message.body,
-      data: message.data ?? {},
-    }),
-    "utf8"
-  );
+};
+
+const assertSize = (payload: object): void => {
+  const size = Buffer.byteLength(JSON.stringify(payload), "utf8");
   if (size > MAX_PAYLOAD_BYTES) {
     throw new PushPayloadError(`payload exceeds ${MAX_PAYLOAD_BYTES} bytes`);
   }
+};
+
+/** Throws PushPayloadError unless the data-only payload is one FCM will accept. */
+export const validateDataPayload = (
+  message: Pick<DataPushMessage, "data" | "ttlMs">
+): void => {
+  assertTtl(message.ttlMs);
+  if (
+    message.data === null ||
+    typeof message.data !== "object" ||
+    Object.keys(message.data).length === 0
+  ) {
+    throw new PushPayloadError("data must have at least one key");
+  }
+  assertData(message.data);
+  assertSize({ data: message.data });
+};
+
+/** Throws PushPayloadError unless the payload is one FCM will accept. */
+export const validatePushPayload = (
+  message: Pick<
+    PushMessage,
+    "title" | "body" | "data" | "channelId" | "tag" | "ttlMs"
+  >
+): void => {
+  assertTtl(message.ttlMs);
+  if (
+    message.channelId !== undefined &&
+    (typeof message.channelId !== "string" || message.channelId.trim() === "")
+  ) {
+    throw new PushPayloadError("channelId must be a non-empty string");
+  }
+  if (
+    message.tag !== undefined &&
+    (typeof message.tag !== "string" ||
+      message.tag.trim() === "" ||
+      message.tag.length > MAX_TAG_CHARS)
+  ) {
+    throw new PushPayloadError(
+      `tag must be a non-empty string of at most ${MAX_TAG_CHARS} characters`
+    );
+  }
+  if (typeof message.title !== "string" || message.title.trim() === "") {
+    throw new PushPayloadError("title must be a non-empty string");
+  }
+  if (typeof message.body !== "string" || message.body.trim() === "") {
+    throw new PushPayloadError("body must be a non-empty string");
+  }
+  assertData(message.data);
+  assertSize({
+    title: message.title,
+    body: message.body,
+    data: message.data ?? {},
+  });
 };
 
 const chunksOf = <T>(items: T[], size: number): T[][] => {
@@ -199,7 +250,10 @@ const chunksOf = <T>(items: T[], size: number): T[][] => {
 
 const buildMessage = (
   device: PushDevice,
-  payload: Pick<PushMessage, "title" | "body" | "data" | "channelId" | "ttlMs">
+  payload: Pick<
+    PushMessage,
+    "title" | "body" | "data" | "channelId" | "tag" | "ttlMs"
+  >
 ): Message => {
   const common = {
     notification: { title: payload.title, body: payload.body },
@@ -207,11 +261,31 @@ const buildMessage = (
     android: {
       priority: "high" as const,
       ...(payload.ttlMs !== undefined ? { ttl: payload.ttlMs } : {}),
-      notification: { channelId: payload.channelId ?? ANDROID_CHANNEL_ID },
+      notification: {
+        channelId: payload.channelId ?? ANDROID_CHANNEL_ID,
+        ...(payload.tag !== undefined ? { tag: payload.tag } : {}),
+      },
     },
   };
   // firebase-admin >= 14.1 targets a Firebase Installation ID with `fid`;
   // `token` is deprecated and only used for registrations stored as kind="token".
+  return device.kind === "fid"
+    ? { ...common, fid: device.registrationId }
+    : { ...common, token: device.registrationId };
+};
+
+/** Data-only message: no `notification` block, so the system shows nothing and the app's handler decides. */
+const buildDataMessage = (
+  device: PushDevice,
+  payload: Pick<DataPushMessage, "data" | "ttlMs">
+): Message => {
+  const common = {
+    data: payload.data,
+    android: {
+      priority: "high" as const,
+      ...(payload.ttlMs !== undefined ? { ttl: payload.ttlMs } : {}),
+    },
+  };
   return device.kind === "fid"
     ? { ...common, fid: device.registrationId }
     : { ...common, token: device.registrationId };
@@ -224,16 +298,15 @@ const getClient = (): MessagingClient | null => {
 };
 
 /**
- * Send one notification to a set of devices. Throws PushPayloadError for a bad
- * payload; per-device FCM failures are reported in the result, never thrown.
+ * Send to a set of devices, building each device's message with `build`. Per-device FCM failures
+ * are reported in the result, never thrown.
  */
-export const sendFirebasePush = async (
-  message: PushMessage
+const deliver = async (
+  allDevices: PushDevice[],
+  build: (device: PushDevice) => Message
 ): Promise<PushResult> => {
-  validatePushPayload(message);
-
   const seen = new Set<string>();
-  const devices = message.devices.filter((device) => {
+  const devices = allDevices.filter((device) => {
     if (device.registrationId.length === 0 || seen.has(device.registrationId)) {
       return false;
     }
@@ -258,9 +331,7 @@ export const sendFirebasePush = async (
   const invalidDeviceIds: string[] = [];
 
   for (const chunk of chunksOf(devices, SEND_BATCH_SIZE)) {
-    const response = await client.sendEach(
-      chunk.map((device) => buildMessage(device, message))
-    );
+    const response = await client.sendEach(chunk.map(build));
 
     response.responses.forEach((result, index) => {
       if (result.success) {
@@ -288,4 +359,26 @@ export const sendFirebasePush = async (
   }
 
   return { successCount, failureCount, invalidDeviceIds };
+};
+
+/**
+ * Send one notification to a set of devices. Throws PushPayloadError for a bad
+ * payload; per-device FCM failures are reported in the result, never thrown.
+ */
+export const sendFirebasePush = async (
+  message: PushMessage
+): Promise<PushResult> => {
+  validatePushPayload(message);
+  return deliver(message.devices, (device) => buildMessage(device, message));
+};
+
+/**
+ * Send a data-only message: the system shows nothing and the app's background handler receives
+ * `data`. Same error contract as `sendFirebasePush`.
+ */
+export const sendFirebaseData = async (
+  message: DataPushMessage
+): Promise<PushResult> => {
+  validateDataPayload(message);
+  return deliver(message.devices, (device) => buildDataMessage(device, message));
 };

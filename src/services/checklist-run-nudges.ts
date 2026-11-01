@@ -100,17 +100,10 @@ export const reconcileChecklistRunNudges = async (
     slot.at.toISOString()
   );
 
-  // Hủy phần thừa trước, rồi upsert phần cần: không có lúc nào mốc hợp lệ bị hủy tạm.
-  await jobsRepo.cancelSlotJobsExcept(userId, "checklist_running", runId, slots);
-  for (const runAt of slots) {
-    await jobsRepo.upsertSlotJob({
-      userId,
-      kind: "checklist_running",
-      refId: runId,
-      localDate: date,
-      runAt,
-    });
-  }
+  await jobsRepo.reconcileSlotJobs(
+    { userId, kind: "checklist_running", refId: runId, localDate: date },
+    slots
+  );
 };
 
 /** Đổi múi giờ: ngày địa phương và mốc 06:00 đổi theo nên tính lại mọi run đang chạy. */
@@ -145,27 +138,15 @@ export const backfillChecklistRunNudges = async (now: Date = new Date()): Promis
     const all = runNudgeSlots(startedAt, timezone);
     const slots = creatableRunNudges(all, now);
 
+    const schedule = {
+      userId: run.user_id, kind: "checklist_running", refId: run.id, localDate: date,
+    } as const;
     if (slots.length === 0) {
-      await jobsRepo.insertSlotJobIfAbsent({
-        userId: run.user_id,
-        kind: "checklist_running",
-        refId: run.id,
-        localDate: date,
-        runAt: all[all.length - 1].at.toISOString(),
-        status: "missed",
-      });
-      continue;
-    }
-    for (const slot of slots) {
-      const inserted = await jobsRepo.insertSlotJobIfAbsent({
-        userId: run.user_id,
-        kind: "checklist_running",
-        refId: run.id,
-        localDate: date,
-        runAt: slot.at.toISOString(),
-        status: "pending",
-      });
-      if (inserted) created++;
+      await jobsRepo.insertSlotJobsIfAbsent(schedule, [all[all.length - 1].at.toISOString()], "missed");
+    } else {
+      created += await jobsRepo.insertSlotJobsIfAbsent(
+        schedule, slots.map((slot) => slot.at.toISOString()), "pending"
+      );
     }
   }
   return created;

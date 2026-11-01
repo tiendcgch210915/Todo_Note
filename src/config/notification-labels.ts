@@ -6,25 +6,27 @@
  * khoảng trắng cuối để ghép thẳng trước nội dung.
  */
 
-/** Nhãn từng dòng trong thông báo tổng kết. */
+/**
+ * Nhãn từng dòng trong thông báo tổng kết. Thông báo thu gọn chỉ hiện chừng 40-50 ký tự của dòng đầu,
+ * nên dòng đầu luôn là DÒNG SỐ LIỆU ngắn (số trước, chữ sau) và không lặp lại điều tiêu đề đã nói.
+ */
 export const DIGEST_LABELS = {
-  /** Dòng đầu của digest_morning: số liệu todo + thói quen trong MỘT dòng. */
-  tasks: "📋 Nhiệm vụ: ",
-  /** Dòng đầu của digest_todos. */
-  progress: "📋 Tiến độ: ",
-  /** Dòng đầu của digest_habits. */
-  habits: "📋 Thói quen: ",
+  /** Dòng đầu của digest_morning và digest_review: "📋 Hôm nay: 5 todo · 3 thói quen". */
+  today: "📋 Hôm nay: ",
+  /** Dòng đầu của digest_todos / digest_habits (tiêu đề đã nói rõ đó là todo hay thói quen). */
+  progress: "📋 ",
   /** digest_morning: dòng câu cổ vũ (câu được đặt trong dấu ngoặc kép cong). */
   motivation: "💪 Động lực: ",
   /** digest_todos / digest_habits: phần khích lệ tách thành dòng riêng. */
   encouragement: "💪 ",
   /** digest_morning: dòng câu triết lý. */
   reflection: "💡 Suy ngẫm: ",
-  /** digest_review: dòng số liệu của hôm nay. */
-  today: "📋 Hôm nay: ",
   /** digest_review: dòng lời nhắc rà soát + lên kế hoạch. */
   review: "🌙 ",
 } as const;
+
+/** Ngăn cách các phần số liệu trên cùng một dòng: "5 todo (xong 2, còn 3) · 3 thói quen". */
+export const DIGEST_SEPARATOR = " · ";
 
 /** Nội dung digest_review (rà soát cuối ngày). Số liệu: x/T todo xong, y/H thói quen. */
 export const REVIEW_BODY = {
@@ -65,12 +67,19 @@ export const CHECKLIST_DUE_BODY = {
 } as const;
 
 /**
- * Nhắc LẶP khi bỏ lỡ giờ hẹn của todo (todo_overdue; checklist không còn nhắc lặp). Tiêu đề vẫn là tên todo,
- * nội dung chỉ nói giờ đã lỡ và việc nên làm: "⏰ Quá giờ 10:00 · Làm ngay hoặc dời lịch!".
+ * Nhắc LẶP khi bỏ lỡ giờ hẹn của todo (todo_overdue; checklist không còn nhắc lặp). Tiêu đề vẫn là tên todo.
+ * Mỗi nhắc lặp THAY nhắc trước của cùng todo trong khay (xem `notificationTag`) nên người đọc chỉ thấy bản
+ * mới nhất: nội dung phải tự nói ĐÃ TRỄ BAO LÂU, rồi giờ hẹn gốc và việc nên làm:
+ *   ⏰ Trễ 2 giờ (hẹn 10:00) · Làm ngay hoặc dời lịch!
  */
 export const OVERDUE_BODY = {
-  prefix: "⏰ Quá giờ ",
-  suffix: " · Làm ngay hoặc dời lịch!",
+  prefix: "⏰ Trễ ",
+  /** Đơn vị của khoảng trễ: "1 giờ", "45 phút", "1 giờ 30 phút". */
+  hour: " giờ",
+  minute: " phút",
+  /** Ghép: prefix + khoảng trễ + scheduledPrefix + HH:mm + suffix. */
+  scheduledPrefix: " (hẹn ",
+  suffix: ") · Làm ngay hoặc dời lịch!",
 } as const;
 
 /**

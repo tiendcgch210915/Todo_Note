@@ -309,3 +309,25 @@ test("calendar day detail query requires ISO date", () => {
     false
   );
 });
+
+test("overlapping calendar reads freeze every day once, including empty days and multi-chunk logs", async () => {
+  const date = "2026-06-24";
+  const now = new Date("2026-06-29T12:00:00Z");
+  for (let i = 0; i < 85; i++) {
+    await insertTodo(`past-${i}`, { date, time: i % 2 ? null : "08:00" });
+  }
+  const [overview, detail] = await Promise.all([
+    dashboard.getCalendarOverview(USER_ID, { from: "2026-06-22", to: "2026-06-28" }, now),
+    dashboard.getCalendarDayDetail(USER_ID, { date }, now),
+  ]);
+  assert.equal(overview.days[date].total_todos, 85);
+  assert.equal(detail.timed_todos.length, 43);
+  assert.equal(detail.untimed_todos.length, 42);
+  assert.equal(detail.week.days.find((d) => d.date === date)?.timed_todos, 43);
+
+  await insertTodo("added-after-close", { date: "2026-06-22", time: "12:00" });
+  await turso.execute("UPDATE todos SET time = NULL");
+  const reread = await dashboard.getCalendarDayDetail(USER_ID, { date }, now);
+  assert.deepEqual(reread, detail);
+  assert.equal(reread.week.days[0].total_todos, 0);
+});

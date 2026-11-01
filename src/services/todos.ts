@@ -1,9 +1,20 @@
 import * as todosRepo from "../repositories/todos.js";
 import * as tagsRepo from "../repositories/tags.js";
-import { nextRecurrenceDateAfter } from "../utils/recurrence.js";
+import {
+  firstRuleDateOnOrAfter,
+  nextRecurrenceDateAfter,
+  ruleAllowsDate,
+  type RecurrenceRule,
+} from "../utils/recurrence.js";
+import { addDays, dayDiff } from "../utils/time.js";
 import { autoLogHabitForCompletedTodo } from "./todo-habit-logs.js";
-import { ensurePastTodoDayClosedForMutation } from "./daily-todo-logs.js";
+import {
+  ensurePastTodoDayClosedForMutation,
+  ensureTodoDayClosedForMutation,
+  vietnamToday,
+} from "./daily-todo-logs.js";
 import * as notificationTriggers from "./notification-triggers.js";
+import { pushLogger } from "./push-logger.js";
 import type {
   CreateTodoInput,
   UpdateTodoInput,
@@ -192,6 +203,153 @@ const parkGeneratedNextOccurrence = (
     }
   );
 
+// ── Rule propagation ─────────────────────────────────────────────────────────
+// Every occurrence carries its own copy of the series rule (the next one is built
+// from the todo just completed). Editing the rule on the series root therefore
+// has to be copied to the occurrences that already exist, or the list keeps
+// showing the old rule and completing them keeps generating dates by it.
+
+const RULE_KEYS = [
+  "recurrence_type",
+  "recurrence_interval",
+  "recurrence_days_of_week",
+  "recurrence_end_date",
+] as const;
+
+/** True when a REST patch / sync payload carries any of the four rule fields. */
+export const touchesRecurrenceRule = (patch: object): boolean =>
+  RULE_KEYS.some((key) => hasOwn(patch, key));
+
+/** The root of a series: carries a rule, is top-level and points at no template. */
+export const isSeriesRoot = (todo: todosRepo.TodoRow): boolean =>
+  todo.recurrence_type !== null &&
+  todo.recurrence_template_id === null &&
+  todo.parent_id === null;
+
+const ruleOf = (todo: todosRepo.TodoRow): RecurrenceRule => ({
+  type: todo.recurrence_type,
+  interval: todo.recurrence_interval,
+  daysOfWeek: todo.recurrence_days_of_week,
+  endDate: todo.recurrence_end_date,
+});
+
+const shiftIsoByDays = (iso: string, days: number): string =>
+  new Date(Date.parse(iso) + days * 86_400_000).toISOString();
+
+/**
+ * Where an open occurrence should move when the rule no longer allows its date, or
+ * null to leave it. Only today and later move: an overdue occurrence stays where it
+ * is (moving it would rewrite a closed day), and a parked one is re-dated by the
+ * completion that revives it. Dates already held by another row of the series, live
+ * or deleted, are skipped, like the next-occurrence slot does.
+ */
+const reaimedDate = async (
+  userId: string,
+  seriesId: string,
+  occurrence: todosRepo.TodoRow,
+  rule: RecurrenceRule,
+  today: string
+): Promise<string | null> => {
+  const date = occurrence.scheduled_date;
+  if (occurrence.status === "archived" || !date || date < today) return null;
+  if (ruleAllowsDate(rule, date)) return null;
+
+  let from = addDays(date, 1);
+  for (let attempt = 0; attempt < 60; attempt += 1) {
+    const candidate = firstRuleDateOnOrAfter(rule, from);
+    // Past the end date there is nowhere to go: keep the date rather than drop a task.
+    if (!candidate) return null;
+    const taken = await todosRepo.findRecurringOccurrenceByDate(
+      userId,
+      seriesId,
+      candidate,
+      true
+    );
+    if (!taken) return candidate;
+    from = addDays(candidate, 1);
+  }
+  return null;
+};
+
+/**
+ * Brings the unfinished occurrences of the series rooted at `rootId` in line with the
+ * root's current rule: copies `recurrence_*` and moves an open occurrence whose date
+ * the rule no longer allows to the first date it does. Idempotent (rows that already
+ * match are untouched), so it is safe to run after every root write. Done occurrences
+ * and the root's own date are left alone. Returns the ids it changed.
+ */
+export const propagateRecurrenceRule = (
+  userId: string,
+  rootId: string,
+  now: Date = new Date()
+): Promise<string[]> =>
+  withSeriesLock(userId, rootId, async () => {
+    const root = await todosRepo.getTodoByIdScoped(rootId, userId);
+    if (!root || !isSeriesRoot(root)) return [];
+
+    const rule = ruleOf(root);
+    const today = vietnamToday(now);
+    const changed: string[] = [];
+
+    for (const occurrence of await todosRepo.listUnfinishedSeriesOccurrences(
+      userId,
+      rootId
+    )) {
+      const patch: todosRepo.UpdateTodoPatch = {};
+      if (
+        occurrence.recurrence_type !== root.recurrence_type ||
+        occurrence.recurrence_interval !== root.recurrence_interval ||
+        occurrence.recurrence_days_of_week !== root.recurrence_days_of_week ||
+        occurrence.recurrence_end_date !== root.recurrence_end_date
+      ) {
+        patch.recurrence_type = root.recurrence_type;
+        patch.recurrence_interval = root.recurrence_interval;
+        patch.recurrence_days_of_week = root.recurrence_days_of_week;
+        patch.recurrence_end_date = root.recurrence_end_date;
+      }
+
+      const moveTo = await reaimedDate(userId, rootId, occurrence, rule, today);
+      if (moveTo && occurrence.scheduled_date) {
+        const days = dayDiff(occurrence.scheduled_date, moveTo);
+        patch.scheduled_date = moveTo;
+        if (occurrence.due_at) patch.due_at = shiftIsoByDays(occurrence.due_at, days);
+        if (occurrence.start_at) patch.start_at = shiftIsoByDays(occurrence.start_at, days);
+        if (occurrence.is_frog === 1) patch.frog_date = moveTo;
+      }
+      if (Object.keys(patch).length === 0) continue;
+
+      await ensureTodoDayClosedForMutation(userId, occurrence, now);
+      const row = await todosRepo.updateTodo(occurrence.id, userId, patch);
+      if (!row) continue;
+      changed.push(occurrence.id);
+
+      if (moveTo) {
+        if (occurrence.is_frog === 1) {
+          await todosRepo.setSingleFrogForDay(occurrence.id, userId, moveTo);
+        }
+        // Date moved: re-arm its reminders and drop a card shown for the old date.
+        await notificationTriggers.onTodoChanged(userId, occurrence.id, now);
+      }
+    }
+    return changed;
+  });
+
+/**
+ * `propagateRecurrenceRule` for callers that already saved the root: a failure here
+ * must not turn that successful save into an error. The next write to the root (or
+ * saving the rule again) repeats the work.
+ */
+export const propagateRecurrenceRuleSafely = async (
+  userId: string,
+  rootId: string
+): Promise<void> => {
+  try {
+    await propagateRecurrenceRule(userId, rootId);
+  } catch (error) {
+    pushLogger.error({ err: error, rootId }, "recurrence_rule_propagation_failed");
+  }
+};
+
 const resolveTagIds = async (
   userId: string,
   input: { tag_ids?: string[]; tags?: string[] }
@@ -229,10 +387,10 @@ export const createTodo = async (
   userId: string,
   input: CreateTodoInput
 ): Promise<todosRepo.TodoWithRelations> => {
-  await ensurePastTodoDayClosedForMutation(
-    userId,
-    input.scheduled_date ?? null
-  );
+  await ensureTodoDayClosedForMutation(userId, {
+    scheduled_date: input.scheduled_date ?? null,
+    parent_id: input.parent_id ?? null,
+  });
 
   let todo: todosRepo.TodoRow;
   try {
@@ -342,7 +500,7 @@ export const updateTodo = async (
   try {
     const before = await todosRepo.getTodoByIdScoped(id, userId);
     if (!before) throw new ServiceError("not_found");
-    await ensurePastTodoDayClosedForMutation(userId, before.scheduled_date);
+    await ensureTodoDayClosedForMutation(userId, before);
     if (todoPatch.scheduled_date !== undefined) {
       await ensurePastTodoDayClosedForMutation(
         userId,
@@ -403,6 +561,9 @@ export const updateTodo = async (
     }
     const withTags = await todosRepo.getTodoWithTags(id, userId);
     if (!withTags) throw new ServiceError("not_found");
+    if (touchesRecurrenceRule(todoPatch) && isSeriesRoot(row)) {
+      await propagateRecurrenceRuleSafely(userId, id);
+    }
     await notificationTriggers.onTodoChanged(userId, id);
     return withTags;
   } catch (e) {
@@ -418,7 +579,7 @@ export const deleteTodo = async (
 ): Promise<void> => {
   const source = await todosRepo.getTodoByIdScoped(id, userId);
   if (!source) throw new ServiceError("not_found");
-  await ensurePastTodoDayClosedForMutation(userId, source.scheduled_date);
+  await ensureTodoDayClosedForMutation(userId, source);
 
   try {
     const result = await todosRepo.softDeleteTodoByScope(
@@ -453,7 +614,7 @@ export const completeTodo = async (
 }> => {
   const before = await todosRepo.getTodoByIdScoped(id, userId);
   if (!before) throw new ServiceError("not_found");
-  await ensurePastTodoDayClosedForMutation(userId, before.scheduled_date);
+  await ensureTodoDayClosedForMutation(userId, before);
 
   const result = await todosRepo.completeTodo(id, userId, body.actual_minutes);
   if (!result) throw new ServiceError("not_found");
@@ -476,7 +637,7 @@ export const uncompleteTodo = async (
 ): Promise<todosRepo.TodoRow> => {
   const before = await todosRepo.getTodoByIdScoped(id, userId);
   if (!before) throw new ServiceError("not_found");
-  await ensurePastTodoDayClosedForMutation(userId, before.scheduled_date);
+  await ensureTodoDayClosedForMutation(userId, before);
 
   const todo = await todosRepo.uncompleteTodo(id, userId);
   if (!todo) throw new ServiceError("not_found");
@@ -535,7 +696,7 @@ export const moveToDay = async (
   try {
     const before = await todosRepo.getTodoByIdScoped(id, userId);
     if (!before) throw new ServiceError("not_found");
-    await ensurePastTodoDayClosedForMutation(userId, before.scheduled_date);
+    await ensureTodoDayClosedForMutation(userId, before);
     await ensurePastTodoDayClosedForMutation(userId, body.date);
 
     const patch: todosRepo.UpdateTodoPatch = {

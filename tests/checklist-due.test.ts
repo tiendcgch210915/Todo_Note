@@ -364,10 +364,11 @@ test("the push goes to EVERY device with the checklist's own title and the step 
   const [message] = messages;
   assert.equal(message.notification?.title, "Rời nhà");
   assert.equal(message.notification?.body, "Đến giờ thực hiện · 3 bước");
-  assert.deepEqual(message.data, { type: "checklist_due", id: TPL, date: "2026-06-20" });
+  assert.deepEqual(message.data, { type: "checklist_due", id: TPL, date: "2026-06-20", tag: `checklist:${TPL}` });
   assert.equal(message.android?.priority, "high");
   assert.equal(message.android?.ttl, 3_600_000);
   assert.equal(message.android?.notification?.channelId, "checklist_reminders");
+  assert.equal(message.android?.notification?.tag, `checklist:${TPL}`);
   for (const value of Object.values(message.data ?? {})) assert.equal(typeof value, "string");
 });
 

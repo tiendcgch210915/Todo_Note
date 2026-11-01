@@ -645,6 +645,26 @@ export const findOpenSuccessor = async (
   return mapRow(res.rows[0] as unknown as Record<string, unknown>);
 };
 
+/**
+ * Occurrences of a series (every live top-level row that carries a rule, except the
+ * root itself) that are not finished: open / in progress, plus parked (archived) ones
+ * that a later completion may revive. Done occurrences are history and are left out.
+ */
+export const listUnfinishedSeriesOccurrences = async (
+  userId: string,
+  rootId: string
+): Promise<TodoRow[]> => {
+  const res = await turso.execute({
+    sql: `SELECT ${TODO_COLUMNS} FROM todos
+          WHERE ${SERIES_OCCURRENCE_SQL}
+            AND id <> ?
+            AND status IN ('open', 'in_progress', 'archived')
+          ORDER BY scheduled_date ASC, created_at ASC, id ASC`,
+    args: [userId, rootId, rootId],
+  });
+  return res.rows.map((row) => mapRow(row as unknown as Record<string, unknown>));
+};
+
 /** Park an open occurrence: hidden everywhere, but kept so it can be revived. */
 export const parkRecurringOccurrence = async (
   id: string,

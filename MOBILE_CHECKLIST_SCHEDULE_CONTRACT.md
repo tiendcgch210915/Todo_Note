@@ -308,7 +308,7 @@ Rules:
 - Android channel id: `checklist_reminders` (the app must create it; the "still running" nudges below use it too).
 - `notification.title`: the checklist title (newlines removed, whitespace collapsed, at most 60 characters including a trailing `…`).
 - `notification.body`: `Đến giờ thực hiện · {n} bước`, or only `Đến giờ thực hiện` when the checklist has no steps.
-- `data` (all strings): `{ "type": "checklist_due", "id": "<checklist id>", "date": "YYYY-MM-DD" }`. Open the checklist `id` and start a run.
+- `data` (all strings): `{ "type": "checklist_due", "id": "<checklist id>", "date": "YYYY-MM-DD", "tag": "checklist:<checklist id>" }`. Open the checklist `id` and start a run. `tag` is explained in "Notification tags" below.
 
 A checklist is reminded **once**, at its time. There is no repeated "overdue" nudge: the old `checklist_overdue` (every 2 hours after the time while not done) was removed, so being late or leaving it undone never triggers another push. A repeating schedule still reminds once on each of its days; a non-repeating one reminds exactly once. (A run the user has started and left unfinished is a different case and is still nudged, see `checklist_running` below.)
 
@@ -328,9 +328,9 @@ Replaces the single 30-minute nudge. While a run is `in_progress` the server nud
 - `notification.body`, one short line (`n` = steps not ticked yet):
   - hourly: `⏳ Đã làm {h} giờ · còn {n} bước chưa tick` (`h` = hours since the start: 1, 2, 3, ...);
   - next morning: `🌅 Hôm qua chưa xong · còn {n} bước chưa tick`.
-- `data` (all strings), unchanged from the old nudge: `{ "type": "checklist", "id": "<run id>", "date": "YYYY-MM-DD" }`, where `date` is the local day the run was started. Open the run `id`; for the 06:00 reminder that run was started the day before.
+- `data` (all strings): `{ "type": "checklist", "id": "<run id>", "date": "YYYY-MM-DD", "tag": "checklist:<checklist id>" }`, where `date` is the local day the run was started. Open the run `id`; for the 06:00 reminder that run was started the day before. The `tag` is keyed by the **checklist** (not the run), so the nudge replaces the `checklist_due` notification of the same checklist.
 
-No app change is required: the type, the id and the channel are the same as before.
+The type, the id and the channel are the same as before; `tag` is the only addition (see "Notification tags").
 
 Other copy changed in the same release:
 
@@ -345,7 +345,47 @@ Other copy changed in the same release:
 | false | false | `Việc nhẹ → Làm gọn rồi tiếp tục nhé.` |
 | null or unset (either one) | | `Đến giờ thực hiện` |
 
-- Digests keep their titles. Morning: `📋 Nhiệm vụ: ...` / blank line / `💪 Động lực: “...”` / `💡 Suy ngẫm: ...`. Todos: `📋 Tiến độ: ...` plus an optional `💪 ...` line. Habits: `📋 Thói quen: ...` plus an optional `💪 ...` line. All labels live in `src/config/notification-labels.ts`.
+- Digests keep their titles, but the first body line is now a short numbers line (the collapsed notification only shows the first ~45 characters). Morning: `📋 Hôm nay: 5 todo (xong 2, còn 3) · 3 thói quen` / blank line / `💪 Động lực: “...”` / `💡 Suy ngẫm: ...` (a zero part is left out). Todos: `📋 Xong 2/5 todo · còn 3 đang chờ` (or `📋 Xong cả 5 todo hôm nay`) plus an optional `💪 ...` line. Habits: `📋 Đã duy trì 1/3 thói quen` (or `📋 Đã duy trì đủ 3/3 thói quen`) plus an optional `💪 ...` line. All labels live in `src/config/notification-labels.ts`.
+- `todo_overdue` (the repeated nudge after the appointment time) now says how late the todo is, because it replaces the previous nudge: `⏰ Trễ 2 giờ (hẹn 10:00) · Làm ngay hoặc dời lịch!` (it used to be `⏰ Quá giờ 10:00 · ...`).
+
+## Notification tags (one card per task)
+
+Every push the job system sends carries a **tag** twice: as `android.notification.tag` and as `data.tag`. Android replaces a notification that has the same tag as one already in the tray, so a user who was away comes back to one up-to-date card per topic instead of a pile of repeats.
+
+| Tag | Used by | Effect |
+| --- | --- | --- |
+| `todo:<todo id>` | `todo_reminder`, `todo_overdue`, `todo_timer_end` | The 10:00 reminder, then the 11:00, 12:00 ... "Trễ N giờ" nudges, then a countdown end all share one card. For an occurrence of a recurring todo the id is the **series root** (`recurrence_template_id`), so today's reminder replaces yesterday's leftover card; `data.id` is still the occurrence to open. |
+| `checklist:<checklist id>` | `checklist_due`, `checklist_running` | "Đến giờ thực hiện" is replaced by "Đã làm 1 giờ", "Đã làm 2 giờ" ... Keyed by the checklist, **not** the run id (`data.id` is still the run id for `checklist`). |
+| `digest:day` | `digest_morning`, `digest_todos`, `digest_habits`, `digest_review` | At most one daily summary on the tray; each one replaces the previous (yesterday's review is gone when this morning's arrives). |
+| `digest:overdue` | the two overdue-important summaries (17:00 and 07:00 next morning) | The morning one replaces the evening one. |
+
+What the app has to do:
+
+- **Background / app closed:** nothing. The system shows the notification and applies `android.notification.tag` by itself.
+- **Foreground:** FCM does not show anything while the app is open; if the app displays its own local notification, give it **`data.tag` as its tag** (and a fixed id, for example 0) so it replaces in the same way. Old servers sent no `tag`: fall back to the current behaviour when `data.tag` is missing.
+- **Clearing:** the server cannot delete a notification already on the device, and replacing is the only thing it does. A card therefore stays until it is replaced or swiped away, even if the todo was completed meanwhile. To tidy that up, cancel by tag when the app opens or syncs and sees the task is done or deleted. Expected to work with `NotificationManager.cancel(tag, 0)` (the FCM SDK posts with id 0) or `flutter_local_notifications` `cancel(0, tag: ...)`; confirm on a real device, the server side of this has not been exercised against one.
+- `tag` is a plain string, at most 128 characters; treat it as opaque.
+
+### Removing a card when the todo's time or date changes (`type: "dismiss"`)
+
+When the user changes the **reminder time or date** of a todo (REST, sync push or admin), the notification that was already delivered for the old time must disappear, and only the repeats for the *new* time remain. The server cannot delete a notification that is already on the phone, so it sends a **data-only** FCM message (no `notification` block: the system shows nothing and your handler runs):
+
+```json
+{ "type": "dismiss", "id": "<todo id>", "tag": "todo:<todo id or series root id>", "before": "2026-06-20T03:00:30.000Z" }
+```
+
+(all strings; `android.priority = high`, `ttl` 3 minutes.) **The app must handle it, otherwise nothing is removed:**
+
+- In the FCM background/foreground handler, when `data.type == "dismiss"`: cancel the notification whose tag is `data.tag` (see "Clearing" above for the calls), show **nothing**, and do not navigate. Unknown or missing `tag` -> ignore.
+- If the platform lets you read when a notification was posted (`StatusBarNotification.getPostTime()`), cancel only notifications posted **at or before** `data.before`. The server already avoids sending a dismiss when a new notification with the same tag is due within 4 minutes, so this is a second safety net, not a requirement.
+- Make sure your background handler does **not** turn a data-only message into a visible notification; older handlers that build a notification from `data.title` / `data.body` must skip `dismiss`.
+
+What the server guarantees / does not:
+
+- Sent once per stale card, to every device of the user, after the new reminder / repeat jobs have been re-armed. The repeats follow the new time, e.g. at 10:00 an important+urgent todo moved from 10:00 to 09:10 loses its card now and still gets its next repeat at 10:10.
+- Not sent for edits that keep the date and time (title, importance, estimate...), for completed / archived / deleted todos, or for cards sent before server migration `0026`.
+- If the next notification of that todo is due within 4 minutes (e.g. moved to 09:03 at 10:00 -> repeat at 10:03) no dismiss is sent: that notification has the same tag and replaces the old card by itself.
+- Best effort. It is a high-priority data message, so Doze / aggressive battery savers / a force-stopped app can delay or drop it, and a phone that stays offline longer than 3 minutes misses it (the card then stays until replaced or swiped away).
 
 ## Verification
 
@@ -354,5 +394,6 @@ Other copy changed in the same release:
 - Migration `0017_checklist_schedules.sql` creates `checklist_schedules`, `checklist_schedule_overrides` and rebuilds `notification_jobs` so its `kind` CHECK accepts `checklist_due`. Apply it with `npm run db:migrate` **before** deploying the code, because the new code inserts the new kind.
 - Manual send: `npm run notify:job-test -- <userId> checklist_due` (then `--cleanup`).
 - Day marks and start-day rule: migration `0023_checklist_occurrence_marks.sql` creates `checklist_occurrence_marks` and indexes `checklist_runs` by `started_at` (dropping the unused `completed_at` index). Apply it with `npm run db:migrate` **before** deploying the code: the sync pull selects the new table, so an unmigrated database fails every pull. Covered by `tests/checklist-occurrence-marks.test.ts` (rule, REST, sync, reminders, habits) and `tests/migration-0023.test.ts`.
+- Card removal on reschedule: migration `0026_notification_card_key.sql` adds the nullable column `notification_jobs.card_key` (the schedule a delivered reminder / repeat was sent for). Apply it with `npm run db:migrate` **before** deploying the code: the tick writes the column when it marks a job sent. Covered by `tests/notification-dismiss.test.ts`.
 - Removed overdue nudge: migration `0024_cancel_checklist_overdue.sql` cancels the pending `checklist_overdue` jobs (history is kept and the kind stays allowed in the table). It is a data cleanup only: even if it has not run yet, the server cancels any leftover `checklist_overdue` job when it comes due instead of sending it. Tests: `tests/overdue-nudges.test.ts` (checklist section), `tests/checklist-due.test.ts`, `tests/migration-0024.test.ts`.
 - Pause: migration `0021_checklist_schedule_pause.sql` adds the two nullable columns `paused_from` / `paused_until` (existing rows = not paused). Apply it with `npm run db:migrate` **before** deploying the code, because the code selects and writes them. Covered by the `pause` tests in `tests/checklist-schedule.test.ts` (expansion), `tests/checklist-schedule-api.test.ts` (REST, sync, jobs) and `tests/checklist-due.test.ts` (planner, overdue nudges, re-validation before sending).

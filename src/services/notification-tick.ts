@@ -20,6 +20,7 @@ import {
   NOTIFICATION_KINDS,
   OVERDUE_DIGEST,
   TTL_MS,
+  notificationTag,
   type NotificationJobKind,
 } from "../config/notification-policy.js";
 import * as dashboardRepo from "../repositories/dashboard.js";
@@ -32,6 +33,7 @@ import * as todosRepo from "../repositories/todos.js";
 import { addDays, localDateOf, localDateTimeToUtc } from "../utils/time.js";
 import { isPushConfigured, pushLogger, type PushLogger } from "./firebase.js";
 import { checkDueForSend } from "./checklist-due.js";
+import { todoCardKey, todoTag } from "./notification-cards.js";
 import { backfillChecklistRunNudges, findRunNudge } from "./checklist-run-nudges.js";
 import { expireChecklistSchedules } from "./checklist-schedule-expiry.js";
 import {
@@ -104,11 +106,25 @@ type Prepared =
       id: string;
       /** data.date */
       date: string;
+      /** Thẻ thay-thế-trong-khay (xem `notificationTag`): thông báo cùng thẻ chỉ còn bản mới nhất. */
+      tag: string;
+      /**
+       * Khóa lịch (ngày + giờ hẹn) của todo lúc gửi, ghi vào job để sau này gỡ thông báo nếu lịch đổi
+       * (xem `todoCardKey`). Chỉ nhắc đúng giờ và nhắc lặp có.
+       */
+      cardKey?: string;
       /** Chạy sau khi gửi thành công. */
       afterSent?: () => Promise<void>;
     };
 
 const CANCEL: Prepared = { cancel: true };
+
+/** Tổng kết gắn với một ngày (data.id = data.date = ngày) và dùng thẻ chung của nhóm tổng kết. */
+const digestPrepared = (
+  kind: NotificationJobKind,
+  text: NotificationText,
+  date: string
+): Prepared => ({ text, id: date, date, tag: notificationTag(kind, date) });
 
 const isLive = (status: string): boolean =>
   status === "open" || status === "in_progress";
@@ -164,6 +180,8 @@ const prepare = async (job: jobsRepo.JobRow): Promise<Prepared> => {
         text: buildTodoReminder(todo.title, todo.is_important, todo.is_urgent),
         id: todo.id,
         date,
+        tag: todoTag(job.kind, todo),
+        cardKey: todoCardKey(todo) ?? undefined,
       };
     }
 
@@ -192,6 +210,7 @@ const prepare = async (job: jobsRepo.JobRow): Promise<Prepared> => {
         text: buildTimerEnd(todo.title, timer.estimated_seconds),
         id: todo.id,
         date,
+        tag: todoTag(job.kind, todo),
         afterSent: () => timersRepo.markTimerFinished(todo.id, endsAt),
       };
     }
@@ -215,7 +234,10 @@ const prepare = async (job: jobsRepo.JobRow): Promise<Prepared> => {
         nudge.kind === "hourly"
           ? buildChecklistRunning(title, run.pending_steps, nudge.hours)
           : buildChecklistCarryover(title, run.pending_steps);
-      return text ? { text, id: run.id, date } : CANCEL;
+      // Thẻ theo CHECKLIST (không theo run): nhắc "đã làm 2 giờ" thay luôn thông báo "đến giờ" của nó.
+      return text
+        ? { text, id: run.id, date, tag: notificationTag(job.kind, run.template_id) }
+        : CANCEL;
     }
 
     case "checklist_due": {
@@ -233,6 +255,7 @@ const prepare = async (job: jobsRepo.JobRow): Promise<Prepared> => {
         text: buildChecklistDue(due.template.title, due.stepCount),
         id: due.template.id,
         date: job.local_date,
+        tag: notificationTag(job.kind, due.template.id),
       };
     }
 
@@ -252,10 +275,14 @@ const prepare = async (job: jobsRepo.JobRow): Promise<Prepared> => {
       // Đang bấm giờ làm chính todo này thì không phải "bỏ lỡ": bỏ mốc này, các mốc sau tự xét lại.
       const timer = await timersRepo.getTimer(todo.id);
       if (timer && timer.user_id === job.user_id && timer.status === "running") return CANCEL;
+      // Thông báo cũ của todo bị thay nên bản này phải tự nói được "đã trễ bao lâu".
+      const lateMinutes = Math.round((runAtMs - scheduledAt.getTime()) / 60_000);
       return {
-        text: buildTodoOverdue(todo.title, todo.time),
+        text: buildTodoOverdue(todo.title, todo.time, lateMinutes),
         id: todo.id,
         date: job.local_date,
+        tag: todoTag(job.kind, todo),
+        cardKey: todoCardKey(todo) ?? undefined,
       };
     }
 
@@ -266,17 +293,17 @@ const prepare = async (job: jobsRepo.JobRow): Promise<Prepared> => {
 
     case "digest_morning": {
       const stats = await digestStats(job.user_id, date);
-      return { text: buildMorningDigest(stats, date), id: date, date };
+      return digestPrepared(job.kind, buildMorningDigest(stats, date), date);
     }
 
     case "digest_todos": {
       const text = buildTodosDigest(await digestStats(job.user_id, date));
-      return text ? { text, id: date, date } : CANCEL;
+      return text ? digestPrepared(job.kind, text, date) : CANCEL;
     }
 
     case "digest_habits": {
       const text = buildHabitsDigest(await digestStats(job.user_id, date));
-      return text ? { text, id: date, date } : CANCEL;
+      return text ? digestPrepared(job.kind, text, date) : CANCEL;
     }
 
     case "digest_overdue_evening": {
@@ -287,7 +314,7 @@ const prepare = async (job: jobsRepo.JobRow): Promise<Prepared> => {
         OVERDUE_DIGEST.eveningTime
       );
       const text = buildOverdueEveningDigest(count);
-      return text ? { text, id: date, date } : CANCEL;
+      return text ? digestPrepared(job.kind, text, date) : CANCEL;
     }
 
     case "digest_overdue_morning": {
@@ -298,13 +325,13 @@ const prepare = async (job: jobsRepo.JobRow): Promise<Prepared> => {
         null
       );
       const text = buildOverdueMorningDigest(count);
-      return text ? { text, id: date, date } : CANCEL;
+      return text ? digestPrepared(job.kind, text, date) : CANCEL;
     }
 
     case "digest_review": {
       // Luôn gửi: đây là lời nhắc rà soát + lên kế hoạch, kể cả khi hôm nay trống.
       const stats = await digestStats(job.user_id, date);
-      return { text: buildReviewDigest(stats), id: date, date };
+      return digestPrepared(job.kind, buildReviewDigest(stats), date);
     }
   }
 };
@@ -390,6 +417,7 @@ const processClaimed = async (
         // Có đích thì CHỈ gửi thiết bị đó; không có cơ chế quay về gửi tất cả.
         targetDeviceId: claimed.target_device_id,
         channelId: CHANNEL_ID[claimed.kind],
+        tag: prepared.tag,
         ttlMs: TTL_MS[claimed.kind],
       }
     );
@@ -397,7 +425,8 @@ const processClaimed = async (
     const fcmMs = Math.round(performance.now() - fcmStartedAt);
     if (result.sent > 0) {
       const sentAt = new Date().toISOString();
-      await jobsRepo.markSent(claimed.id, claimed.run_at, sentAt);
+      // Chỉ lần gửi thật mới ghi khóa lịch: chạy thử (NOTIFY_DRY_RUN) không để lại thông báo nào trên máy.
+      await jobsRepo.markSent(claimed.id, claimed.run_at, sentAt, prepared.cardKey ?? null);
       logSent(options.logger, claimed, sentAt, fcmMs);
       await prepared.afterSent?.();
       return "sent";

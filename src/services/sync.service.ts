@@ -8,7 +8,8 @@
  *  - Junction reconcile (§5.4)
  *  - Tag natural-key conflict (§3.3)
  *  - Habit-log natural-key conflict (§3.5)
- *  - Recurring-occurrence (series, date) natural-key conflict (§3.6)
+ *  - Recurring-occurrence (series, date) natural-key conflict (§3.6), and copying a
+ *    series root's rule to its unfinished occurrences once the batch is applied
  *  - System-template protection (§8 read_only)
  *  - Soft-delete cascade (§6)
  */
@@ -27,7 +28,10 @@ import {
   autoLogHabitsForMarkedDaySafely,
 } from "./checklist-habit-logs.js";
 import * as runsRepo from "../repositories/checklist-runs.js";
-import { ensurePastTodoDayClosedForMutation } from "./daily-todo-logs.js";
+import {
+  ensurePastTodoDayClosedForMutation,
+  ensureTodoDayClosedForMutation,
+} from "./daily-todo-logs.js";
 import * as notificationTriggers from "./notification-triggers.js";
 import * as schedulesRepo from "../repositories/checklist-schedules.js";
 import {
@@ -160,8 +164,16 @@ export const processPush = async (
   // the same batch; inserting it would break the parent_id foreign key and fail
   // the whole request, so those operations are skipped instead.
   const refused = new Set<string>();
+  // Series roots whose rule was written by this batch (§3.6 rule propagation).
+  const writtenRoots = new Set<string>();
   for (const op of ops) {
-    results.push(await processOp(userId, op, refused));
+    results.push(await processOp(userId, op, refused, writtenRoots));
+  }
+  // After the whole batch, not per op: the propagation stamps the occurrences it
+  // touches with the server clock, which would beat (LWW) an op later in the same
+  // batch that edits one of them, e.g. a completion made offline after the rule edit.
+  for (const rootId of writtenRoots) {
+    await todosService.propagateRecurrenceRuleSafely(userId, rootId);
   }
   return results;
 };
@@ -171,7 +183,8 @@ export const processPush = async (
 async function processOp(
   userId: string,
   op: SyncOp,
-  refused: Set<string>
+  refused: Set<string>,
+  writtenRoots: Set<string>
 ): Promise<OpResult> {
   const { op: opType, type, payload } = op;
 
@@ -446,15 +459,21 @@ async function processOp(
   let frogUpdatedAt: string | undefined;
 
   if (type === "todo" && opType !== "delete") {
-    await ensurePastTodoDayClosedForMutation(
-      userId,
-      beforeTodo?.scheduled_date
-    );
+    await ensureTodoDayClosedForMutation(userId, {
+      scheduled_date: beforeTodo?.scheduled_date,
+      parent_id: beforeTodo?.parent_id,
+    });
     if (hasOwn(dbPayload, "scheduled_date")) {
       await ensurePastTodoDayClosedForMutation(
         userId,
         (dbPayload.scheduled_date as string | null) ?? null
       );
+    }
+    if (hasOwn(dbPayload, "parent_id")) {
+      await ensureTodoDayClosedForMutation(userId, {
+        scheduled_date: null,
+        parent_id: (dbPayload.parent_id as string | null) ?? null,
+      });
     }
 
     const finalParentId = hasOwn(dbPayload, "parent_id")
@@ -564,6 +583,13 @@ async function processOp(
       const afterTodo = await todosRepo.getTodoByIdScoped(id, userId);
       if (afterTodo?.status === "done" && beforeTodo?.status !== "done") {
         await autoLogHabitForCompletedTodo(userId, afterTodo);
+      }
+      if (
+        afterTodo &&
+        todosService.touchesRecurrenceRule(dbPayload) &&
+        todosService.isSeriesRoot(afterTodo)
+      ) {
+        writtenRoots.add(id);
       }
       // Create / update / complete / reschedule / un-set reminder time: re-arm or cancel.
       await notificationTriggers.onTodoChanged(userId, id);

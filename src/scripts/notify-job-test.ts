@@ -4,7 +4,7 @@
  *   npm run notify:job-test -- <userId>                         # mọi loại (todo_timer_end cần --device)
  *   npm run notify:job-test -- <userId> digest_morning
  *   npm run notify:job-test -- <userId> checklist_due           # checklist có lịch hôm nay, đúng giờ chạy
- *   npm run notify:job-test -- <userId> todo_overdue            # nhắc lặp "Quá giờ" của một todo trễ 2 giờ
+ *   npm run notify:job-test -- <userId> todo_overdue            # nhắc lặp "Trễ 2 giờ (hẹn ...)" của một todo trễ 2 giờ
  *   npm run notify:job-test -- <userId> checklist_running       # nhắc "đã làm 1 giờ" của một checklist đang chạy
  *   npm run notify:job-test -- <userId> digest_review           # thông báo rà soát cuối ngày
  *   npm run notify:job-test -- <userId> digest_overdue_evening  # "⏰ x todo quan trọng quá hạn" (tổng kết 17:00)
@@ -367,7 +367,7 @@ const main = async (): Promise<number> => {
         const scheduledTime = localHhmm(scheduledAt, settings.timezone);
         const id = await insertTestTodo(userId, "Nhắc lặp", today, scheduledTime, true);
         await jobsRepo.upsertSlotJob({ userId, kind, refId: id, localDate: today, runAt });
-        console.log(`✓ ${kind}: todo thử quan trọng hẹn ${scheduledTime}, nhắc "Quá giờ" lúc ${time}.`);
+        console.log(`✓ ${kind}: todo thử quan trọng hẹn ${scheduledTime}, nhắc "Trễ" lúc ${time}.`);
         break;
       }
       default: {

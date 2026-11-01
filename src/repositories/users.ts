@@ -51,18 +51,15 @@ export const listUsers = async (params: {
 
   const whereSql = where.length ? `WHERE ${where.join(" AND ")}` : "";
 
-  const totalRes = await turso.execute({
-    sql: `SELECT COUNT(*) AS c FROM users ${whereSql}`,
-    args,
-  });
-  const total = Number((totalRes.rows[0] as Record<string, unknown>).c);
-
   const offset = (page - 1) * pageSize;
-  const listRes = await turso.execute({
-    sql: `SELECT * FROM users ${whereSql} ORDER BY created_at DESC LIMIT ? OFFSET ?`,
-    args: [...args, pageSize, offset],
-  });
-
+  const [totalRes, listRes] = await turso.batch([
+    { sql: `SELECT COUNT(*) AS c FROM users ${whereSql}`, args },
+    {
+      sql: `SELECT * FROM users ${whereSql} ORDER BY created_at DESC LIMIT ? OFFSET ?`,
+      args: [...args, pageSize, offset],
+    },
+  ], "read");
+  const total = Number(totalRes.rows[0].c);
   const rows = (listRes.rows as unknown as Record<string, unknown>[]).map(mapRow);
   return { rows, total };
 };

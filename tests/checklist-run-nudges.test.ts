@@ -264,8 +264,9 @@ test("every hour after the start, until the checklist is completed", async () =>
     assert.equal(runningMessages().length, hours, `${hhmm}`);
     assert.equal(last?.notification?.title, "Rời nhà");
     assert.equal(last?.notification?.body, `⏳ Đã làm ${hours} giờ · còn 3 bước chưa tick`);
-    assert.deepEqual({ ...last?.data }, { type: "checklist", id: "run-1", date: DATE });
+    assert.deepEqual({ ...last?.data }, { type: "checklist", id: "run-1", date: DATE, tag: `checklist:${TPL}` });
     assert.equal(last?.android?.notification?.channelId, "checklist_reminders");
+    assert.equal(last?.android?.notification?.tag, `checklist:${TPL}`, "keyed by the checklist, not the run");
   }
 
   // The user ticks the checklist as completed at 15:30 -> no more nudges.
@@ -293,7 +294,12 @@ test("the next day it only sends one 06:00 reminder about yesterday, then stops"
   assert.equal(bodies[0], "⏳ Đã làm 1 giờ · còn 2 bước chưa tick");
   assert.equal(bodies[10], "⏳ Đã làm 11 giờ · còn 2 bước chưa tick");
   assert.equal(bodies[11], "🌅 Hôm qua chưa xong · còn 2 bước chưa tick");
-  assert.deepEqual({ ...runningMessages()[11].data }, { type: "checklist", id: "run-1", date: DATE });
+  assert.deepEqual({ ...runningMessages()[11].data }, { type: "checklist", id: "run-1", date: DATE, tag: `checklist:${TPL}` });
+  assert.equal(
+    new Set(runningMessages().map((m) => m.android?.notification?.tag)).size,
+    1,
+    "all 12 nudges share one tag, so the tray ends up with a single card for the run"
+  );
 
   // Nothing is armed after the morning reminder: no hourly nudges on the new day, no repeat.
   assert.deepEqual(await runAtsWith("pending", "run-1"), []);

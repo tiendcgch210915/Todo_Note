@@ -21,6 +21,7 @@ import * as settingsRepo from "../repositories/notification-settings.js";
 import { addDays, localDateOf, localDateTimeToUtc } from "../utils/time.js";
 import { dayBoundsUtc, doneDatesOf, loadDoneDates } from "./checklist-occurrence-done.js";
 import {
+  indexRowsByChecklist,
   occurrencesBetween,
   toScheduleRule,
   type ScheduleOverride,
@@ -174,18 +175,17 @@ export const planChecklistDueForUsers = async (
     existing.map((job) => [`${job.user_id}|${job.ref_id}|${job.local_date}`, job])
   );
 
+  const overridesFor = indexRowsByChecklist(overrideRows);
+  const runsFor = indexRowsByChecklist(runs);
+  const marksFor = indexRowsByChecklist(marks);
   let written = 0;
   for (const schedule of schedules) {
     const frame = frames.get(schedule.user_id) as Frame;
-    const overrides = toOverrides(
-      overrideRows.filter(
-        (row) => row.user_id === schedule.user_id && row.template_id === schedule.template_id
-      )
-    );
+    const overrides = toOverrides(overridesFor(schedule));
     const done = doneDatesOf(
       { userId: schedule.user_id, templateId: schedule.template_id },
-      runs,
-      marks,
+      runsFor(schedule),
+      marksFor(schedule),
       frame.timezone
     );
     const open = dueSlotsFor(

@@ -240,7 +240,66 @@ test("notifyUser targets fid devices with `fid` and token devices with `token`, 
     assert.deepEqual(message.data, { type: "test", id: "abc-123", extra: "1" });
     assert.equal(message.android?.priority, "high");
     assert.equal(message.android?.notification?.channelId, "general_notifications");
+    assert.equal("tag" in (message.android?.notification ?? {}), false, "no tag unless asked for");
   }
+});
+
+test("a tag is sent as android.notification.tag and mirrored into data.tag, nothing else changes", async () => {
+  await register(USER_ID, "dev-a", "fid");
+  await register(USER_ID, "dev-b", "token");
+  const { client, batches } = fakeClient();
+  firebase.setMessagingClientForTests(client);
+
+  const result = await notifications.notifyUser(USER_ID, input, {
+    tag: "todo:abc-123",
+    channelId: "todo_reminders",
+    ttlMs: 3_600_000,
+  });
+
+  assert.deepEqual(result, { devices: 2, sent: 2, failed: 0, removed: 0 });
+  assert.equal(batches[0].length, 2);
+  for (const message of batches[0]) {
+    assert.equal(message.android?.notification?.tag, "todo:abc-123");
+    assert.equal(message.android?.notification?.channelId, "todo_reminders");
+    assert.equal(message.android?.ttl, 3_600_000);
+    assert.equal(message.android?.priority, "high");
+    assert.deepEqual(message.data, { type: "test", id: "abc-123", extra: "1", tag: "todo:abc-123" });
+    assert.deepEqual(message.notification, { title: "Xin chào", body: "Nội dung" });
+  }
+  assert.deepEqual(input.data, { type: "test", id: "abc-123", extra: "1" }, "the caller's data object is not mutated");
+});
+
+test("the tag option wins over a data.tag the caller passed, so both places always agree", async () => {
+  await register(USER_ID, "dev");
+  const { client, batches } = fakeClient();
+  firebase.setMessagingClientForTests(client);
+
+  await notifications.notifyUser(
+    USER_ID,
+    { ...input, data: { type: "t", id: "1", tag: "stale" } },
+    { tag: "checklist:xyz" }
+  );
+
+  assert.equal(batches[0][0].android?.notification?.tag, "checklist:xyz");
+  assert.equal(batches[0][0].data?.tag, "checklist:xyz");
+});
+
+test("an invalid tag is rejected before sending and deletes nothing", async () => {
+  await register(USER_ID, "dev");
+  const { client, batches } = fakeClient();
+  firebase.setMessagingClientForTests(client);
+
+  for (const tag of ["", "   ", "x".repeat(129), 7 as unknown as string]) {
+    const result = await notifications.notifyUser(USER_ID, input, { tag });
+    assert.ok(result.error, `expected an error for tag ${JSON.stringify(tag)}`);
+    assert.equal(result.sent, 0);
+  }
+  assert.equal(batches.length, 0);
+  assert.deepEqual(await registered(USER_ID), ["dev"]);
+
+  // The longest accepted tag still goes out.
+  const ok = await notifications.notifyUser(USER_ID, input, { tag: "x".repeat(128) });
+  assert.equal(ok.sent, 1);
 });
 
 test("notifyUser sends in batches of at most 500 messages", async () => {

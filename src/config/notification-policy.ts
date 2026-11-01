@@ -166,6 +166,74 @@ export const DATA_TYPE: Record<NotificationJobKind, string> = {
   digest_overdue_morning: "digest_todos",
 };
 
+/** Một tổng kết "hôm nay" duy nhất trên khay: sáng, todo, thói quen và rà soát thay thế lẫn nhau. */
+export const DAY_DIGEST_TAG = "digest:day";
+/** Một tổng kết todo quan trọng quá hạn duy nhất trên khay: bản 07:00 sáng hôm sau thay bản 17:00. */
+export const OVERDUE_DIGEST_TAG = "digest:overdue";
+
+/**
+ * THẺ (`android.notification.tag`) của thông báo: Android thay thông báo CŨ cùng thẻ đang nằm trong
+ * khay bằng thông báo mới, nên mỗi "chủ đề" chỉ chiếm MỘT chỗ và luôn là trạng thái mới nhất. Nhờ vậy
+ * người dùng vắng mặt cả buổi quay lại không gặp một dãy nhắc lặp của cùng một việc.
+ *
+ *  - todo (nhắc đúng giờ, nhắc lặp, hết giờ đếm ngược): `todo:<id todo>`; todo thuộc chuỗi lặp thì dùng id
+ *    GỐC của chuỗi (`recurrence_template_id`), để lần xuất hiện hôm nay thay thông báo còn sót của hôm qua;
+ *  - checklist (nhắc theo lịch và nhắc đang làm dở): `checklist:<id CHECKLIST (mẫu)>`, KHÔNG phải id run,
+ *    để nhắc "đã làm 2 giờ" thay luôn thông báo "đến giờ" của cùng checklist;
+ *  - tổng kết: xem `DAY_DIGEST_TAG` / `OVERDUE_DIGEST_TAG`.
+ *
+ * `subjectId` là id todo (hoặc id gốc chuỗi lặp) hay id checklist (mẫu) tùy loại; tổng kết bỏ qua nó.
+ * Thẻ cũng được gửi kèm trong `data.tag` để app dùng đúng thẻ ấy khi tự hiện thông báo lúc đang mở.
+ * Đổi gom nhóm ở đây là đủ: `switch` cố ý liệt kê hết các loại để thêm loại mới mà quên thẻ sẽ lỗi
+ * biên dịch.
+ */
+export const notificationTag = (
+  kind: NotificationJobKind,
+  subjectId: string
+): string => {
+  switch (kind) {
+    case "todo_reminder":
+    case "todo_overdue":
+    case "todo_timer_end":
+      return `todo:${subjectId}`;
+    case "checklist_due":
+    case "checklist_running":
+    case "checklist_30m":
+    case "checklist_overdue":
+      return `checklist:${subjectId}`;
+    case "digest_morning":
+    case "digest_todos":
+    case "digest_habits":
+    case "digest_review":
+      return DAY_DIGEST_TAG;
+    case "digest_overdue_evening":
+    case "digest_overdue_morning":
+      return OVERDUE_DIGEST_TAG;
+  }
+};
+
+/**
+ * Job mà thông báo của nó là "thẻ của một todo" gắn với GIỜ/NGÀY hẹn, nên phải gỡ khỏi máy khi
+ * người dùng đổi giờ/ngày đó (xem `services/notification-cards.ts`). Chỉ có hai loại này nhắc theo giờ
+ * hẹn; `todo_timer_end` là sự kiện đếm ngược, không gắn với giờ hẹn.
+ */
+export const TODO_CARD_KINDS = ["todo_reminder", "todo_overdue"] as const;
+
+/** Giá trị `data.type` của tin "gỡ thông báo" (tin chỉ có data, không hiện gì): app hủy thông báo theo `data.tag`. */
+export const DISMISS_DATA_TYPE = "dismiss";
+
+/**
+ * Tin gỡ thông báo là tin im lặng, app xử lý trong nền và hủy theo THẺ, nên nếu nó đến SAU một thông báo
+ * mới cùng thẻ thì sẽ xóa nhầm thông báo mới. Hai hằng số này loại trừ chuyện đó:
+ *  - `ttlMs` ngắn: tin gỡ đến trễ (máy mất mạng) quá chừng này thì bị FCM bỏ;
+ *  - `replaceWithinMs` > `ttlMs`: nếu thông báo kế tiếp của todo đến hạn trong chừng này thì KHÔNG gửi tin
+ *    gỡ, vì thông báo mới tự thay thẻ cũ (cùng thẻ). Nhờ vậy không tin gỡ nào còn sống khi thông báo mới hiện.
+ */
+export const DISMISS = {
+  ttlMs: 3 * MINUTE,
+  replaceWithinMs: 4 * MINUTE,
+} as const;
+
 export const DISPATCH = {
   /** Số job tối đa xử lý trong một lần tick. */
   batchSize: 200,

@@ -7,9 +7,13 @@ export const MIN_TODOS_FOR_SCORE = 3;
 
 export type Quadrant = "q1" | "q2" | "q3" | "q4";
 
-export type ScorableTodo = {
+export type ScorableSubtask = {
   status: string;
   completed_at: string | null;
+  subtasks?: ScorableSubtask[];
+};
+
+export type ScorableTodo = ScorableSubtask & {
   is_important: number | null;
   is_urgent: number | null;
   is_frog: number;
@@ -36,7 +40,7 @@ export const isScoredTodo = (t: ScorableTodo, date: string): boolean =>
   todoWeight(t, date) > 0;
 
 export const isCompletedForScore = (
-  t: ScorableTodo,
+  t: Pick<ScorableSubtask, "status" | "completed_at">,
   date: string
 ): boolean => {
   if (t.status !== "done") return false;
@@ -45,37 +49,32 @@ export const isCompletedForScore = (
   return completedDate !== null && completedDate <= date;
 };
 
+// Share (0..1) of a todo's weight earned on `date`: all of it once the todo itself is completed,
+// otherwise the fraction of its leaf subtasks (those with no subtasks of their own, at any depth)
+// that are done, so 1 of 3 subtasks done earns a third. This is the same count the mobile app
+// shows as the todo's percentage (`SubtaskProgress`), which keeps score and display consistent.
+export const completionShare = (t: ScorableSubtask, date: string): number => {
+  if (isCompletedForScore(t, date)) return 1;
+  let done = 0;
+  let total = 0;
+  const countLeaves = (subtasks: ScorableSubtask[]): void => {
+    for (const subtask of subtasks) {
+      if (subtask.subtasks && subtask.subtasks.length > 0) {
+        countLeaves(subtask.subtasks);
+      } else {
+        total++;
+        if (isCompletedForScore(subtask, date)) done++;
+      }
+    }
+  };
+  countLeaves(t.subtasks ?? []);
+  return total === 0 ? 0 : done / total;
+};
+
 const todoWeight = (t: ScorableTodo, date: string): number => {
   const regularWeight =
     (t.is_important === 1 ? 1 : 0) + (t.is_urgent === 1 ? 1 : 0);
   return isFrogForDate(t, date) ? Math.max(regularWeight, 2) : regularWeight;
-};
-
-const computeTodoScore = (
-  todos: ScorableTodo[],
-  date: string
-): number => {
-  const scoredTodos = todos.filter((t) => isScoredTodo(t, date));
-  if (scoredTodos.length === 0) return 0;
-
-  const totalWeight = scoredTodos.reduce(
-    (sum, todo) => sum + todoWeight(todo, date),
-    0
-  );
-  if (totalWeight === 0) return 0;
-
-  const completedWeight = scoredTodos.reduce(
-    (sum, todo) =>
-      sum + (isCompletedForScore(todo, date) ? todoWeight(todo, date) : 0),
-    0
-  );
-  const frogBonus = scoredTodos.some(
-    (todo) => isFrogForDate(todo, date) && isCompletedForScore(todo, date)
-  )
-    ? FROG_BONUS_SCORE
-    : 0;
-
-  return (TODO_WEIGHT_SCORE * completedWeight) / totalWeight + frogBonus;
 };
 
 const computeHabitScore = (habits?: {
@@ -91,14 +90,22 @@ export const computeScore = (
   date: string,
   habits?: { total: number; completed: number }
 ): number => {
-  const completedTodos = todos.filter((todo) =>
-    isCompletedForScore(todo, date)
-  ).length;
-  if (
-    todos.length < MIN_TODOS_FOR_SCORE ||
-    completedTodos < MIN_TODOS_FOR_SCORE
-  ) {
-    return 0;
+  if (todos.length < MIN_TODOS_FOR_SCORE) return 0;
+  let completedTodos = 0;
+  let totalWeight = 0;
+  let completedWeight = 0;
+  let frogBonus = 0;
+  for (const todo of todos) {
+    const weight = todoWeight(todo, date);
+    totalWeight += weight;
+    completedWeight += weight * completionShare(todo, date);
+    // Only fully completed todos count toward the minimum and earn the frog bonus.
+    if (isCompletedForScore(todo, date)) {
+      completedTodos++;
+      if (isFrogForDate(todo, date)) frogBonus = FROG_BONUS_SCORE;
+    }
   }
-  return Math.round(computeTodoScore(todos, date) + computeHabitScore(habits));
+  if (completedTodos < MIN_TODOS_FOR_SCORE) return 0;
+  const todoScore = totalWeight ? (TODO_WEIGHT_SCORE * completedWeight) / totalWeight : 0;
+  return Math.round(todoScore + frogBonus + computeHabitScore(habits));
 };

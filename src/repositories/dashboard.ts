@@ -46,6 +46,66 @@ export const listDayTopLevelStats = async (
   return (res.rows as unknown as Record<string, unknown>[]).map(mapStat);
 };
 
+export type SubtaskNode = {
+  status: string;
+  completed_at: string | null;
+  subtasks: SubtaskNode[];
+};
+
+// Live subtasks (any depth) of the given top-level todos, as trees keyed by top-level id.
+export const listSubtaskTrees = async (
+  userId: string,
+  rootIds: string[]
+): Promise<Map<string, SubtaskNode[]>> => {
+  const trees = new Map<string, SubtaskNode[]>();
+  if (rootIds.length === 0) return trees;
+  const res = await turso.execute({
+    sql: `WITH RECURSIVE sub(id, parent_id, status, completed_at) AS (
+            SELECT id, parent_id, status, completed_at FROM todos
+            WHERE user_id = ? AND parent_id IN (SELECT value FROM json_each(?))
+              AND status != 'archived' AND deleted_at IS NULL
+            UNION
+            SELECT t.id, t.parent_id, t.status, t.completed_at FROM todos t
+            JOIN sub ON t.parent_id = sub.id
+            WHERE t.user_id = ? AND t.status != 'archived' AND t.deleted_at IS NULL
+          )
+          SELECT id, parent_id, status, completed_at FROM sub`,
+    args: [userId, JSON.stringify(rootIds), userId],
+  });
+  const rows = res.rows as unknown as Record<string, unknown>[];
+  const nodes = new Map<string, SubtaskNode>();
+  for (const row of rows) {
+    nodes.set(row.id as string, {
+      status: row.status as string,
+      completed_at: (row.completed_at as string | null) ?? null,
+      subtasks: [],
+    });
+  }
+  for (const row of rows) {
+    const node = nodes.get(row.id as string)!;
+    const parentId = row.parent_id as string;
+    const parent = nodes.get(parentId);
+    if (parent) parent.subtasks.push(node);
+    else trees.set(parentId, [...(trees.get(parentId) ?? []), node]);
+  }
+  return trees;
+};
+
+export type DayScorableTodo = DayTodoStat & { subtasks: SubtaskNode[] };
+
+// Top-level todos của ngày D kèm cây subtask, đủ để tính điểm.
+export const listDayScorableTodos = async (
+  userId: string,
+  date: string
+): Promise<DayScorableTodo[]> => {
+  const todos = await listDayTopLevelStats(userId, date);
+  const trees = await listSubtaskTrees(
+    userId,
+    todos.map((todo) => todo.id)
+  );
+  return todos.map((todo) => ({ ...todo, subtasks: trees.get(todo.id) ?? [] }));
+};
+
 // Habits active trong ngày D + log của ngày D
 export const countDayHabits = async (
   userId: string,
@@ -92,22 +152,28 @@ export const getFrogForDay = async (
 };
 
 // Range queries (cho calendar overview)
-export const rawTodosInRange = async (
+export const countTodosByDay = async (
   userId: string,
   from: string,
   to: string
-): Promise<DayTodoStat[]> => {
+): Promise<{ date: string; total_todos: number; timed_todos: number; done_todos: number }[]> => {
   const res = await turso.execute({
-    sql: `SELECT id, title, status, scheduled_date, time, due_at, completed_at,
-                 is_important, is_urgent, is_frog, frog_date
+    sql: `SELECT scheduled_date, COUNT(*) AS total, COUNT(time) AS timed,
+                 SUM(status = 'done') AS done
           FROM todos
           WHERE user_id = ? AND scheduled_date BETWEEN ? AND ?
             AND parent_id IS NULL
             AND status != 'archived'
-            AND deleted_at IS NULL`,
+            AND deleted_at IS NULL
+          GROUP BY scheduled_date`,
     args: [userId, from, to],
   });
-  return (res.rows as unknown as Record<string, unknown>[]).map(mapStat);
+  return res.rows.map((r) => ({
+    date: String(r.scheduled_date),
+    total_todos: Number(r.total),
+    timed_todos: Number(r.timed),
+    done_todos: Number(r.done),
+  }));
 };
 
 export const activeHabitsInRange = async (
@@ -131,23 +197,23 @@ export const activeHabitsInRange = async (
   }));
 };
 
-export const allLogsInRange = async (
+export const countCompletedHabitsByDay = async (
   userId: string,
   from: string,
   to: string
-): Promise<{ habit_id: string; log_date: string; completed: number }[]> => {
+): Promise<{ date: string; completed: number }[]> => {
   const res = await turso.execute({
-    sql: `SELECT l.habit_id, l.log_date, l.completed
+    sql: `SELECT l.log_date, COUNT(DISTINCT l.habit_id) AS completed
           FROM habit_logs l
           JOIN habits h ON h.id = l.habit_id
           WHERE h.user_id = ?
             AND h.deleted_at IS NULL
-            AND l.log_date BETWEEN ? AND ?`,
+            AND l.completed = 1 AND l.log_date BETWEEN ? AND ?
+          GROUP BY l.log_date`,
     args: [userId, from, to],
   });
-  return (res.rows as unknown as Record<string, unknown>[]).map((r) => ({
-    habit_id: r.habit_id as string,
-    log_date: r.log_date as string,
+  return res.rows.map((r) => ({
+    date: String(r.log_date),
     completed: Number(r.completed),
   }));
 };

@@ -8,6 +8,7 @@ import {
   buildHabitsDigest,
   buildMorningDigest,
   buildTimerEnd,
+  buildTodoOverdue,
   buildTodoReminder,
   buildTodosDigest,
   normalizePushTitle,
@@ -15,6 +16,7 @@ import {
 } from "../src/services/notification-content.js";
 import {
   DIGEST_LABELS,
+  DIGEST_SEPARATOR,
   FALLBACK_TITLE,
   PUSH_TITLE_MAX_CHARS,
   QUOTE,
@@ -40,19 +42,16 @@ const stats = (totalTodos: number, doneTodos: number, habitsTotal: number, habit
 
 const DATE = "2026-06-20";
 const line = (body: string, index: number): string => body.split("\n")[index];
-const { tasks, progress, habits, motivation, encouragement, reflection } = DIGEST_LABELS;
+const { today, progress, motivation, encouragement, reflection } = DIGEST_LABELS;
 
 // ── digest_morning ───────────────────────────────────────────────────────────
 
-test("morning digest layout: tasks line, blank line, motivation (quoted), reflection", () => {
+test("morning digest layout: numbers line, blank line, motivation (quoted), reflection", () => {
   const m = buildMorningDigest(stats(5, 2, 3), DATE);
   assert.equal(m.title, "Chào buổi sáng");
   const lines = m.body.split("\n");
   assert.equal(lines.length, 4);
-  assert.equal(
-    lines[0],
-    "📋 Nhiệm vụ: Hôm nay bạn có 5 todo (đã xong 2, còn 3) & 3 thói quen cần duy trì."
-  );
+  assert.equal(lines[0], "📋 Hôm nay: 5 todo (xong 2, còn 3) · 3 thói quen");
   assert.equal(lines[1], "", "exactly one blank line between the two blocks");
   assert.equal(lines[2], `💪 Động lực: “${cheerForDate(DATE)}”`);
   assert.equal(lines[3], `💡 Suy ngẫm: ${philosophyForDate(DATE)}`);
@@ -67,17 +66,35 @@ test("morning digest: the quote uses curly quotes and the reflection is NOT quot
   assert.doesNotMatch(line(body, 3), /[“”"]/);
 });
 
-test("morning digest keeps the numbers wording of every branch on the single tasks line", () => {
+test("morning digest puts the numbers of every branch on one short line, numbers before words", () => {
   const first = (s: ReturnType<typeof stats>) => line(buildMorningDigest(s, DATE).body, 0);
-  assert.equal(first(stats(5, 0, 3)), `${tasks}Hôm nay bạn có 5 todo cần hoàn thành & 3 thói quen cần duy trì.`);
-  assert.equal(
-    first(stats(5, 2, 3)),
-    `${tasks}Hôm nay bạn có 5 todo (đã xong 2, còn 3) & 3 thói quen cần duy trì.`
-  );
-  assert.equal(first(stats(4, 4, 2)), `${tasks}Bạn đã hoàn thành cả 4 todo hôm nay! Còn 2 thói quen để duy trì.`);
-  assert.match(first(stats(0, 0, 0)), /^📋 Nhiệm vụ: Hôm nay chưa có todo hay thói quen nào\. Thử thêm một mục tiêu nhỏ/);
+  assert.equal(first(stats(5, 0, 3)), `${today}5 todo${DIGEST_SEPARATOR}3 thói quen`);
+  assert.equal(first(stats(5, 2, 3)), `${today}5 todo (xong 2, còn 3)${DIGEST_SEPARATOR}3 thói quen`);
+  assert.equal(first(stats(4, 4, 2)), `${today}xong cả 4 todo${DIGEST_SEPARATOR}2 thói quen`);
+  assert.match(first(stats(0, 0, 0)), /^📋 Hôm nay chưa có todo hay thói quen\. Thêm một mục tiêu nhỏ/);
   // inconsistent counts are clamped instead of printing nonsense
-  assert.equal(first(stats(2, 9, 1, 5)), `${tasks}Bạn đã hoàn thành cả 2 todo hôm nay! Còn 1 thói quen để duy trì.`);
+  assert.equal(first(stats(2, 9, 1, 5)), `${today}xong cả 2 todo${DIGEST_SEPARATOR}1 thói quen`);
+});
+
+test("morning digest never prints a zero part: no '0 todo' and no '0 thói quen'", () => {
+  const first = (s: ReturnType<typeof stats>) => line(buildMorningDigest(s, DATE).body, 0);
+  assert.equal(first(stats(0, 0, 3)), `${today}3 thói quen`);
+  assert.equal(first(stats(5, 0, 0)), `${today}5 todo`);
+  assert.equal(first(stats(5, 2, 0)), `${today}5 todo (xong 2, còn 3)`);
+  assert.equal(first(stats(4, 4, 0)), `${today}xong cả 4 todo`);
+});
+
+test("the numbers line of every digest fits the collapsed notification (about 50 characters)", () => {
+  const firstLines = [
+    line(buildMorningDigest(stats(12, 7, 9), DATE).body, 0),
+    line(buildMorningDigest(stats(12, 12, 9), DATE).body, 0),
+    line(buildTodosDigest(stats(12, 7, 0))?.body ?? "", 0),
+    line(buildTodosDigest(stats(12, 0, 0))?.body ?? "", 0),
+    line(buildHabitsDigest(stats(0, 0, 12, 7))?.body ?? "", 0),
+  ];
+  for (const text of firstLines) {
+    assert.ok(Array.from(text).length <= 50, `${text} (${Array.from(text).length} characters)`);
+  }
 });
 
 test("digests contain no HTML or markdown and stay short", () => {
@@ -98,21 +115,21 @@ test("todos digest is skipped when there are no todos", () => {
   assert.equal(buildTodosDigest(stats(0, 0, 4)), null);
 });
 
-test("todos digest: progress line first, encouragement on its own line only when there is one", () => {
+test("todos digest: numbers line first, encouragement on its own line only when there is one", () => {
   const none = buildTodosDigest(stats(3, 0, 0));
   assert.equal(none?.title, "Tổng kết todo hôm nay");
   assert.equal(
     none?.body,
-    `${progress}Hôm nay chưa có todo nào hoàn thành, còn 3 todo đang chờ bạn.\n${encouragement}Hãy bắt đầu bằng việc nhỏ nhất!`
+    `${progress}Xong 0/3 todo${DIGEST_SEPARATOR}còn 3 đang chờ\n${encouragement}Hãy bắt đầu bằng việc nhỏ nhất!`
   );
   assert.equal(
     buildTodosDigest(stats(5, 2, 0))?.body,
-    `${progress}Bạn đã hoàn thành 2 todo rồi, còn lại 3 todo nữa vẫn đang chờ bạn.`,
+    `${progress}Xong 2/5 todo${DIGEST_SEPARATOR}còn 3 đang chờ`,
     "no encouragement line when the sentence has none"
   );
   assert.equal(
     buildTodosDigest(stats(4, 4, 0))?.body,
-    `${progress}Bạn đã hoàn thành cả 4 todo hôm nay.\n${encouragement}Tuyệt vời!`
+    `${progress}Xong cả 4 todo hôm nay\n${encouragement}Tuyệt vời!`
   );
 });
 
@@ -122,31 +139,62 @@ test("habits digest is skipped when no habit needs maintaining", () => {
   assert.equal(buildHabitsDigest(stats(5, 5, 0)), null);
 });
 
-test("habits digest: progress line first, encouragement on its own line only when there is one", () => {
+test("habits digest: numbers line first, encouragement on its own line only when there is one", () => {
   const none = buildHabitsDigest(stats(0, 0, 3, 0));
   assert.equal(none?.title, "Tổng kết thói quen");
   assert.equal(
     none?.body,
-    `${habits}Hôm nay bạn chưa duy trì thói quen nào.\n${encouragement}Vẫn còn thời gian để làm một thói quen nhỏ trước khi hết ngày!`
+    `${progress}Đã duy trì 0/3 thói quen\n${encouragement}Vẫn còn thời gian để làm một thói quen nhỏ trước khi hết ngày!`
   );
-  assert.equal(buildHabitsDigest(stats(0, 0, 3, 1))?.body, `${habits}Hôm nay bạn đã duy trì được 1/3 thói quen.`);
+  assert.equal(buildHabitsDigest(stats(0, 0, 3, 1))?.body, `${progress}Đã duy trì 1/3 thói quen`);
   assert.equal(
     buildHabitsDigest(stats(0, 0, 3, 3))?.body,
-    `${habits}Bạn đã duy trì đủ 3/3 thói quen hôm nay.\n${encouragement}Tuyệt vời!`
+    `${progress}Đã duy trì đủ 3/3 thói quen\n${encouragement}Tuyệt vời!`
   );
 });
 
 test("labels and icons come from the single config file", () => {
   assert.deepEqual(DIGEST_LABELS, {
-    tasks: "📋 Nhiệm vụ: ",
-    progress: "📋 Tiến độ: ",
-    habits: "📋 Thói quen: ",
+    today: "📋 Hôm nay: ",
+    progress: "📋 ",
     motivation: "💪 Động lực: ",
     encouragement: "💪 ",
     reflection: "💡 Suy ngẫm: ",
-    today: "📋 Hôm nay: ",
     review: "🌙 ",
   });
+  assert.equal(DIGEST_SEPARATOR, " · ");
+});
+
+// ── todo_overdue ─────────────────────────────────────────────────────────────
+
+test("todo overdue: the body says how late it is first, then the original time and what to do", () => {
+  assert.deepEqual(buildTodoOverdue("Nộp báo cáo", "10:00", 120), {
+    title: "Nộp báo cáo",
+    body: "⏰ Trễ 2 giờ (hẹn 10:00) · Làm ngay hoặc dời lịch!",
+  });
+  assert.equal(buildTodoOverdue("x", "10:00", 60).body, "⏰ Trễ 1 giờ (hẹn 10:00) · Làm ngay hoặc dời lịch!");
+  assert.equal(buildTodoOverdue("x", "09:30", 240).body, "⏰ Trễ 4 giờ (hẹn 09:30) · Làm ngay hoặc dời lịch!");
+});
+
+test("todo overdue: lateness is readable below an hour and for an hour plus minutes", () => {
+  const late = (minutes: number) => buildTodoOverdue("x", "10:00", minutes).body.split(" (hẹn")[0];
+  assert.equal(late(45), "⏰ Trễ 45 phút");
+  assert.equal(late(90), "⏰ Trễ 1 giờ 30 phút");
+  assert.equal(late(61), "⏰ Trễ 1 giờ 1 phút");
+});
+
+test("todo overdue: nonsense lateness is clamped to one minute instead of printing 0 or NaN", () => {
+  for (const minutes of [0, -30, Number.NaN, Number.POSITIVE_INFINITY]) {
+    assert.match(buildTodoOverdue("x", "10:00", minutes).body, /^⏰ Trễ 1 phút \(hẹn 10:00\)/, String(minutes));
+  }
+});
+
+test("todo overdue: the title is normalized like the other pushes and the body stays on one line", () => {
+  const m = buildTodoOverdue(`Họp\n${"rất dài ".repeat(20)}`, "08:15", 180);
+  assert.ok(Array.from(m.title).length <= PUSH_TITLE_MAX_CHARS);
+  assert.doesNotMatch(m.title, /\n/);
+  assert.doesNotMatch(m.body, /\n/);
+  assert.equal(buildTodoOverdue("  ", "08:15", 60).title, "Todo");
 });
 
 // ── todo_reminder ────────────────────────────────────────────────────────────

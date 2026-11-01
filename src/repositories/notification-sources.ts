@@ -3,6 +3,8 @@ import { turso } from "../config/db.js";
 /** Dữ liệu checklist run cần cho thông báo (đọc lúc dựng job và lúc gửi). */
 export type ChecklistRunInfo = {
   id: string;
+  /** Checklist (mẫu) mà run thuộc về: thẻ thông báo theo checklist chứ không theo run. */
+  template_id: string;
   name: string | null;
   template_title: string | null;
   status: "in_progress" | "completed" | "abandoned";
@@ -16,7 +18,7 @@ export const getChecklistRunInfo = async (
   runId: string
 ): Promise<ChecklistRunInfo | null> => {
   const res = await turso.execute({
-    sql: `SELECT r.id, r.name, r.status, r.started_at, t.title AS template_title,
+    sql: `SELECT r.id, r.template_id, r.name, r.status, r.started_at, t.title AS template_title,
                  (SELECT COUNT(*) FROM checklist_run_items i
                   WHERE i.run_id = r.id AND i.status = 'pending'
                     AND i.deleted_at IS NULL) AS pending_steps
@@ -29,6 +31,7 @@ export const getChecklistRunInfo = async (
   const row = res.rows[0] as unknown as Record<string, unknown>;
   return {
     id: row.id as string,
+    template_id: row.template_id as string,
     name: (row.name as string | null) ?? null,
     template_title: (row.template_title as string | null) ?? null,
     status: row.status as ChecklistRunInfo["status"],

@@ -178,10 +178,31 @@ test("todo reminder is sent when the todo is still open and the time still match
   assert.equal(message.notification?.title, "Uống nước");
   // the seeded todo has no importance/urgency, so the generic body is used
   assert.equal(message.notification?.body, "Đến giờ thực hiện");
-  assert.deepEqual(message.data, { type: "todo", id: "todo-1", date: "2026-06-20" });
+  assert.deepEqual(message.data, { type: "todo", id: "todo-1", date: "2026-06-20", tag: "todo:todo-1" });
   assert.equal(message.android?.priority, "high");
   assert.equal(message.android?.ttl, 3_600_000);
   assert.equal(message.android?.notification?.channelId, "todo_reminders");
+  assert.equal(message.android?.notification?.tag, "todo:todo-1");
+});
+
+test("an occurrence of a recurring todo is tagged by its series, so today's reminder replaces yesterday's leftover", async () => {
+  await fx.insertDevice(turso, USER_ID, "reg-1");
+  await fx.insertTodo(turso, { id: "series-root", scheduledDate: "2026-06-19", time: "08:00", status: "done" });
+  await fx.insertTodo(turso, {
+    id: "occ-today",
+    scheduledDate: "2026-06-20",
+    time: "08:00",
+    recurrenceTemplateId: "series-root",
+  });
+  await fx.insertRawJob(turso, { id: "job-occ", kind: "todo_reminder", refId: "occ-today", runAt: REMINDER_RUN_AT });
+
+  await tick(AFTER_REMINDER);
+
+  const message = fake.messages.find((m) => m.data?.type === "todo");
+  assert.ok(message);
+  assert.equal(message.data?.id, "occ-today", "the app still opens the occurrence itself");
+  assert.equal(message.android?.notification?.tag, "todo:series-root");
+  assert.equal(message.data?.tag, "todo:series-root");
 });
 
 test("todo reminder body follows the todo's importance and urgency", async () => {
@@ -267,6 +288,8 @@ test("running-checklist reminder reports unticked steps and is cancelled when al
   );
   assert.equal(message.android?.notification?.channelId, "checklist_reminders");
   assert.equal(message.android?.ttl, 3_600_000);
+  assert.equal(message.android?.notification?.tag, "checklist:tpl-1", "keyed by the checklist, not by the run");
+  assert.deepEqual(message.data, { type: "checklist", id: "run-1", date: "2026-06-20", tag: "checklist:tpl-1" });
 
   for (const [label, sql] of [
     ["all ticked", "UPDATE checklist_run_items SET status = 'done'"],
@@ -303,7 +326,8 @@ test("digests: morning always sends, todos/habits are skipped when there is noth
   assert.deepEqual(types, ["digest_morning"]);
   assert.equal(fake.messages[0].android?.notification?.channelId, "daily_digest");
   assert.equal(fake.messages[0].android?.ttl, 7_200_000);
-  assert.deepEqual(fake.messages[0].data, { type: "digest_morning", id: date, date });
+  assert.deepEqual(fake.messages[0].data, { type: "digest_morning", id: date, date, tag: "digest:day" });
+  assert.equal(fake.messages[0].android?.notification?.tag, "digest:day");
 });
 
 test("digests use live data: todo counts and habit progress for the job's local date", async () => {
@@ -325,8 +349,37 @@ test("digests use live data: todo counts and habit progress for the job's local 
   await tick(QUIET);
 
   const bodies = Object.fromEntries(fake.messages.map((m) => [m.data?.type, m.notification?.body]));
-  assert.equal(bodies.digest_todos, "📋 Tiến độ: Bạn đã hoàn thành 1 todo rồi, còn lại 2 todo nữa vẫn đang chờ bạn.");
-  assert.equal(bodies.digest_habits, "📋 Thói quen: Hôm nay bạn đã duy trì được 1/2 thói quen.");
+  assert.equal(bodies.digest_todos, "📋 Xong 1/3 todo · còn 2 đang chờ");
+  assert.equal(bodies.digest_habits, "📋 Đã duy trì 1/2 thói quen");
+});
+
+test("all four daily summaries share one tag; the overdue summary keeps its own", async () => {
+  await fx.insertDevice(turso, USER_ID, "reg-1");
+  const date = "2026-06-20";
+  await fx.insertTodo(turso, { id: "t-1", scheduledDate: date });
+  await fx.insertTodo(turso, { id: "t-late", scheduledDate: date, time: "08:00", isImportant: 1, isUrgent: 0 });
+  await fx.insertHabit(turso, { id: "h-1" });
+  const runAt = iso(plusMinutes(QUIET, -1));
+  for (const kind of ["digest_morning", "digest_todos", "digest_habits", "digest_review", "digest_overdue_evening"]) {
+    await fx.insertRawJob(turso, { id: `job-${kind}`, kind, localDate: date, runAt });
+  }
+
+  await tick(QUIET);
+
+  assert.equal(fake.messages.length, 5, "nothing is merged on the server: all five are sent");
+  const tagWhere = (match: (message: (typeof fake.messages)[number]) => boolean) =>
+    fake.messages.find(match)?.android?.notification?.tag;
+  assert.equal(tagWhere((m) => m.data?.type === "digest_morning"), "digest:day");
+  assert.equal(
+    tagWhere((m) => m.data?.type === "digest_todos" && m.notification?.title === "Tổng kết todo hôm nay"),
+    "digest:day"
+  );
+  assert.equal(tagWhere((m) => m.data?.type === "digest_habits"), "digest:day");
+  assert.equal(tagWhere((m) => m.data?.type === "digest_review"), "digest:day");
+  assert.equal(tagWhere((m) => /todo quan trọng/.test(m.notification?.title ?? "")), "digest:overdue");
+  for (const message of fake.messages) {
+    assert.equal(message.data?.tag, message.android?.notification?.tag, "data.tag always mirrors the Android tag");
+  }
 });
 
 test("a job of a disabled user is cancelled, not sent", async () => {
