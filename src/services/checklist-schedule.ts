@@ -42,6 +42,25 @@ export type ScheduleRule = {
 /** Đổi giờ của MỘT ngày cụ thể. */
 export type ScheduleOverride = { localDate: string; time: string };
 
+type ChecklistOwner = { user_id: string; template_id: string };
+
+// A system template can be scheduled by many users in the same planner batch.
+export const indexRowsByChecklist = <T extends ChecklistOwner>(rows: readonly T[]) => {
+  const byUser = new Map<string, Map<string, T[]>>();
+  for (const row of rows) {
+    let templates = byUser.get(row.user_id);
+    if (!templates) {
+      templates = new Map();
+      byUser.set(row.user_id, templates);
+    }
+    const group = templates.get(row.template_id);
+    if (group) group.push(row);
+    else templates.set(row.template_id, [row]);
+  }
+  return (schedule: ChecklistOwner): readonly T[] =>
+    byUser.get(schedule.user_id)?.get(schedule.template_id) ?? [];
+};
+
 export type ChecklistOccurrence = {
   checklistId: string;
   date: string;

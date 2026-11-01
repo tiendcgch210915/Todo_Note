@@ -1,8 +1,7 @@
 /**
  * sync.repo.ts
  *
- * Tất cả DB access cho sync layer. Không N+1: associations được bulk-fetch
- * bằng IN(...) queries rồi group in JS.
+ * Tất cả DB access cho sync layer.
  *
  * API_CONTRACT §4 (pull) + §5 (push helpers)
  */
@@ -38,8 +37,35 @@ export type SyncChanges = {
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
-/** Build IN(?,?,…) placeholder string */
-const inPlaceholders = (ids: string[]): string => ids.map(() => "?").join(", ");
+// Read each parent and its live associations in one statement. Each subquery
+// uses the junction index for that parent, including on a one-row delta.
+const todoSelect = `SELECT e.*,
+  (SELECT json_group_array(tt.tag_id) FROM todo_tags tt
+   JOIN tags g ON g.id = tt.tag_id WHERE tt.todo_id = e.id AND g.deleted_at IS NULL) AS tag_ids,
+  (SELECT json_group_array(l.note_id) FROM note_todo_links l
+   JOIN notes n ON n.id = l.note_id WHERE l.todo_id = e.id AND n.deleted_at IS NULL) AS linked_note_ids
+  FROM todos e`;
+
+const noteSelect = `SELECT e.*,
+  (SELECT json_group_array(nt.tag_id) FROM note_tags nt
+   JOIN tags g ON g.id = nt.tag_id WHERE nt.note_id = e.id AND g.deleted_at IS NULL) AS tag_ids,
+  (SELECT json_group_array(json_object('target_note_id', l.target_note_id, 'label', l.label))
+   FROM note_links l JOIN notes n ON n.id = l.target_note_id
+   WHERE l.source_note_id = e.id AND n.deleted_at IS NULL) AS note_links,
+  (SELECT json_group_array(l.todo_id) FROM note_todo_links l
+   JOIN todos t ON t.id = l.todo_id WHERE l.note_id = e.id AND t.deleted_at IS NULL) AS linked_todo_ids
+  FROM notes e`;
+
+const syncTodo = (row: Record<string, unknown>) => toSyncEntity(row, "todo", {
+  tag_ids: JSON.parse(row.tag_ids as string),
+  linked_note_ids: JSON.parse(row.linked_note_ids as string),
+} satisfies TodoAssoc);
+
+const syncNote = (row: Record<string, unknown>) => toSyncEntity(row, "note", {
+  tag_ids: JSON.parse(row.tag_ids as string),
+  note_links: JSON.parse(row.note_links as string),
+  linked_todo_ids: JSON.parse(row.linked_todo_ids as string),
+} satisfies NoteAssoc);
 
 /**
  * Cast unknown[] to turso-compatible arg array.
@@ -171,8 +197,6 @@ const updateExistingNoteFromSync = async (
  *
  * `since` = "" | undefined → initial sync: only living entities (deleted_at IS NULL)
  * `since` = ISO timestamp  → delta: entities where updated_at > since (incl. soft-deleted)
- *
- * Bulk-fetch associations with IN queries to avoid N+1.
  */
 export const getChangesSince = async (
   userId: string,
@@ -181,9 +205,7 @@ export const getChangesSince = async (
   const isInitial = !since || since === "";
   const a1 = isInitial ? [userId] : [userId, since!]; // single-arg or (userId, since)
 
-  // ── Phase 1: all 10 main entity queries IN PARALLEL ──────────────────────
-  // No inter-dependencies at this level → fire all at once, halving latency
-  // on remote DBs (Turso: ~50 ms/query × 10 seq → 2 round-trips instead).
+  const parentFilter = isInitial ? "e.deleted_at IS NULL" : "e.updated_at > ?";
   const [
     usersRes, tagsRes, todosRes, notesRes,
     habitsRes, habitLogsRes, categoriesRes, templatesRes, templateOrdersRes,
@@ -204,15 +226,11 @@ export const getChangesSince = async (
       args: a1,
     })),
     runSyncQuery("todos", turso.execute({
-      sql: isInitial
-        ? "SELECT * FROM todos WHERE user_id = ? AND deleted_at IS NULL ORDER BY updated_at DESC"
-        : "SELECT * FROM todos WHERE user_id = ? AND updated_at > ? ORDER BY updated_at DESC",
+      sql: `${todoSelect} WHERE e.user_id = ? AND ${parentFilter} ORDER BY e.updated_at DESC`,
       args: a1,
     })),
     runSyncQuery("notes", turso.execute({
-      sql: isInitial
-        ? "SELECT * FROM notes WHERE user_id = ? AND deleted_at IS NULL ORDER BY updated_at DESC"
-        : "SELECT * FROM notes WHERE user_id = ? AND updated_at > ? ORDER BY updated_at DESC",
+      sql: `${noteSelect} WHERE e.user_id = ? AND ${parentFilter} ORDER BY e.updated_at DESC`,
       args: a1,
     })),
     runSyncQuery("habits", turso.execute({
@@ -329,107 +347,14 @@ export const getChangesSince = async (
     })),
   ]);
 
-  // ── Phase 2: association queries for todo + note (PARALLEL) ──────────────
-  const todoRows = todosRes.rows as unknown as Record<string, unknown>[];
-  const noteRows = notesRes.rows as unknown as Record<string, unknown>[];
-  const todoIds = todoRows.map((r) => r.id as string);
-  const noteIds = noteRows.map((r) => r.id as string);
-
-  const emptyResult = { rows: [] as unknown[] };
-
-  const [tTagsRes, tNotesRes, nTagsRes, nLinksRes, nTodosRes] = await Promise.all([
-    todoIds.length > 0
-      ? runSyncQuery("todo_tags", turso.execute({
-          sql: `SELECT tt.todo_id, tt.tag_id
-                FROM todo_tags tt JOIN tags g ON g.id = tt.tag_id
-                WHERE tt.todo_id IN (${inPlaceholders(todoIds)}) AND g.deleted_at IS NULL`,
-          args: todoIds,
-        }))
-      : Promise.resolve(emptyResult),
-    todoIds.length > 0
-      ? runSyncQuery("todo_linked_notes", turso.execute({
-          sql: `SELECT ntl.todo_id, ntl.note_id
-                FROM note_todo_links ntl JOIN notes n ON n.id = ntl.note_id
-                WHERE ntl.todo_id IN (${inPlaceholders(todoIds)}) AND n.deleted_at IS NULL`,
-          args: todoIds,
-        }))
-      : Promise.resolve(emptyResult),
-    noteIds.length > 0
-      ? runSyncQuery("note_tags", turso.execute({
-          sql: `SELECT nt.note_id, nt.tag_id
-                FROM note_tags nt JOIN tags g ON g.id = nt.tag_id
-                WHERE nt.note_id IN (${inPlaceholders(noteIds)}) AND g.deleted_at IS NULL`,
-          args: noteIds,
-        }))
-      : Promise.resolve(emptyResult),
-    noteIds.length > 0
-      ? runSyncQuery("note_links", turso.execute({
-          sql: `SELECT nl.source_note_id, nl.target_note_id, nl.label
-                FROM note_links nl JOIN notes t ON t.id = nl.target_note_id
-                WHERE nl.source_note_id IN (${inPlaceholders(noteIds)}) AND t.deleted_at IS NULL`,
-          args: noteIds,
-        }))
-      : Promise.resolve(emptyResult),
-    noteIds.length > 0
-      ? runSyncQuery("note_linked_todos", turso.execute({
-          sql: `SELECT ntl.note_id, ntl.todo_id
-                FROM note_todo_links ntl JOIN todos t ON t.id = ntl.todo_id
-                WHERE ntl.note_id IN (${inPlaceholders(noteIds)}) AND t.deleted_at IS NULL`,
-          args: noteIds,
-        }))
-      : Promise.resolve(emptyResult),
-  ]);
-
-  // ── Group associations into Maps ─────────────────────────────────────────
-  const todoTagMap = new Map<string, string[]>();
-  const todoLinkedNoteMap = new Map<string, string[]>();
-  for (const r of tTagsRes.rows as unknown as { todo_id: string; tag_id: string }[]) {
-    if (!todoTagMap.has(r.todo_id)) todoTagMap.set(r.todo_id, []);
-    todoTagMap.get(r.todo_id)!.push(r.tag_id);
-  }
-  for (const r of tNotesRes.rows as unknown as { todo_id: string; note_id: string }[]) {
-    if (!todoLinkedNoteMap.has(r.todo_id)) todoLinkedNoteMap.set(r.todo_id, []);
-    todoLinkedNoteMap.get(r.todo_id)!.push(r.note_id);
-  }
-
-  const noteTagMap = new Map<string, string[]>();
-  const noteLinkMap = new Map<string, { target_note_id: string; label: string | null }[]>();
-  const noteTodoMap = new Map<string, string[]>();
-  for (const r of nTagsRes.rows as unknown as { note_id: string; tag_id: string }[]) {
-    if (!noteTagMap.has(r.note_id)) noteTagMap.set(r.note_id, []);
-    noteTagMap.get(r.note_id)!.push(r.tag_id);
-  }
-  for (const r of nLinksRes.rows as unknown as {
-    source_note_id: string; target_note_id: string; label: string | null;
-  }[]) {
-    if (!noteLinkMap.has(r.source_note_id)) noteLinkMap.set(r.source_note_id, []);
-    noteLinkMap.get(r.source_note_id)!.push({ target_note_id: r.target_note_id, label: r.label ?? null });
-  }
-  for (const r of nTodosRes.rows as unknown as { note_id: string; todo_id: string }[]) {
-    if (!noteTodoMap.has(r.note_id)) noteTodoMap.set(r.note_id, []);
-    noteTodoMap.get(r.note_id)!.push(r.todo_id);
-  }
-
-  // ── Serialize ─────────────────────────────────────────────────────────────
   const users = (usersRes.rows as unknown as Record<string, unknown>[]).map((r) =>
     toSyncEntity(r, "user")
   );
   const tags = (tagsRes.rows as unknown as Record<string, unknown>[]).map((r) =>
     toSyncEntity(r, "tag")
   );
-  const todos = todoRows.map((r) =>
-    toSyncEntity(r, "todo", {
-      tag_ids: todoTagMap.get(r.id as string) ?? [],
-      linked_note_ids: todoLinkedNoteMap.get(r.id as string) ?? [],
-    } satisfies TodoAssoc)
-  );
-  const notes = noteRows.map((r) =>
-    toSyncEntity(r, "note", {
-      tag_ids: noteTagMap.get(r.id as string) ?? [],
-      note_links: noteLinkMap.get(r.id as string) ?? [],
-      linked_todo_ids: noteTodoMap.get(r.id as string) ?? [],
-    } satisfies NoteAssoc)
-  );
+  const todos = todosRes.rows.map(syncTodo);
+  const notes = notesRes.rows.map(syncNote);
   const habits = (habitsRes.rows as unknown as Record<string, unknown>[]).map((r) =>
     toSyncEntity(r, "habit")
   );
@@ -1661,11 +1586,19 @@ export const resurrectHabitLogRow = async (
 export const getFullEntity = async (
   type: EntityType,
   id: string,
-  _userId: string
+  userId: string
 ): Promise<Record<string, unknown> | null> => {
+  if (type === "todo" || type === "note") {
+    const select = type === "todo" ? todoSelect : noteSelect;
+    const res = await turso.execute({
+      sql: `${select} WHERE e.id = ? AND e.user_id = ?`,
+      args: [id, userId],
+    });
+    if (!res.rows.length) return null;
+    return type === "todo" ? syncTodo(res.rows[0]) : syncNote(res.rows[0]);
+  }
+
   const TABLE: Partial<Record<EntityType, string>> = {
-    todo: "todos",
-    note: "notes",
     tag: "tags",
     habit: "habits",
     habit_log: "habit_logs",
@@ -1683,69 +1616,6 @@ export const getFullEntity = async (
   const table = TABLE[type];
   if (!table) return null;
 
-  const rowRes = await turso.execute({
-    sql: `SELECT * FROM ${table} WHERE id = ?`,
-    args: [id],
-  });
-  if (rowRes.rows.length === 0) return null;
-  const row = rowRes.rows[0] as unknown as Record<string, unknown>;
-
-  // For todo: fetch tag_ids + linked_note_ids
-  if (type === "todo") {
-    const [tagsRes, notesRes] = await Promise.all([
-      turso.execute({
-        sql: `SELECT tt.tag_id FROM todo_tags tt
-              JOIN tags g ON g.id = tt.tag_id
-              WHERE tt.todo_id = ? AND g.deleted_at IS NULL`,
-        args: [id],
-      }),
-      turso.execute({
-        sql: `SELECT ntl.note_id FROM note_todo_links ntl
-              JOIN notes n ON n.id = ntl.note_id
-              WHERE ntl.todo_id = ? AND n.deleted_at IS NULL`,
-        args: [id],
-      }),
-    ]);
-    const assoc: TodoAssoc = {
-      tag_ids: (tagsRes.rows as unknown as { tag_id: string }[]).map((r) => r.tag_id),
-      linked_note_ids: (notesRes.rows as unknown as { note_id: string }[]).map((r) => r.note_id),
-    };
-    return toSyncEntity(row, "todo", assoc);
-  }
-
-  // For note: fetch tag_ids + note_links + linked_todo_ids
-  if (type === "note") {
-    const [tagsRes, linksRes, todosRes] = await Promise.all([
-      turso.execute({
-        sql: `SELECT nt.tag_id FROM note_tags nt
-              JOIN tags g ON g.id = nt.tag_id
-              WHERE nt.note_id = ? AND g.deleted_at IS NULL`,
-        args: [id],
-      }),
-      turso.execute({
-        sql: `SELECT nl.target_note_id, nl.label
-              FROM note_links nl
-              JOIN notes n ON n.id = nl.target_note_id
-              WHERE nl.source_note_id = ? AND n.deleted_at IS NULL`,
-        args: [id],
-      }),
-      turso.execute({
-        sql: `SELECT ntl.todo_id FROM note_todo_links ntl
-              JOIN todos t ON t.id = ntl.todo_id
-              WHERE ntl.note_id = ? AND t.deleted_at IS NULL`,
-        args: [id],
-      }),
-    ]);
-    const assoc: NoteAssoc = {
-      tag_ids: (tagsRes.rows as unknown as { tag_id: string }[]).map((r) => r.tag_id),
-      note_links: (linksRes.rows as unknown as { target_note_id: string; label: string | null }[]).map(
-        (r) => ({ target_note_id: r.target_note_id, label: r.label })
-      ),
-      linked_todo_ids: (todosRes.rows as unknown as { todo_id: string }[]).map((r) => r.todo_id),
-    };
-    return toSyncEntity(row, "note", assoc);
-  }
-
-  // All other types: no associations
-  return toSyncEntity(row, type);
+  const res = await turso.execute({ sql: `SELECT * FROM ${table} WHERE id = ?`, args: [id] });
+  return res.rows.length ? toSyncEntity(res.rows[0], type) : null;
 };

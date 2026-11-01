@@ -92,22 +92,28 @@ export const getFrogForDay = async (
 };
 
 // Range queries (cho calendar overview)
-export const rawTodosInRange = async (
+export const countTodosByDay = async (
   userId: string,
   from: string,
   to: string
-): Promise<DayTodoStat[]> => {
+): Promise<{ date: string; total_todos: number; timed_todos: number; done_todos: number }[]> => {
   const res = await turso.execute({
-    sql: `SELECT id, title, status, scheduled_date, time, due_at, completed_at,
-                 is_important, is_urgent, is_frog, frog_date
+    sql: `SELECT scheduled_date, COUNT(*) AS total, COUNT(time) AS timed,
+                 SUM(status = 'done') AS done
           FROM todos
           WHERE user_id = ? AND scheduled_date BETWEEN ? AND ?
             AND parent_id IS NULL
             AND status != 'archived'
-            AND deleted_at IS NULL`,
+            AND deleted_at IS NULL
+          GROUP BY scheduled_date`,
     args: [userId, from, to],
   });
-  return (res.rows as unknown as Record<string, unknown>[]).map(mapStat);
+  return res.rows.map((r) => ({
+    date: String(r.scheduled_date),
+    total_todos: Number(r.total),
+    timed_todos: Number(r.timed),
+    done_todos: Number(r.done),
+  }));
 };
 
 export const activeHabitsInRange = async (
@@ -131,23 +137,23 @@ export const activeHabitsInRange = async (
   }));
 };
 
-export const allLogsInRange = async (
+export const countCompletedHabitsByDay = async (
   userId: string,
   from: string,
   to: string
-): Promise<{ habit_id: string; log_date: string; completed: number }[]> => {
+): Promise<{ date: string; completed: number }[]> => {
   const res = await turso.execute({
-    sql: `SELECT l.habit_id, l.log_date, l.completed
+    sql: `SELECT l.log_date, COUNT(DISTINCT l.habit_id) AS completed
           FROM habit_logs l
           JOIN habits h ON h.id = l.habit_id
           WHERE h.user_id = ?
             AND h.deleted_at IS NULL
-            AND l.log_date BETWEEN ? AND ?`,
+            AND l.completed = 1 AND l.log_date BETWEEN ? AND ?
+          GROUP BY l.log_date`,
     args: [userId, from, to],
   });
-  return (res.rows as unknown as Record<string, unknown>[]).map((r) => ({
-    habit_id: r.habit_id as string,
-    log_date: r.log_date as string,
+  return res.rows.map((r) => ({
+    date: String(r.log_date),
     completed: Number(r.completed),
   }));
 };

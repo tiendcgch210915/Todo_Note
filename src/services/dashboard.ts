@@ -52,19 +52,13 @@ export const getTodayStats = async (
 ): Promise<TodayStats> => {
   const date = query.date ?? dailyTodoLogs.vietnamToday(now);
   const isClosedDay = dailyTodoLogs.isClosedTodoDate(date, now);
-  const [habits, liveFrog] = await Promise.all([
-    dashRepo.countDayHabits(userId, date),
-    isClosedDay ? Promise.resolve(null) : dashRepo.getFrogForDay(userId, date),
-  ]);
-
   const counts = { q1: 0, q2: 0, q3: 0, q4: 0 };
 
   if (isClosedDay) {
-    const summary = await dailyTodoLogs.ensureUserTodoDayClosed(
-      userId,
-      date,
-      now
-    );
+    const [summary, habits] = await Promise.all([
+      dailyTodoLogs.ensureUserTodoDayClosed(userId, date, now),
+      dashRepo.countDayHabits(userId, date),
+    ]);
     const logs = await dailyTodoLogs.listDailyTodoLogs(userId, date);
     for (const t of logs) {
       if (t.completed === 1) continue;
@@ -86,7 +80,11 @@ export const getTodayStats = async (
     };
   }
 
-  const todos = await dashRepo.listDayTopLevelStats(userId, date);
+  const [todos, habits, liveFrog] = await Promise.all([
+    dashRepo.listDayTopLevelStats(userId, date),
+    dashRepo.countDayHabits(userId, date),
+    dashRepo.getFrogForDay(userId, date),
+  ]);
   const score = computeScore(todos, date, habits);
 
   for (const t of todos) {
@@ -205,9 +203,9 @@ export const getEisenhower = async (
   }
 
   const todos = await dashRepo.listDayTopLevelStats(userId, date);
-  const tagMap = await listTagsForTodoIds(todos.map((todo) => todo.id));
-  for (const t of todos) {
-    if (t.status === "done") continue;
+  const open = todos.filter((todo) => todo.status !== "done");
+  const tagMap = await listTagsForTodoIds(open.map((todo) => todo.id));
+  for (const t of open) {
     const q = quadrantOf(t.is_important, t.is_urgent);
     by_quadrant[q].push(toEisenhowerTodo(t, tagMap.get(t.id) ?? []));
     counts[q]++;
@@ -437,29 +435,29 @@ export const getCalendarDayDetail = async (
   const today = dailyTodoLogs.vietnamToday(now);
   const closedThrough = addDays(today, -1);
 
-  await dailyTodoLogs.ensureUserTodoDaysClosed(userId, weekFrom, weekTo, now);
+  const weekSummaries = await dailyTodoLogs.getClosedTodoSummaries(userId, weekFrom, weekTo, now);
 
   const liveWeekFrom = weekFrom < today ? today : weekFrom;
   const closedSummaryFrom = weekFrom;
   const closedSummaryTo = weekTo < today ? weekTo : closedThrough;
   const isSelectedClosed = dailyTodoLogs.isClosedTodoDate(date, now);
 
-  const [dayRows, dayLogRows, weekTodos, weekSummaries, user] =
+  const [dayRows, dayLogRows, weekTodos, timedLogs, user] =
     await Promise.all([
       isSelectedClosed ? Promise.resolve([]) : listDayTopLevel(userId, date),
       isSelectedClosed
         ? dailyTodoLogs.listDailyTodoLogs(userId, date)
         : Promise.resolve([]),
       liveWeekFrom <= weekTo
-        ? dashRepo.rawTodosInRange(userId, liveWeekFrom, weekTo)
+        ? dashRepo.countTodosByDay(userId, liveWeekFrom, weekTo)
         : Promise.resolve([]),
       closedSummaryFrom <= closedSummaryTo
-        ? dailyTodoLogs.listDailyTodoSummariesInRange(
+        ? dailyTodoLogs.countTimedLogsInRange(
             userId,
             closedSummaryFrom,
             closedSummaryTo
           )
-        : Promise.resolve([]),
+        : new Map<string, number>(),
       usersRepo.getUserById(userId),
     ]);
 
@@ -489,18 +487,14 @@ export const getCalendarDayDetail = async (
   }
   for (const summary of weekSummaries) {
     if (!weekCounts[summary.log_date]) continue;
-    const logs = await dailyTodoLogs.listDailyTodoLogs(userId, summary.log_date);
     weekCounts[summary.log_date] = {
       total_todos: summary.total_todos,
-      timed_todos: logs.filter((todo) => todo.time !== null).length,
+      timed_todos: timedLogs.get(summary.log_date) ?? 0,
       done_todos: summary.done_todos,
     };
   }
-  for (const todo of weekTodos) {
-    if (!todo.scheduled_date || !weekCounts[todo.scheduled_date]) continue;
-    weekCounts[todo.scheduled_date].total_todos++;
-    if (todo.time !== null) weekCounts[todo.scheduled_date].timed_todos++;
-    if (todo.status === "done") weekCounts[todo.scheduled_date].done_todos++;
+  for (const { date, ...counts } of weekTodos) {
+    weekCounts[date] = counts;
   }
 
   const weekDays = daysInRange(weekFrom, weekTo).map((d) => {
@@ -583,7 +577,6 @@ export const getCalendarOverview = async (
   now: Date = new Date()
 ): Promise<CalendarOverview> => {
   const today = dailyTodoLogs.vietnamToday(now);
-  const closedThrough = addDays(today, -1);
   const days: Record<string, CalendarDay> = {};
   for (const d of daysInRange(query.from, query.to)) {
     days[d] = {
@@ -594,30 +587,14 @@ export const getCalendarOverview = async (
     };
   }
 
-  await dailyTodoLogs.ensureUserTodoDaysClosed(
-    userId,
-    query.from,
-    query.to,
-    now
-  );
-
-  const liveFrom = query.from < today ? today : query.from;
-  const summaryTo = query.to < today ? query.to : closedThrough;
-  const [todos, habits, logs] = await Promise.all([
-    liveFrom <= query.to
-      ? dashRepo.rawTodosInRange(userId, liveFrom, query.to)
-      : Promise.resolve([]),
+  const futureFrom = query.from > today ? query.from : addDays(today, 1);
+  const [dailySummaries, todayTodos, futureCounts, habits, completedHabits] = await Promise.all([
+    dailyTodoLogs.getClosedTodoSummaries(userId, query.from, query.to, now),
+    days[today] ? dashRepo.listDayTopLevelStats(userId, today) : [],
+    futureFrom <= query.to ? dashRepo.countTodosByDay(userId, futureFrom, query.to) : [],
     dashRepo.activeHabitsInRange(userId, query.from, query.to),
-    dashRepo.allLogsInRange(userId, query.from, query.to),
+    dashRepo.countCompletedHabitsByDay(userId, query.from, query.to),
   ]);
-  const dailySummaries =
-    query.from <= summaryTo
-      ? await dailyTodoLogs.listDailyTodoSummariesInRange(
-          userId,
-          query.from,
-          summaryTo
-        )
-      : [];
 
   // Closed todo days are immutable snapshots.
   for (const summary of dailySummaries) {
@@ -627,13 +604,10 @@ export const getCalendarOverview = async (
     days[summary.log_date].score = summary.score;
   }
 
-  // Live todos for today/future.
-  const todosByDay: Record<string, dashRepo.DayTodoStat[]> = {};
-  for (const t of todos) {
-    if (!t.scheduled_date || !days[t.scheduled_date]) continue;
-    (todosByDay[t.scheduled_date] ??= []).push(t);
-    days[t.scheduled_date].total_todos++;
-    if (t.status === "done") days[t.scheduled_date].done_todos++;
+  for (const counts of futureCounts) {
+    if (!days[counts.date]) continue;
+    days[counts.date].total_todos = counts.total_todos;
+    days[counts.date].done_todos = counts.done_todos;
   }
   // Habits active per day
   for (const d of Object.keys(days)) {
@@ -643,23 +617,17 @@ export const getCalendarOverview = async (
   }
 
   // Habits completed per day
-  const completedByDay: Record<string, Set<string>> = {};
-  for (const l of logs) {
-    if (l.completed === 1) {
-      (completedByDay[l.log_date] ??= new Set()).add(l.habit_id);
-    }
-  }
-  for (const [d, s] of Object.entries(completedByDay)) {
-    if (days[d]) days[d].habits_completed = s.size;
+  for (const { date, completed } of completedHabits) {
+    if (days[date]) days[date].habits_completed = completed;
   }
 
-  for (const d of Object.keys(days)) {
-    if (d === today) {
-      days[d].score = computeScore(todosByDay[d] ?? [], d, {
-        total: days[d].habits_total,
-        completed: days[d].habits_completed,
-      });
-    }
+  if (days[today]) {
+    days[today].total_todos = todayTodos.length;
+    days[today].done_todos = todayTodos.filter((t) => t.status === "done").length;
+    days[today].score = computeScore(todayTodos, today, {
+      total: days[today].habits_total,
+      completed: days[today].habits_completed,
+    });
   }
 
   return { from: query.from, to: query.to, days };

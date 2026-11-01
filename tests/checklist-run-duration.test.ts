@@ -1,11 +1,11 @@
 import assert from "node:assert/strict";
-import { before, beforeEach, test } from "node:test";
+import { after, before, beforeEach, test } from "node:test";
 
 process.env.TURSO_DATABASE_URL = "file::memory:";
 process.env.TURSO_AUTH_TOKEN = "";
 
 const { turso } = await import("../src/config/db.js");
-const { createNotificationTables } = await import("./helpers/migrations.js");
+const { applyAllMigrations } = await import("./helpers/migrations.js");
 const checklists = await import("../src/services/checklists.js");
 const { CompleteRunSchema } = await import("../src/schemas/api/checklists.js");
 const { processPush } = await import("../src/services/sync.service.js");
@@ -92,176 +92,8 @@ const insertRun = async (
   );
 };
 
-before(async () => {
-  await createNotificationTables(turso);
-  await turso.execute(`
-    CREATE TABLE IF NOT EXISTS users (
-      id TEXT PRIMARY KEY,
-      email TEXT UNIQUE NOT NULL,
-      password_hash TEXT NOT NULL,
-      display_name TEXT,
-      avatar_url TEXT,
-      timezone TEXT NOT NULL DEFAULT 'Asia/Ho_Chi_Minh',
-      settings TEXT,
-      is_admin INTEGER NOT NULL DEFAULT 0,
-      created_at TEXT NOT NULL,
-      updated_at TEXT NOT NULL,
-      deleted_at TEXT
-    )
-  `);
-  await turso.execute(`
-    CREATE TABLE IF NOT EXISTS tags (
-      id TEXT PRIMARY KEY,
-      user_id TEXT NOT NULL,
-      name TEXT NOT NULL,
-      color TEXT NOT NULL DEFAULT '#888888',
-      created_at TEXT NOT NULL,
-      updated_at TEXT NOT NULL,
-      deleted_at TEXT
-    )
-  `);
-  await turso.execute(`
-    CREATE TABLE IF NOT EXISTS todos (
-      id TEXT PRIMARY KEY,
-      user_id TEXT NOT NULL,
-      updated_at TEXT NOT NULL,
-      deleted_at TEXT
-    )
-  `);
-  await turso.execute(`
-    CREATE TABLE IF NOT EXISTS notes (
-      id TEXT PRIMARY KEY,
-      user_id TEXT NOT NULL,
-      updated_at TEXT NOT NULL,
-      deleted_at TEXT
-    )
-  `);
-  await turso.execute(`
-    CREATE TABLE IF NOT EXISTS habits (
-      id TEXT PRIMARY KEY,
-      user_id TEXT NOT NULL,
-      title TEXT NOT NULL DEFAULT '',
-      description TEXT,
-      icon TEXT,
-      color TEXT NOT NULL DEFAULT '#4CAF50',
-      frequency_type TEXT NOT NULL DEFAULT 'daily',
-      target_per_period INTEGER NOT NULL DEFAULT 1,
-      active_weekdays TEXT,
-      start_date TEXT NOT NULL DEFAULT '1970-01-01',
-      end_date TEXT,
-      checklist_template_id TEXT,
-      current_streak INTEGER NOT NULL DEFAULT 0,
-      longest_streak INTEGER NOT NULL DEFAULT 0,
-      is_archived INTEGER NOT NULL DEFAULT 0,
-      created_at TEXT NOT NULL DEFAULT '1970-01-01T00:00:00.000Z',
-      updated_at TEXT NOT NULL,
-      deleted_at TEXT
-    )
-  `);
-  await turso.execute(`
-    CREATE TABLE IF NOT EXISTS habit_logs (
-      id TEXT PRIMARY KEY,
-      habit_id TEXT NOT NULL,
-      log_date TEXT NOT NULL,
-      completed INTEGER NOT NULL DEFAULT 0,
-      note TEXT,
-      created_at TEXT NOT NULL,
-      updated_at TEXT NOT NULL,
-      auto_closed INTEGER NOT NULL DEFAULT 0,
-      deleted_at TEXT
-    )
-  `);
-  await turso.execute(`
-    CREATE UNIQUE INDEX IF NOT EXISTS idx_habit_logs_unique
-      ON habit_logs(habit_id, log_date)
-  `);
-  await turso.execute(`
-    CREATE TABLE IF NOT EXISTS checklist_categories (
-      id TEXT PRIMARY KEY,
-      user_id TEXT NOT NULL,
-      name TEXT NOT NULL,
-      slug TEXT NOT NULL,
-      icon TEXT,
-      color TEXT NOT NULL DEFAULT '#888888',
-      sort_order INTEGER NOT NULL DEFAULT 0,
-      is_system INTEGER NOT NULL DEFAULT 0,
-      created_at TEXT NOT NULL,
-      updated_at TEXT NOT NULL,
-      deleted_at TEXT
-    )
-  `);
-  await turso.execute(`
-    CREATE TABLE IF NOT EXISTS checklist_templates (
-      id TEXT PRIMARY KEY,
-      user_id TEXT NOT NULL,
-      title TEXT NOT NULL,
-      description TEXT,
-      icon TEXT,
-      category TEXT,
-      category_id TEXT,
-      sort_order INTEGER NOT NULL DEFAULT 0,
-      is_system INTEGER NOT NULL DEFAULT 0,
-      times_used INTEGER NOT NULL DEFAULT 0,
-      last_used_at TEXT,
-      created_at TEXT NOT NULL,
-      updated_at TEXT NOT NULL,
-      deleted_at TEXT
-    )
-  `);
-  await turso.execute(`
-    CREATE TABLE IF NOT EXISTS checklist_template_orders (
-      id TEXT PRIMARY KEY,
-      user_id TEXT NOT NULL,
-      template_id TEXT NOT NULL,
-      sort_order INTEGER NOT NULL DEFAULT 0,
-      created_at TEXT NOT NULL,
-      updated_at TEXT NOT NULL,
-      deleted_at TEXT,
-      UNIQUE(user_id, template_id)
-    )
-  `);
-  await turso.execute(`
-    CREATE TABLE IF NOT EXISTS checklist_template_items (
-      id TEXT PRIMARY KEY,
-      template_id TEXT NOT NULL,
-      position INTEGER NOT NULL,
-      title TEXT NOT NULL,
-      description TEXT,
-      is_required INTEGER NOT NULL DEFAULT 1,
-      created_at TEXT NOT NULL,
-      updated_at TEXT NOT NULL,
-      deleted_at TEXT
-    )
-  `);
-  await turso.execute(`
-    CREATE TABLE IF NOT EXISTS checklist_runs (
-      id TEXT PRIMARY KEY,
-      template_id TEXT NOT NULL,
-      user_id TEXT NOT NULL,
-      name TEXT,
-      status TEXT NOT NULL DEFAULT 'in_progress',
-      started_at TEXT NOT NULL,
-      completed_at TEXT,
-      duration_ms INTEGER,
-      created_at TEXT NOT NULL,
-      updated_at TEXT NOT NULL,
-      deleted_at TEXT
-    )
-  `);
-  await turso.execute(`
-    CREATE TABLE IF NOT EXISTS checklist_run_items (
-      id TEXT PRIMARY KEY,
-      run_id TEXT NOT NULL,
-      template_item_id TEXT NOT NULL,
-      status TEXT NOT NULL DEFAULT 'pending',
-      completed_at TEXT,
-      note TEXT,
-      created_at TEXT NOT NULL,
-      updated_at TEXT NOT NULL,
-      deleted_at TEXT
-    )
-  `);
-});
+before(() => applyAllMigrations(turso));
+after(() => turso.close());
 
 beforeEach(async () => {
   for (const table of [

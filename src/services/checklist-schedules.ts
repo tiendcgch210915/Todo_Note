@@ -9,6 +9,7 @@ import * as settingsRepo from "../repositories/notification-settings.js";
 import { addDays, localDateTimeToUtc } from "../utils/time.js";
 import { doneDatesOf } from "./checklist-occurrence-done.js";
 import {
+  indexRowsByChecklist,
   isOccurrenceDate,
   occurrencesBetween,
   toScheduleRule,
@@ -129,12 +130,14 @@ export const listOccurrences = async (
   to: string
 ): Promise<OccurrenceItem[]> => {
   await finishSchedulesForUserSafely(userId);
-  const ctx = await settingsRepo.getUserContext(userId);
+  const [ctx, schedules] = await Promise.all([
+    settingsRepo.getUserContext(userId),
+    schedulesRepo.listLiveSchedulesForUsers([userId]),
+  ]);
   const { timezone } = resolveSettings(
     ctx ?? { timezone: null, morning_time: null, evening_time: null }
   );
 
-  const schedules = await schedulesRepo.listLiveSchedulesForUsers([userId]);
   if (schedules.length === 0) return [];
   const templateIds = schedules.map((s) => s.template_id);
 
@@ -150,15 +153,18 @@ export const listOccurrences = async (
   ]);
 
   const items: OccurrenceItem[] = [];
+  const overridesFor = indexRowsByChecklist(overrideRows);
+  const runsFor = indexRowsByChecklist(runs);
+  const marksFor = indexRowsByChecklist(marks);
   for (const schedule of schedules) {
-    const overrides = overrideRows
-      .filter((row) => row.template_id === schedule.template_id)
+    const overrides = overridesFor(schedule)
       .map((row) => ({ localDate: row.local_date, time: row.time }));
-    const done = doneDatesOf({ userId, templateId: schedule.template_id }, runs, marks, timezone);
+    const scheduleMarks = marksFor(schedule);
+    const done = doneDatesOf(
+      { userId, templateId: schedule.template_id }, runsFor(schedule), scheduleMarks, timezone
+    );
     const manual = new Map(
-      marks
-        .filter((mark) => mark.template_id === schedule.template_id)
-        .map((mark) => [mark.local_date, mark.status] as const)
+      scheduleMarks.map((mark) => [mark.local_date, mark.status] as const)
     );
     for (const occurrence of occurrencesBetween(toScheduleRule(schedule), overrides, from, to)) {
       items.push({

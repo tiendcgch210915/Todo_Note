@@ -165,17 +165,10 @@ export const reconcileTodoOverdue = async (
     now
   ).map((slot) => slot.toISOString());
 
-  // Hủy phần thừa trước, rồi upsert phần cần: không có lúc nào mốc hợp lệ bị hủy tạm.
-  await jobsRepo.cancelSlotJobsExcept(userId, "todo_overdue", todo.id, slots);
-  for (const runAt of slots) {
-    await jobsRepo.upsertSlotJob({
-      userId,
-      kind: "todo_overdue",
-      refId: todo.id,
-      localDate: todo.scheduled_date,
-      runAt,
-    });
-  }
+  await jobsRepo.reconcileSlotJobs(
+    { userId, kind: "todo_overdue", refId: todo.id, localDate: todo.scheduled_date },
+    slots
+  );
 };
 
 /** Đổi múi giờ: giờ hẹn đổi sang UTC khác nên tính lại mốc của mọi todo có giờ sắp tới. */
@@ -216,27 +209,16 @@ export const backfillTodoOverdue = async (now: Date = new Date()): Promise<numbe
     const all = overdueSlots(scheduledAt, todo.scheduled_date, timezone, intervalMs);
     const slots = creatableOverdueSlots(all, "todo_overdue", now);
 
+    const schedule = {
+      userId: todo.user_id, kind: "todo_overdue", refId: todo.id, localDate: todo.scheduled_date,
+    } as const;
     if (slots.length === 0) {
-      await jobsRepo.insertSlotJobIfAbsent({
-        userId: todo.user_id,
-        kind: "todo_overdue",
-        refId: todo.id,
-        localDate: todo.scheduled_date,
-        runAt: (all[all.length - 1] ?? scheduledAt).toISOString(),
-        status: "missed",
-      });
-      continue;
-    }
-    for (const slot of slots) {
-      const inserted = await jobsRepo.insertSlotJobIfAbsent({
-        userId: todo.user_id,
-        kind: "todo_overdue",
-        refId: todo.id,
-        localDate: todo.scheduled_date,
-        runAt: slot.toISOString(),
-        status: "pending",
-      });
-      if (inserted) created++;
+      const last = all[all.length - 1] ?? scheduledAt;
+      await jobsRepo.insertSlotJobsIfAbsent(schedule, [last.toISOString()], "missed");
+    } else {
+      created += await jobsRepo.insertSlotJobsIfAbsent(
+        schedule, slots.map((slot) => slot.toISOString()), "pending"
+      );
     }
   }
   return created;

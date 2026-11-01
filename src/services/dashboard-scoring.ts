@@ -51,33 +51,6 @@ const todoWeight = (t: ScorableTodo, date: string): number => {
   return isFrogForDate(t, date) ? Math.max(regularWeight, 2) : regularWeight;
 };
 
-const computeTodoScore = (
-  todos: ScorableTodo[],
-  date: string
-): number => {
-  const scoredTodos = todos.filter((t) => isScoredTodo(t, date));
-  if (scoredTodos.length === 0) return 0;
-
-  const totalWeight = scoredTodos.reduce(
-    (sum, todo) => sum + todoWeight(todo, date),
-    0
-  );
-  if (totalWeight === 0) return 0;
-
-  const completedWeight = scoredTodos.reduce(
-    (sum, todo) =>
-      sum + (isCompletedForScore(todo, date) ? todoWeight(todo, date) : 0),
-    0
-  );
-  const frogBonus = scoredTodos.some(
-    (todo) => isFrogForDate(todo, date) && isCompletedForScore(todo, date)
-  )
-    ? FROG_BONUS_SCORE
-    : 0;
-
-  return (TODO_WEIGHT_SCORE * completedWeight) / totalWeight + frogBonus;
-};
-
 const computeHabitScore = (habits?: {
   total: number;
   completed: number;
@@ -91,14 +64,21 @@ export const computeScore = (
   date: string,
   habits?: { total: number; completed: number }
 ): number => {
-  const completedTodos = todos.filter((todo) =>
-    isCompletedForScore(todo, date)
-  ).length;
-  if (
-    todos.length < MIN_TODOS_FOR_SCORE ||
-    completedTodos < MIN_TODOS_FOR_SCORE
-  ) {
-    return 0;
+  if (todos.length < MIN_TODOS_FOR_SCORE) return 0;
+  let completedTodos = 0;
+  let totalWeight = 0;
+  let completedWeight = 0;
+  let frogBonus = 0;
+  for (const todo of todos) {
+    const weight = todoWeight(todo, date);
+    totalWeight += weight;
+    if (isCompletedForScore(todo, date)) {
+      completedTodos++;
+      completedWeight += weight;
+      if (isFrogForDate(todo, date)) frogBonus = FROG_BONUS_SCORE;
+    }
   }
-  return Math.round(computeTodoScore(todos, date) + computeHabitScore(habits));
+  if (completedTodos < MIN_TODOS_FOR_SCORE) return 0;
+  const todoScore = totalWeight ? (TODO_WEIGHT_SCORE * completedWeight) / totalWeight : 0;
+  return Math.round(todoScore + frogBonus + computeHabitScore(habits));
 };
