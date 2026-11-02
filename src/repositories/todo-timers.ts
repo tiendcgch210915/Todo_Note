@@ -15,6 +15,12 @@ export type TimerRow = {
   updated_at: string;
 };
 
+/**
+ * Todo đã được BẮT ĐẦU bằng đồng hồ đếm ngược: đang chạy, tạm dừng, hoặc đã hết giờ mà todo chưa xong
+ * (todo xong/bị cất thì timer về `idle`). Chỉ `idle` (chưa bấm giờ, hoặc đã dừng hẳn) là chưa bắt đầu.
+ */
+export const isTimerStarted = (status: TimerStatus): boolean => status !== "idle";
+
 const COLUMNS =
   "todo_id, user_id, status, estimated_seconds, remaining_seconds, ends_at, device_id, last_client_event_at, updated_at";
 

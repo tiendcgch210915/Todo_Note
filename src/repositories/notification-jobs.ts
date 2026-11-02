@@ -750,6 +750,7 @@ export const listTodosMissingReminderJobs = async (
  * Todo thuộc diện nhắc lặp (cùng điều kiện với `todoWantsOverdue`) của người dùng có thiết bị mà
  * CHƯA có dòng job `todo_overdue` nào cho ngày đó (todo có trước tính năng, hoặc hook bị sót).
  *
+ * Todo đã bắt đầu (`in_progress`) không còn thuộc diện nhắc lặp nên cũng bị loại.
  * Nhóm không nhắc lặp theo từng todo được loại ngay trong SQL: quan trọng & không khẩn cấp (đã có
  * tổng kết 17:00/07:00) và không quan trọng & không khẩn cấp (chỉ nhắc đúng giờ hẹn).
  *
@@ -772,7 +773,7 @@ export const listTodosMissingOverdueJobs = async (
             AND t.scheduled_date >= ?
             AND t.parent_id IS NULL
             AND t.deleted_at IS NULL
-            AND t.status IN ('open', 'in_progress')
+            AND t.status = 'open'
             AND (t.estimated_minutes IS NULL OR t.estimated_minutes <= ${OVERDUE.maxEstimatedMinutes})
             AND NOT (COALESCE(t.is_important, 1) = 0 AND COALESCE(t.is_urgent, 1) = 0)
             -- quan trọng & BIẾT chắc là không khẩn cấp (chưa phân loại thì vẫn thuộc diện nhắc)

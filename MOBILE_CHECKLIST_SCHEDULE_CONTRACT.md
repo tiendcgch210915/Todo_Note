@@ -347,6 +347,7 @@ Other copy changed in the same release:
 
 - Digests keep their titles, but the first body line is now a short numbers line (the collapsed notification only shows the first ~45 characters). Morning: `📋 Hôm nay: 5 todo (xong 2, còn 3) · 3 thói quen` / blank line / `💪 Động lực: “...”` / `💡 Suy ngẫm: ...` (a zero part is left out). Todos: `📋 Xong 2/5 todo · còn 3 đang chờ` (or `📋 Xong cả 5 todo hôm nay`) plus an optional `💪 ...` line. Habits: `📋 Đã duy trì 1/3 thói quen` (or `📋 Đã duy trì đủ 3/3 thói quen`) plus an optional `💪 ...` line. All labels live in `src/config/notification-labels.ts`.
 - `todo_overdue` (the repeated nudge after the appointment time) now says how late the todo is, because it replaces the previous nudge: `⏰ Trễ 2 giờ (hẹn 10:00) · Làm ngay hoặc dời lịch!` (it used to be `⏰ Quá giờ 10:00 · ...`).
+- `todo_overdue` stops once the todo is **started**, even if it is not completed: `status = "in_progress"`, or a countdown that was started on it (`PUT /todos/:id/timer` events `start`/`resume` -> running, `pause` -> paused, or the countdown ran out -> finished). Sending the timer event `stop` (back to `idle`) makes the todo eligible for the next slot again. The on-time `todo_reminder` is not affected.
 
 ## Notification tags (one card per task)
 

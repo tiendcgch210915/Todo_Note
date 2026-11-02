@@ -272,9 +272,12 @@ const prepare = async (job: jobsRepo.JobRow): Promise<Prepared> => {
       if (!isOverdueSlot(scheduledAt, new Date(runAtMs), job.local_date, settings.timezone, intervalMs)) {
         return CANCEL;
       }
-      // Đang bấm giờ làm chính todo này thì không phải "bỏ lỡ": bỏ mốc này, các mốc sau tự xét lại.
+      // Đã bắt đầu làm todo này (đồng hồ đang chạy, tạm dừng hoặc đã hết giờ mà chưa xong) thì không
+      // phải "bỏ lỡ" nữa: không nhắc lặp thêm. Dừng hẳn đồng hồ (idle) thì các mốc sau được xét lại.
       const timer = await timersRepo.getTimer(todo.id);
-      if (timer && timer.user_id === job.user_id && timer.status === "running") return CANCEL;
+      if (timer && timer.user_id === job.user_id && timersRepo.isTimerStarted(timer.status)) {
+        return CANCEL;
+      }
       // Thông báo cũ của todo bị thay nên bản này phải tự nói được "đã trễ bao lâu".
       const lateMinutes = Math.round((runAtMs - scheduledAt.getTime()) / 60_000);
       return {

@@ -1,6 +1,7 @@
 /**
  * Nhắc LẶP khi người dùng bỏ lỡ giờ hẹn của một todo, cho tới hết ngày địa phương đó, miễn là todo
- * vẫn chưa xong. Nhịp nhắc phụ thuộc todo thuộc nhóm nào (xem `todoOverdueIntervalMs`):
+ * vẫn chưa xong VÀ chưa được bắt đầu (đã bấm giờ hoặc chuyển `in_progress` thì không nhắc thêm, kể cả
+ * khi chưa hoàn thành). Nhịp nhắc phụ thuộc todo thuộc nhóm nào (xem `todoOverdueIntervalMs`):
  *  - quan trọng & khẩn cấp: giờ hẹn + 1h, +2h, ...;
  *  - khẩn cấp (không quan trọng) hoặc chưa phân loại: giờ hẹn + 2h, +4h, ...;
  *  - quan trọng (không khẩn cấp): KHÔNG nhắc theo từng todo, đã có tổng kết 17:00 và 07:00 sáng
@@ -75,12 +76,15 @@ export const overdueIntervalForFlags = (
 
 /**
  * Nhịp nhắc lặp (ms) của một todo, hoặc null nếu todo không được nhắc lặp theo từng todo. Điều kiện
- * chung: còn làm dở (open/in_progress), là todo cấp trên cùng, có ngày và giờ hẹn, và ước lượng
- * KHÔNG quá 2 giờ (trên 2h thì không bao giờ nhắc lặp; chưa ước lượng thì nhắc). Rồi theo nhóm:
- * xem `overdueIntervalForFlags`.
+ * chung: chưa bắt đầu và chưa xong (`open`; `in_progress` = đã bắt đầu rồi nên hết nhắc lặp), là
+ * todo cấp trên cùng, có ngày và giờ hẹn, và ước lượng KHÔNG quá 2 giờ (trên 2h thì không bao giờ
+ * nhắc lặp; chưa ước lượng thì nhắc). Rồi theo nhóm: xem `overdueIntervalForFlags`.
+ *
+ * Todo bắt đầu bằng đồng hồ đếm ngược (bảng `todo_timers`, không nằm trong `todo`) được loại ở bước
+ * kiểm tra lại ngay trước khi gửi (notification-tick, `isTimerStarted`).
  */
 export const todoOverdueIntervalMs = (todo: OverdueTodoFields): number | null => {
-  if (todo.status !== "open" && todo.status !== "in_progress") return null;
+  if (todo.status !== "open") return null;
   if (todo.parent_id !== null) return null;
   if (!todo.time || !todo.scheduled_date) return null;
   if (

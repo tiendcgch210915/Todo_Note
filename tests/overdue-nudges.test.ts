@@ -106,8 +106,7 @@ test("which todos get repeat nudges", () => {
   const wants = (o: Parameters<typeof todoFields>[0] = {}) => nudges.todoWantsOverdue(todoFields(o));
 
   assert.equal(wants(), true);
-  assert.equal(wants({ status: "in_progress" }), true);
-  for (const status of ["done", "archived"]) assert.equal(wants({ status }), false, status);
+  for (const status of ["in_progress", "done", "archived"]) assert.equal(wants({ status }), false, status);
   assert.equal(wants({ parent_id: "parent" }), false, "sub-tasks never carry a time");
   assert.equal(wants({ time: null }), false);
   assert.equal(wants({ scheduled_date: null }), false);
@@ -294,6 +293,17 @@ test("completing, deleting or moving the todo stops the nudges; un-completing br
   assert.deepEqual(await pendingRunAts("todo_overdue", todo.id), []);
 });
 
+test("starting the todo (in_progress) stops the nudges; setting it back to open brings them back", async () => {
+  const todo = await makeTodo({ title: "A", scheduled_date: DATE, time: "10:00", is_important: true });
+  assert.equal((await pendingRunAts("todo_overdue", todo.id)).length, 6);
+
+  await todosService.updateTodo(USER_ID, todo.id, { status: "in_progress" });
+  assert.deepEqual(await pendingRunAts("todo_overdue", todo.id), []);
+
+  await todosService.updateTodo(USER_ID, todo.id, { status: "open" });
+  assert.equal((await pendingRunAts("todo_overdue", todo.id)).length, 6);
+});
+
 test("editing an unrelated field after a nudge was sent does not send it again", async () => {
   const todo = await makeTodo({ title: "A", scheduled_date: DATE, time: "10:00", is_important: true });
   const first = slotsVn(DATE, ["12:00"])[0];
@@ -412,6 +422,7 @@ test("backfill skips todos that are not eligible and users without a device", as
   await fx.insertTodo(turso, { id: "ok", ...base });
   await fx.insertTodo(turso, { id: "important-only", ...base, isImportant: 1, isUrgent: 0 });
   await fx.insertTodo(turso, { id: "done", ...base, status: "done" });
+  await fx.insertTodo(turso, { id: "started", ...base, status: "in_progress" });
   await fx.insertTodo(turso, { id: "sub", ...base, parentId: "ok" });
   await fx.insertTodo(turso, { id: "big", ...base, estimatedMinutes: 240 });
   await fx.insertTodo(turso, { id: "q4", ...base, isImportant: 0, isUrgent: 0 });
@@ -573,8 +584,22 @@ test("a slot missed while the server was down is skipped, and the next slot is u
   assert.equal(overdueMessages().length, 2, "the 14:00 nudge still goes out");
 });
 
+/** Timer của todo "t1" ở trạng thái `status` (chỉ những trường mà server đọc khi quyết định nhắc). */
+const setTimer = (status: "idle" | "running" | "paused" | "finished") =>
+  timersRepo.upsertTimer({
+    todo_id: "t1",
+    user_id: USER_ID,
+    status,
+    estimated_seconds: 1500,
+    remaining_seconds: status === "finished" ? 0 : status === "idle" ? null : 900,
+    ends_at: status === "running" ? "2026-06-20T06:00:00.000Z" : null,
+    device_id: "device-A",
+    last_client_event_at: "2026-06-20T05:30:00.000Z",
+  });
+
 const invalidations: Array<[string, () => Promise<unknown>]> = [
   ["the todo is done", () => turso.execute("UPDATE todos SET status = 'done' WHERE id = 't1'")],
+  ["the todo was started (in_progress)", () => turso.execute("UPDATE todos SET status = 'in_progress' WHERE id = 't1'")],
   ["the todo is archived", () => turso.execute("UPDATE todos SET status = 'archived' WHERE id = 't1'")],
   ["the todo was deleted", () => turso.execute("UPDATE todos SET deleted_at = '2026-06-20T01:00:00.000Z' WHERE id = 't1'")],
   ["the estimate grew beyond 2 hours", () => turso.execute("UPDATE todos SET estimated_minutes = 180 WHERE id = 't1'")],
@@ -583,20 +608,9 @@ const invalidations: Array<[string, () => Promise<unknown>]> = [
   ["the todo was moved to another day", () => turso.execute({ sql: "UPDATE todos SET scheduled_date = ? WHERE id = 't1'", args: ["2026-06-21"] })],
   ["the todo lost its time", () => turso.execute("UPDATE todos SET time = NULL WHERE id = 't1'")],
   ["the user was disabled", () => turso.execute({ sql: "UPDATE users SET deleted_at = ? WHERE id = ?", args: ["2026-06-20T01:00:00.000Z", USER_ID] })],
-  [
-    "the countdown timer is running",
-    () =>
-      timersRepo.upsertTimer({
-        todo_id: "t1",
-        user_id: USER_ID,
-        status: "running",
-        estimated_seconds: 1500,
-        remaining_seconds: 1500,
-        ends_at: "2026-06-20T06:00:00.000Z",
-        device_id: "device-A",
-        last_client_event_at: "2026-06-20T05:30:00.000Z",
-      }),
-  ],
+  ["the countdown timer is running", () => setTimer("running")],
+  ["the countdown timer is paused (started, not finished)", () => setTimer("paused")],
+  ["the countdown ran out but the todo is not done", () => setTimer("finished")],
 ];
 
 for (const [label, mutate] of invalidations) {
@@ -611,39 +625,55 @@ for (const [label, mutate] of invalidations) {
   });
 }
 
-test("a paused countdown does not suppress the nudge", async () => {
+test("an idle timer (never started, or stopped) does not suppress the nudge", async () => {
   await armTodo();
-  await timersRepo.upsertTimer({
-    todo_id: "t1",
-    user_id: USER_ID,
-    status: "paused",
-    estimated_seconds: 1500,
-    remaining_seconds: 900,
-    ends_at: null,
-    device_id: "device-A",
-    last_client_event_at: "2026-06-20T05:30:00.000Z",
-  });
+  await setTimer("idle");
   await dispatchAt(TODAY, "12:00");
   assert.equal(overdueMessages().length, 2);
 });
 
-test("a running timer only skips the slot it overlaps; a later slot is judged on its own", async () => {
+test("a started todo gets no nudge at any later slot, however the countdown evolves, until it is stopped", async () => {
+  await armTodo();
+
+  await setTimer("running");
+  await dispatchAt(TODAY, "12:00");
+  await setTimer("paused");
+  await dispatchAt(TODAY, "14:00");
+  await setTimer("finished");
+  await dispatchAt(TODAY, "16:00");
+  assert.equal(overdueMessages().length, 0, "started but not completed: no repeats");
+
+  await timersRepo.resetTimerIdle("t1");
+  await dispatchAt(TODAY, "18:00");
+  assert.equal(overdueMessages().length, 2, "stopping the countdown makes the todo nudgeable again");
+});
+
+test("a todo started in_progress is not nudged at any slot even though its jobs were already armed", async () => {
+  await armTodo();
+
+  // Written straight to the DB, so no hook ran and all six slots are still pending.
+  await turso.execute("UPDATE todos SET status = 'in_progress' WHERE id = 't1'");
+  assert.equal((await pendingRunAts("todo_overdue", "t1")).length, 6);
+
+  for (const hhmm of EVEN_SLOTS) await dispatchAt(TODAY, hhmm);
+
+  assert.equal(overdueMessages().length, 0);
+  assert.deepEqual(new Set(await statusesOf("todo_overdue", "t1")), new Set(["cancelled"]));
+});
+
+test("another user's timer row never suppresses the nudge", async () => {
   await armTodo();
   await timersRepo.upsertTimer({
     todo_id: "t1",
-    user_id: USER_ID,
+    user_id: OTHER_USER_ID,
     status: "running",
     estimated_seconds: 1500,
-    remaining_seconds: 1500,
+    remaining_seconds: 900,
     ends_at: "2026-06-20T06:00:00.000Z",
-    device_id: "device-A",
-    last_client_event_at: "2026-06-20T05:00:00.000Z",
+    device_id: null,
+    last_client_event_at: "2026-06-20T05:30:00.000Z",
   });
   await dispatchAt(TODAY, "12:00");
-  assert.equal(overdueMessages().length, 0);
-
-  await timersRepo.resetTimerIdle("t1");
-  await dispatchAt(TODAY, "14:00");
   assert.equal(overdueMessages().length, 2);
 });
 
