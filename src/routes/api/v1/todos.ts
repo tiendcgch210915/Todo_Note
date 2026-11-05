@@ -14,6 +14,10 @@ import {
 } from "../../../schemas/api/todos.js";
 import * as todos from "../../../services/todos.js";
 import {
+  acknowledgeReminder,
+  ReminderRepeatError,
+} from "../../../services/reminder-repeat.js";
+import {
   applyTimerEvent,
   TimerServiceError,
 } from "../../../services/todo-timers.js";
@@ -278,6 +282,19 @@ export default async function todosRoutes(app: FastifyInstance) {
           return reply.code(404).send({ error: "device_not_found" });
         if (e.code === "todo_completed")
           return reply.code(409).send({ error: "todo_completed" });
+      }
+      throw e;
+    }
+  });
+
+  // POST /:id/reminder-ack — người dùng đã chạm thông báo / đang mở app: dừng các lần nhắc lại
+  // (+2, +4 phút sau nhắc đúng giờ). Không có body; idempotent.
+  app.post<{ Params: { id: string } }>("/:id/reminder-ack", async (req, reply) => {
+    try {
+      return await acknowledgeReminder(req.userId, req.params.id);
+    } catch (e) {
+      if (e instanceof ReminderRepeatError) {
+        return reply.code(404).send({ error: "not_found" });
       }
       throw e;
     }

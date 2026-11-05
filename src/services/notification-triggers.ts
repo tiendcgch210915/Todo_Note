@@ -27,6 +27,7 @@ import { dismissStaleTodoCard } from "./notification-cards.js";
 import { recomputePendingDigests, planUser } from "./notification-planner.js";
 import { resolveSettings } from "./notification-schedule.js";
 import { reconcileAllTodoOverdue, reconcileTodoOverdue } from "./overdue-nudges.js";
+import { cancelReminderRepeats, reconcileReminderRepeats } from "./reminder-repeat.js";
 
 const safely = async (op: string, fn: () => Promise<void>): Promise<void> => {
   try {
@@ -56,6 +57,7 @@ const clearTodoArtifacts = async (
 ): Promise<void> => {
   await jobsRepo.cancelEventJobs("todo_reminder", todoIds);
   await jobsRepo.cancelEventJobs("todo_overdue", todoIds);
+  await cancelReminderRepeats(todoIds);
   await jobsRepo.cancelEventJobs("todo_timer_end", todoIds);
   if (dropTimerRows) {
     await timersRepo.deleteTimers(todoIds);
@@ -86,6 +88,7 @@ const rearmTodoJobs = async (
   if (!todo.time || !todo.scheduled_date || todo.parent_id !== null) {
     await jobsRepo.cancelEventJobs("todo_reminder", [todo.id]);
     await jobsRepo.cancelEventJobs("todo_overdue", [todo.id]);
+    await cancelReminderRepeats([todo.id]);
     return;
   }
 
@@ -101,6 +104,10 @@ const rearmTodoJobs = async (
   );
 
   const runAt = localDateTimeToUtc(todo.scheduled_date, todo.time, timezone);
+  // Nhắc lại (+2, +4 phút) chỉ còn giá trị khi vẫn khớp giờ hẹn mới và todo chưa bắt đầu.
+  await safely("reminder_repeat_changed", () =>
+    reconcileReminderRepeats(userId, todo, runAt)
+  );
   if (runAt.getTime() <= now.getTime()) {
     // Chỉ nhắc giờ ở TƯƠNG LAI; giờ đã qua thì bỏ job đang chờ (nếu có).
     await jobsRepo.cancelEventJobs("todo_reminder", [todo.id]);

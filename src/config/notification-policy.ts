@@ -55,11 +55,21 @@ export const LEGACY_SLOT_KINDS = ["checklist_overdue"] as const;
  */
 export const RUNNING_KINDS = ["checklist_running"] as const;
 
+/**
+ * Nhắc LẠI NGAY SAU nhắc đúng giờ của TODO: `REMINDER_REPEAT.count` lần, cách nhau
+ * `REMINDER_REPEAT.intervalMs`, tính từ giờ hẹn (+2 phút, +4 phút). Mỗi lần là MỘT dòng job riêng,
+ * duy nhất theo (user, kind, ref_id, run_at), và chỉ được tạo SAU KHI nhắc đúng giờ đã gửi (xem
+ * `services/reminder-repeat.ts`). Dừng ngay khi người dùng đã chạm thông báo, đã bắt đầu todo (bấm giờ /
+ * `in_progress`) hoặc đang mở app: app báo bằng `POST /todos/:id/reminder-ack`.
+ */
+export const REMINDER_REPEAT_KINDS = ["todo_reminder_repeat"] as const;
+
 /** Mọi loại "mỗi mốc một dòng": duy nhất theo (user, kind, ref_id, run_at). */
 export const SLOT_KINDS = [
   ...OVERDUE_KINDS,
   ...LEGACY_SLOT_KINDS,
   ...RUNNING_KINDS,
+  ...REMINDER_REPEAT_KINDS,
 ] as const;
 
 export const NOTIFICATION_KINDS = [
@@ -68,6 +78,7 @@ export const NOTIFICATION_KINDS = [
   ...OVERDUE_KINDS,
   ...LEGACY_SLOT_KINDS,
   ...RUNNING_KINDS,
+  ...REMINDER_REPEAT_KINDS,
   ...DIGEST_KINDS,
 ] as const;
 
@@ -101,6 +112,8 @@ export const LATENESS_MS: Record<NotificationJobKind, number> = {
   todo_overdue: 30 * MINUTE,
   checklist_overdue: 30 * MINUTE,
   checklist_running: 30 * MINUTE,
+  // Một lần nhắc lại trễ hơn khoảng cách giữa hai lần thì đã chồng lên lần kế: bỏ, không gửi bù.
+  todo_reminder_repeat: 2 * MINUTE,
   digest_morning: 2 * HOUR,
   digest_todos: 2 * HOUR,
   digest_habits: 1 * HOUR,
@@ -118,6 +131,8 @@ export const TTL_MS: Record<NotificationJobKind, number> = {
   todo_overdue: 3_600_000,
   checklist_overdue: 3_600_000,
   checklist_running: 3_600_000,
+  // Máy offline thì nhắc lại đã vô nghĩa khi nó online trở lại: FCM bỏ sau 2 phút.
+  todo_reminder_repeat: 120_000,
   digest_morning: 7_200_000,
   digest_todos: 7_200_000,
   digest_habits: 3_600_000,
@@ -135,6 +150,7 @@ export const CHANNEL_ID: Record<NotificationJobKind, string> = {
   todo_overdue: "todo_reminders",
   checklist_overdue: "checklist_reminders",
   checklist_running: "checklist_reminders",
+  todo_reminder_repeat: "todo_reminders",
   digest_morning: "daily_digest",
   digest_todos: "daily_digest",
   digest_habits: "daily_digest",
@@ -157,6 +173,8 @@ export const DATA_TYPE: Record<NotificationJobKind, string> = {
   checklist_overdue: "checklist_due",
   // Giống checklist_30m trước đây: app mở đúng lần chạy đang làm dở (data.id = id của run).
   checklist_running: "checklist",
+  // Cùng type với nhắc đúng giờ; app nhận biết lần nhắc lại qua `data.repeat` ("1", "2").
+  todo_reminder_repeat: "todo",
   digest_morning: "digest_morning",
   digest_todos: "digest_todos",
   digest_habits: "digest_habits",
@@ -193,6 +211,7 @@ export const notificationTag = (
 ): string => {
   switch (kind) {
     case "todo_reminder":
+    case "todo_reminder_repeat":
     case "todo_overdue":
     case "todo_timer_end":
       return `todo:${subjectId}`;
@@ -218,6 +237,15 @@ export const notificationTag = (
  * hẹn; `todo_timer_end` là sự kiện đếm ngược, không gắn với giờ hẹn.
  */
 export const TODO_CARD_KINDS = ["todo_reminder", "todo_overdue"] as const;
+
+/**
+ * Nhắc lại ngay sau nhắc đúng giờ (xem `REMINDER_REPEAT_KINDS`): `count` lần, mỗi lần cách giờ hẹn thêm
+ * `intervalMs` (+2 phút, +4 phút).
+ */
+export const REMINDER_REPEAT = {
+  count: 2,
+  intervalMs: 2 * MINUTE,
+} as const;
 
 /** Giá trị `data.type` của tin "gỡ thông báo" (tin chỉ có data, không hiện gì): app hủy thông báo theo `data.tag`. */
 export const DISMISS_DATA_TYPE = "dismiss";

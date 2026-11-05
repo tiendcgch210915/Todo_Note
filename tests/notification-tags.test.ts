@@ -16,7 +16,12 @@ import {
 
 const UUID = "0192f3c0-aaaa-7bbb-8ccc-0123456789ab";
 
-const TODO_KINDS: readonly NotificationJobKind[] = ["todo_reminder", "todo_overdue", "todo_timer_end"];
+const TODO_KINDS: readonly NotificationJobKind[] = [
+  "todo_reminder",
+  "todo_reminder_repeat",
+  "todo_overdue",
+  "todo_timer_end",
+];
 const CHECKLIST_KINDS: readonly NotificationJobKind[] = [
   "checklist_due",
   "checklist_running",

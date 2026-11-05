@@ -439,6 +439,7 @@ test("the documented lateness thresholds are the configured ones", () => {
     todo_overdue: 30 * MINUTE,
     checklist_overdue: 30 * MINUTE,
     checklist_running: 30 * MINUTE,
+    todo_reminder_repeat: 2 * MINUTE,
     digest_morning: 2 * MIN,
     digest_todos: 2 * MIN,
     digest_habits: 1 * MIN,

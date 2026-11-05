@@ -427,11 +427,14 @@ const upsertSlot = `DO UPDATE SET
   sent_at = CASE WHEN ${KEEP_STATE_SQL} THEN notification_jobs.sent_at ELSE NULL END,
   local_date = excluded.local_date`;
 
+/** `cancelled` ghi sẵn một mốc đã bị hủy (dấu "đừng tạo lại"): xem `acknowledgeReminder`. */
+type SlotInsertStatus = "pending" | "missed" | "cancelled";
+
 // Callers supply at most one local day's slots for a single todo or run.
 const slotInsert = (
   schedule: SlotSchedule,
   runAts: readonly string[],
-  status: "pending" | "missed",
+  status: SlotInsertStatus,
   onConflict: "ignore" | "update"
 ) => {
   const createdAt = nowISO();
@@ -455,7 +458,7 @@ export const upsertSlotJob = async (input: SlotSchedule & { runAt: string }): Pr
 export const insertSlotJobsIfAbsent = async (
   schedule: SlotSchedule,
   runAts: readonly string[],
-  status: "pending" | "missed"
+  status: SlotInsertStatus
 ): Promise<number> => {
   if (runAts.length === 0) return 0;
   const res = await turso.execute(slotInsert(schedule, runAts, status, "ignore"));

@@ -8,6 +8,7 @@ import * as devicesRepo from "../repositories/notifications.js";
 import * as timersRepo from "../repositories/todo-timers.js";
 import * as todosRepo from "../repositories/todos.js";
 import type { TodoTimerInput } from "../schemas/api/todos.js";
+import { cancelReminderRepeats } from "./reminder-repeat.js";
 
 export class TimerServiceError extends Error {
   constructor(public code: "not_found" | "device_not_found" | "todo_completed") {
@@ -97,6 +98,9 @@ export const applyTimerEvent = async (
         input.registrationId ?? ""
       );
       if (!device) throw new TimerServiceError("device_not_found");
+
+      // Đã bắt đầu làm: nhắc lại (+2, +4 phút) sau nhắc đúng giờ không còn cần nữa.
+      await cancelReminderRepeats([todoId]);
 
       // Sự kiện đến muộn quá ngưỡng: trừ phần độ trễ khỏi thời gian còn lại.
       const delayMs = nowMs - eventMs;

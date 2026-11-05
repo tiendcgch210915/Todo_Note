@@ -58,6 +58,7 @@ import {
 } from "./notification-planner.js";
 import { resolveSettings } from "./notification-schedule.js";
 import { notifyUser } from "./notifications.js";
+import { repeatIndexOf, scheduleReminderRepeats } from "./reminder-repeat.js";
 import {
   backfillTodoOverdue,
   isOverdueSlot,
@@ -113,6 +114,8 @@ type Prepared =
        * (xem `todoCardKey`). Chỉ nhắc đúng giờ và nhắc lặp có.
        */
       cardKey?: string;
+      /** Khóa data bổ sung (giá trị là chuỗi); không ghi đè được `type`/`id`/`date`. */
+      data?: Record<string, string>;
       /** Chạy sau khi gửi thành công. */
       afterSent?: () => Promise<void>;
     };
@@ -149,7 +152,7 @@ const digestStats = async (
  * Kiểm tra lại điều kiện NGAY TRƯỚC KHI gửi và dựng nội dung từ dữ liệu hiện tại.
  * Không khớp -> hủy, không gửi.
  */
-const prepare = async (job: jobsRepo.JobRow): Promise<Prepared> => {
+const prepare = async (job: jobsRepo.JobRow, now: Date): Promise<Prepared> => {
   const ctx = await settingsRepo.getUserContext(job.user_id);
   if (!ctx || !ctx.active) return CANCEL;
   const settings = resolveSettings(ctx);
@@ -182,6 +185,40 @@ const prepare = async (job: jobsRepo.JobRow): Promise<Prepared> => {
         date,
         tag: todoTag(job.kind, todo),
         cardKey: todoCardKey(todo) ?? undefined,
+        // Nhắc đúng giờ đã đi thì mới hẹn nhắc lại (+2, +4 phút); xem services/reminder-repeat.ts.
+        afterSent: () => scheduleReminderRepeats(job.user_id, todo, expected, now),
+      };
+    }
+
+    case "todo_reminder_repeat": {
+      if (!job.ref_id || !job.local_date) return CANCEL;
+      const todo = await todosRepo.getTodoByIdScoped(job.ref_id, job.user_id);
+      // `open` = chưa bắt đầu: `in_progress` (đã bắt đầu), xong, cất hay xóa đều không nhắc nữa.
+      if (
+        !todo ||
+        todo.status !== "open" ||
+        todo.parent_id !== null ||
+        !todo.time ||
+        todo.scheduled_date !== job.local_date
+      ) {
+        return CANCEL;
+      }
+      // Giờ hẹn đã bị sửa sau khi job được tạo -> mốc này không còn là mốc nhắc lại của giờ hẹn hiện tại.
+      const scheduledAt = localDateTimeToUtc(todo.scheduled_date, todo.time, settings.timezone);
+      const repeat = repeatIndexOf(scheduledAt, new Date(runAtMs));
+      if (repeat === null) return CANCEL;
+      // Đã bấm giờ (đang chạy, tạm dừng hay hết giờ) tức là đã bắt đầu làm: không nhắc nữa.
+      const timer = await timersRepo.getTimer(todo.id);
+      if (timer && timer.user_id === job.user_id && timersRepo.isTimerStarted(timer.status)) {
+        return CANCEL;
+      }
+      return {
+        // Cùng nội dung và thẻ với nhắc đúng giờ: thẻ trên khay được thay bằng bản này và kêu lại.
+        text: buildTodoReminder(todo.title, todo.is_important, todo.is_urgent),
+        id: todo.id,
+        date: job.local_date,
+        tag: todoTag(job.kind, todo),
+        data: { repeat: String(repeat) },
       };
     }
 
@@ -385,12 +422,12 @@ const logSent = (
 
 const processClaimed = async (
   claimed: jobsRepo.JobRow,
-  options: { dryRun: boolean; logger: PushLogger }
+  options: { dryRun: boolean; logger: PushLogger; now?: Date }
 ): Promise<Outcome> => {
   // `claimed` đã ở trạng thái processing (attempts đã được tăng khi giành quyền).
   const attempts = claimed.attempts;
   try {
-    const prepared = await prepare(claimed);
+    const prepared = await prepare(claimed, options.now ?? new Date());
     if (prepared.cancel) {
       await jobsRepo.markTerminal(claimed.id, claimed.run_at, "cancelled");
       return "cancelled";
@@ -411,6 +448,7 @@ const processClaimed = async (
         title: prepared.text.title,
         body: prepared.text.body,
         data: {
+          ...prepared.data,
           type: DATA_TYPE[claimed.kind],
           id: prepared.id,
           date: prepared.date,
@@ -565,7 +603,7 @@ const dispatchDue = async (
     // Đọc lại sau khi giành quyền: run_at/đích có thể vừa bị sửa.
     const claimed = await jobsRepo.getJobById(candidate.id);
     if (!claimed || claimed.status !== "processing") return;
-    const outcome = await processClaimed(claimed, { dryRun, logger });
+    const outcome = await processClaimed(claimed, { dryRun, logger, now: options.now });
     summary[outcome]++;
   };
 
