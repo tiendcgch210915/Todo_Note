@@ -445,6 +445,9 @@ test("GET /notification-settings returns the defaults and the derived habit time
     habitSummaryTime: "17:30",
     reviewTime: "21:30",
     timezone: "Asia/Ho_Chi_Minh",
+    morningEnabled: true,
+    eveningEnabled: true,
+    reviewEnabled: true,
   });
 });
 
@@ -465,6 +468,9 @@ test("PUT /notification-settings saves, changes users.timezone and moves pending
     habitSummaryTime: "20:30",
     reviewTime: "21:30",
     timezone: "America/New_York",
+    morningEnabled: true,
+    eveningEnabled: true,
+    reviewEnabled: true,
   });
 
   const user = await turso.execute({ sql: "SELECT timezone, updated_at FROM users WHERE id = ?", args: [USER_ID] });

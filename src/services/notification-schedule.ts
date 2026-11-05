@@ -4,7 +4,9 @@
  */
 import {
   DEFAULT_NOTIFICATION_SETTINGS,
+  DIGEST_GROUP,
   OVERDUE_DIGEST,
+  type DigestGroup,
   type DigestKind,
 } from "../config/notification-policy.js";
 import {
@@ -22,6 +24,8 @@ export type ResolvedSettings = {
   habitSummaryTime: string;
   /** Giờ thông báo rà soát cuối ngày (digest_review), mặc định 21:30. */
   reviewTime: string;
+  /** Nhóm tổng kết nào đang bật; chưa lưu cài đặt = bật hết. */
+  enabled: Record<DigestGroup, boolean>;
 };
 
 export const resolveSettings = (input: {
@@ -30,6 +34,9 @@ export const resolveSettings = (input: {
   evening_time: string | null | undefined;
   /** Bỏ qua được: nơi chỉ cần múi giờ không phải truyền. */
   review_time?: string | null | undefined;
+  morning_enabled?: boolean | null | undefined;
+  evening_enabled?: boolean | null | undefined;
+  review_enabled?: boolean | null | undefined;
 }): ResolvedSettings => {
   const timezone =
     input.timezone && isValidTimeZone(input.timezone)
@@ -53,8 +60,19 @@ export const resolveSettings = (input: {
     eveningTime,
     habitSummaryTime: habitSummaryTime(eveningTime),
     reviewTime,
+    enabled: {
+      morning: input.morning_enabled ?? DEFAULT_NOTIFICATION_SETTINGS.morningEnabled,
+      evening: input.evening_enabled ?? DEFAULT_NOTIFICATION_SETTINGS.eveningEnabled,
+      review: input.review_enabled ?? DEFAULT_NOTIFICATION_SETTINGS.reviewEnabled,
+    },
   };
 };
+
+/** Người dùng có đang bật tổng kết `kind` không (xem `DIGEST_GROUP`). */
+export const isDigestEnabled = (
+  kind: DigestKind,
+  settings: ResolvedSettings
+): boolean => settings.enabled[DIGEST_GROUP[kind]];
 
 /** Giờ địa phương mỗi loại tổng kết được gửi. */
 export const digestLocalTime = (

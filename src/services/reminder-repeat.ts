@@ -1,6 +1,6 @@
 /**
  * Nhắc LẠI MỘT LẦN ngay sau nhắc đúng giờ của todo "quan trọng và khẩn cấp": `REMINDER_REPEAT.count`
- * lần (1), cách giờ hẹn `REMINDER_REPEAT.intervalMs` (2 phút), tức +2 phút. Todo thuộc nhóm khác (kể cả
+ * lần (1), cách giờ hẹn `REMINDER_REPEAT.intervalMs` (5 phút), tức +5 phút. Todo thuộc nhóm khác (kể cả
  * chưa phân loại) không có nhắc lại này; nhịp nhắc theo giờ của nó là việc của `overdue-nudges`.
  * Chỉ để chắc người dùng không bỏ lỡ lời nhắc, nên phải DỪNG ngay khi họ đã phản ứng:
  *
@@ -41,7 +41,7 @@ export class ReminderRepeatError extends Error {
 
 // ── Hàm thuần ────────────────────────────────────────────────────────────────
 
-/** Các mốc nhắc lại của giờ hẹn `scheduledAt`: +interval, +2·interval, ... (`count` mốc; hiện là MỘT mốc, +2 phút). */
+/** Các mốc nhắc lại của giờ hẹn `scheduledAt`: +interval, +2·interval, ... (`count` mốc; hiện là MỘT mốc, +5 phút). */
 export const repeatSlots = (scheduledAt: Date): Date[] =>
   Array.from(
     { length: REMINDER_REPEAT.count },
@@ -89,7 +89,7 @@ const toIso = (slots: readonly Date[]): string[] => slots.map((slot) => slot.toI
 
 /**
  * Gọi sau khi nhắc đúng giờ ĐÃ GỬI: tạo lần nhắc lại nếu todo thuộc diện (quan trọng và khẩn cấp) và mốc
- * còn ở tương lai (nhắc đúng giờ gửi muộn quá +2 phút thì không còn lần nhắc lại). Idempotent, và không
+ * còn ở tương lai (nhắc đúng giờ gửi muộn quá +5 phút thì không còn lần nhắc lại). Idempotent, và không
  * bao giờ throw: lỗi ở đây không được làm hỏng việc ghi kết quả của nhắc đúng giờ.
  */
 export const scheduleReminderRepeats = async (
@@ -163,11 +163,25 @@ export const acknowledgeReminder = async (
     const upcoming = repeatSlots(
       localDateTimeToUtc(todo.scheduled_date, todo.time, timezone)
     ).filter((slot) => slot.getTime() > now.getTime());
-    await jobsRepo.insertSlotJobsIfAbsent(
-      { userId, kind: KIND, refId: todo.id, localDate: todo.scheduled_date },
-      toIso(upcoming),
-      "cancelled"
-    );
+    try {
+      await jobsRepo.insertSlotJobsIfAbsent(
+        { userId, kind: KIND, refId: todo.id, localDate: todo.scheduled_date },
+        toIso(upcoming),
+        "cancelled"
+      );
+    } catch (error) {
+      // Dấu "đừng tạo lại" chỉ là lớp bảo hiểm cho trường hợp ack đến trước khi dòng nhắc lại được tạo.
+      // Nó lỗi (ví dụ chưa áp migration 0027 nên bảng chưa nhận loại job này, mà khi đó cũng chưa có
+      // nhắc lại nào để dừng) không được làm app nhận 500 rồi gọi lại mãi.
+      pushLogger.error(
+        {
+          op: "reminder_ack_marker",
+          errorName: error instanceof Error ? error.name : "unknown",
+          errorMessage: error instanceof Error ? error.message : String(error),
+        },
+        "reminder ack marker failed"
+      );
+    }
   }
   return { todo_id: todo.id, cancelled };
 };

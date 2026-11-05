@@ -10,7 +10,8 @@ const HHmm = z.string().regex(HHMM_RE, "Expected HH:mm");
 /**
  * PUT /notification-settings. Giờ thói quen = eveningTime + 30 phút (tính tự động, tối đa
  * 23:59) nên eveningTime phải <= 23:29. `reviewTime` (giờ thông báo rà soát cuối ngày) không
- * bắt buộc: bỏ trống = giữ giờ đã lưu.
+ * bắt buộc: bỏ trống = giữ giờ đã lưu. `morningEnabled` / `eveningEnabled` / `reviewEnabled` bật/tắt từng
+ * nhóm tổng kết (tắt cả ba = không nhận tổng kết nào); cũng không bắt buộc: bỏ trống = giữ lựa chọn đã lưu.
  */
 export const UpdateNotificationSettingsSchema = z.object({
   morningTime: HHmm,
@@ -19,6 +20,9 @@ export const UpdateNotificationSettingsSchema = z.object({
     "eveningTime must be 23:29 or earlier so the habit summary (+30 min) stays within the day"
   ),
   reviewTime: HHmm.optional(),
+  morningEnabled: z.boolean().optional(),
+  eveningEnabled: z.boolean().optional(),
+  reviewEnabled: z.boolean().optional(),
   timezone: z
     .string()
     .trim()

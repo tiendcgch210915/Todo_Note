@@ -83,6 +83,7 @@ test("settings default to 07:00 / 17:00 / Asia/Ho_Chi_Minh and survive bad store
     eveningTime: "17:00",
     habitSummaryTime: "17:30",
     reviewTime: "21:30",
+    enabled: { morning: true, evening: true, review: true },
   });
   const garbage = resolveSettings({ timezone: "Nope/Nope", morning_time: "7am", evening_time: "99:99" });
   assert.equal(garbage.timezone, "Asia/Ho_Chi_Minh");

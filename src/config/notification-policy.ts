@@ -57,7 +57,7 @@ export const RUNNING_KINDS = ["checklist_running"] as const;
 
 /**
  * Nhắc LẠI MỘT LẦN ngay sau nhắc đúng giờ của TODO "quan trọng và khẩn cấp": cách giờ hẹn
- * `REMINDER_REPEAT.intervalMs` (+2 phút). Là MỘT dòng job riêng, duy nhất theo (user, kind, ref_id,
+ * `REMINDER_REPEAT.intervalMs` (+5 phút). Là MỘT dòng job riêng, duy nhất theo (user, kind, ref_id,
  * run_at), và chỉ được tạo SAU KHI nhắc đúng giờ đã gửi (xem `services/reminder-repeat.ts`). Dừng ngay khi
  * người dùng đã chạm thông báo, đã bắt đầu todo (bấm giờ / `in_progress`) hoặc đang mở app: app báo bằng
  * `POST /todos/:id/reminder-ack`.
@@ -100,6 +100,22 @@ export type NotificationJobStatus =
 export const isDigestKind = (kind: string): kind is DigestKind =>
   (DIGEST_KINDS as readonly string[]).includes(kind);
 
+/**
+ * Ba nhóm tổng kết mà người dùng bật/tắt riêng (PUT /notification-settings: morningEnabled,
+ * eveningEnabled, reviewEnabled). Mỗi nhóm gồm mọi tổng kết gửi ở buổi đó, kể cả tổng kết todo quan trọng
+ * quá hạn 07:00 / 17:00. Loại mới thêm vào `DIGEST_KINDS` PHẢI có mặt ở đây (compile error nếu thiếu).
+ */
+export type DigestGroup = "morning" | "evening" | "review";
+
+export const DIGEST_GROUP: Record<DigestKind, DigestGroup> = {
+  digest_morning: "morning",
+  digest_overdue_morning: "morning",
+  digest_todos: "evening",
+  digest_habits: "evening",
+  digest_overdue_evening: "evening",
+  digest_review: "review",
+};
+
 const MINUTE = 60_000;
 const HOUR = 60 * MINUTE;
 
@@ -112,7 +128,7 @@ export const LATENESS_MS: Record<NotificationJobKind, number> = {
   todo_overdue: 30 * MINUTE,
   checklist_overdue: 30 * MINUTE,
   checklist_running: 30 * MINUTE,
-  // Một lần nhắc lại trễ hơn khoảng cách giữa hai lần thì đã chồng lên lần kế: bỏ, không gửi bù.
+  // Nhắc lại chỉ là một cú hích ngay sau nhắc đúng giờ: trễ quá 2 phút (server ngủ) thì bỏ, không gửi bù.
   todo_reminder_repeat: 2 * MINUTE,
   digest_morning: 2 * HOUR,
   digest_todos: 2 * HOUR,
@@ -240,11 +256,11 @@ export const TODO_CARD_KINDS = ["todo_reminder", "todo_overdue"] as const;
 
 /**
  * Nhắc lại ngay sau nhắc đúng giờ (xem `REMINDER_REPEAT_KINDS`): `count` lần, mỗi lần cách giờ hẹn thêm
- * `intervalMs`. Hiện là MỘT lần, +2 phút, chỉ cho todo quan trọng và khẩn cấp.
+ * `intervalMs`. Hiện là MỘT lần, +5 phút, chỉ cho todo quan trọng và khẩn cấp.
  */
 export const REMINDER_REPEAT = {
   count: 1,
-  intervalMs: 2 * MINUTE,
+  intervalMs: 5 * MINUTE,
 } as const;
 
 /** Giá trị `data.type` của tin "gỡ thông báo" (tin chỉ có data, không hiện gì): app hủy thông báo theo `data.tag`. */
@@ -368,6 +384,10 @@ export const DEFAULT_NOTIFICATION_SETTINGS = {
   /** Giờ gửi thông báo rà soát cuối ngày (sửa được qua PUT /notification-settings). */
   reviewTime: "21:30",
   timezone: "Asia/Ho_Chi_Minh",
+  /** Mọi tổng kết mặc định BẬT (người dùng chưa lưu cài đặt, hoặc app bản cũ không gửi trường này). */
+  morningEnabled: true,
+  eveningEnabled: true,
+  reviewEnabled: true,
 } as const;
 
 /** Giờ thói quen = evening_time + 30 phút, tối đa 23:59. */

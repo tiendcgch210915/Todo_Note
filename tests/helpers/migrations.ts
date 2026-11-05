@@ -109,6 +109,11 @@ export const createNotificationTables = async (db: TestDb): Promise<void> => {
   });
   // 0023 thêm bảng dấu tay "Đã xong / Chưa hoàn thành" theo ngày (và chuyển chỉ mục run sang started_at).
   await applyMigrationFileOnce(db, "0023_checklist_occurrence_marks.sql", "checklist_occurrence_marks");
+  // 0028 thêm cờ bật/tắt từng nhóm tổng kết vào notification_settings.
+  await applyMigrationFileWhen(db, "0028_notification_digest_toggles.sql", async () => {
+    const columns = await db.execute("PRAGMA table_info(notification_settings)");
+    return !columns.rows.some((row) => row.name === "morning_enabled");
+  });
 };
 
 /**

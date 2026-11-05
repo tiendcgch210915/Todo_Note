@@ -21,7 +21,8 @@ export default async function notificationSettingsRoutes(app: FastifyInstance) {
     }
   });
 
-  // PUT /notification-settings  { morningTime, eveningTime, timezone }
+  // PUT /notification-settings  { morningTime, eveningTime, timezone, reviewTime?,
+  //                               morningEnabled?, eveningEnabled?, reviewEnabled? }
   app.put("/", async (req, reply) => {
     const parsed = UpdateNotificationSettingsSchema.safeParse(req.body);
     if (!parsed.success) {

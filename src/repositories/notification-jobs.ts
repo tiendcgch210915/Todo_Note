@@ -661,12 +661,23 @@ export const markSent = async (
   sentAtIso: string,
   cardKey: string | null = null
 ): Promise<boolean> => {
-  const res = await turso.execute({
-    sql: `UPDATE notification_jobs
-          SET status = 'sent', sent_at = ?, card_key = COALESCE(?, card_key)
-          WHERE id = ? AND status = 'processing' AND run_at = ?`,
-    args: [sentAtIso, cardKey, id, runAt],
-  });
+  // Không có khóa lịch thì KHÔNG động tới cột `card_key`: cách ghi tối thiểu này cũng chạy được trên
+  // cơ sở dữ liệu chưa áp migration 0026, nên dùng làm đường lùi khi việc ghi kèm khóa lịch lỗi.
+  const res = await turso.execute(
+    cardKey === null
+      ? {
+          sql: `UPDATE notification_jobs
+                SET status = 'sent', sent_at = ?
+                WHERE id = ? AND status = 'processing' AND run_at = ?`,
+          args: [sentAtIso, id, runAt],
+        }
+      : {
+          sql: `UPDATE notification_jobs
+                SET status = 'sent', sent_at = ?, card_key = ?
+                WHERE id = ? AND status = 'processing' AND run_at = ?`,
+          args: [sentAtIso, cardKey, id, runAt],
+        }
+  );
   return res.rowsAffected > 0;
 };
 

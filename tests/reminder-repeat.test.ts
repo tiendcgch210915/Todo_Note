@@ -98,14 +98,14 @@ const todoPushes = () => fake.messages.filter((m) => m.data?.type === "todo");
 
 // ── hàm thuần ────────────────────────────────────────────────────────────────
 
-test("there is exactly one repeat slot, 2 minutes after the appointment time", () => {
+test("there is exactly one repeat slot, 5 minutes after the appointment time", () => {
   const t = at("10:00");
   assert.deepEqual(
     repeat.repeatSlots(t).map((d) => d.toISOString()),
-    [at("10:02").toISOString()]
+    [at("10:05").toISOString()]
   );
-  assert.equal(repeat.repeatIndexOf(t, at("10:02")), 1);
-  for (const runAt of [at("10:00"), at("10:01"), at("10:03"), at("10:04"), at("10:06"), at("09:58")]) {
+  assert.equal(repeat.repeatIndexOf(t, at("10:05")), 1);
+  for (const runAt of [at("10:00"), at("10:02"), at("10:04"), at("10:06"), at("10:10"), at("09:55")]) {
     assert.equal(repeat.repeatIndexOf(t, runAt), null, runAt.toISOString());
   }
 });
@@ -130,17 +130,19 @@ test("only important AND urgent todos are eligible", () => {
 
 // ── gửi ──────────────────────────────────────────────────────────────────────
 
-test("the on-time reminder is followed by exactly ONE repeat, 2 minutes later, then nothing", async () => {
+test("the on-time reminder is followed by exactly ONE repeat, 5 minutes later, then nothing", async () => {
   await armTodo();
   assert.deepEqual(await pendingRepeatRunAts(), [], "no repeat exists before the reminder went out");
 
   await dispatchAt("10:00");
   assert.equal(todoPushes().length, 1);
-  assert.deepEqual(await pendingRepeatRunAts(), [at("10:02").toISOString()]);
+  assert.deepEqual(await pendingRepeatRunAts(), [at("10:05").toISOString()]);
 
-  await dispatchAt("10:02");
-  await dispatchAt("10:04");
-  await dispatchAt("10:06");
+  await dispatchAt("10:02"); // nothing is due between the reminder and its repeat
+  assert.equal(todoPushes().length, 1);
+  await dispatchAt("10:05");
+  await dispatchAt("10:07");
+  await dispatchAt("10:10");
   await dispatchAt("10:30");
 
   const pushes = todoPushes();
@@ -168,24 +170,24 @@ for (const [label, flags] of [
   test(`a todo that is ${label} gets its on-time reminder but no repeat`, async () => {
     await armTodo(flags);
     await dispatchAt("10:00");
-    await dispatchAt("10:02");
+    await dispatchAt("10:05");
 
     assert.equal(todoPushes().length, 1, "only the on-time reminder");
     assert.deepEqual(await repeatRows(), [], "no repeat job is even created");
   });
 }
 
-test("a reminder that went out a little late (1 minute) still gets its repeat", async () => {
+test("a reminder that went out a little late (4 minutes) still gets its repeat", async () => {
   await armTodo();
-  await dispatchAt("10:01", 10); // the +2 minute slot is still ahead
-  assert.deepEqual(await pendingRepeatRunAts(), [at("10:02").toISOString()]);
-  await dispatchAt("10:02");
+  await dispatchAt("10:04", 10); // the +5 minute slot is still ahead
+  assert.deepEqual(await pendingRepeatRunAts(), [at("10:05").toISOString()]);
+  await dispatchAt("10:05");
   assert.equal(todoPushes().length, 2);
 });
 
-test("a reminder that went out more than 2 minutes late gets no repeat: its slot is already past", async () => {
+test("a reminder that went out more than 5 minutes late gets no repeat: its slot is already past", async () => {
   await armTodo();
-  await dispatchAt("10:03", 10);
+  await dispatchAt("10:06", 10);
   assert.equal(todoPushes().length, 1);
   assert.deepEqual(await repeatRows(), []);
 });
@@ -194,7 +196,7 @@ test("a repeat that is more than 2 minutes late is dropped, never sent", async (
   await armTodo();
   await dispatchAt("10:00");
 
-  await dispatchAt("10:05"); // the server was away: the slot is past the 2 minute lateness limit
+  await dispatchAt("10:08"); // the server was away: the slot is past the 2 minute lateness limit
   assert.equal(todoPushes().length, 1);
   assert.deepEqual(await repeatStatuses(), ["missed"]);
 });
@@ -215,7 +217,7 @@ test("tapping the notification (ack) right after the reminder cancels the repeat
   const result = await repeat.acknowledgeReminder(USER_ID, "t1", at("10:00", 30));
   assert.deepEqual(result, { todo_id: "t1", cancelled: 1 });
 
-  await dispatchAt("10:02");
+  await dispatchAt("10:05");
   assert.equal(todoPushes().length, 1, "only the on-time reminder");
   assert.deepEqual(await repeatStatuses(), ["cancelled"]);
 });
@@ -229,7 +231,7 @@ test("an ack that arrives before the repeat was even created still wins", async 
   assert.deepEqual(await repeatStatuses(), ["cancelled"], "the marker is written");
 
   await dispatchAt("10:00"); // the reminder goes out and tries to create the repeat
-  await dispatchAt("10:02");
+  await dispatchAt("10:05");
 
   assert.equal(todoPushes().length, 1);
   assert.deepEqual(await repeatStatuses(), ["cancelled"], "not resurrected, no duplicate");
@@ -244,7 +246,7 @@ test("an ack is idempotent and reaches every device of the user", async () => {
   assert.equal((await repeat.acknowledgeReminder(USER_ID, "t1", at("10:00", 20))).cancelled, 1);
   assert.equal((await repeat.acknowledgeReminder(USER_ID, "t1", at("10:00", 25))).cancelled, 0);
 
-  await dispatchAt("10:02");
+  await dispatchAt("10:05");
   assert.equal(todoPushes().length, 2, "no repeat to either device");
 });
 
@@ -274,7 +276,7 @@ test("starting the countdown cancels the repeat at once", async () => {
   );
   assert.deepEqual(await pendingRepeatRunAts(), []);
 
-  await dispatchAt("10:02");
+  await dispatchAt("10:05");
   assert.equal(todoPushes().length, 1);
 });
 
@@ -324,10 +326,10 @@ for (const [label, mutate] of invalidations) {
     await dispatchAt("10:00");
     await mutate(); // written straight to the DB, so no hook cancelled anything
 
-    await dispatchAt("10:02");
+    await dispatchAt("10:05");
 
     assert.equal(todoPushes().length, 1);
-    assert.equal((await repeatRows()).find((r) => r.run_at === at("10:02").toISOString())?.status, "cancelled");
+    assert.equal((await repeatRows()).find((r) => r.run_at === at("10:05").toISOString())?.status, "cancelled");
   });
 }
 
@@ -344,7 +346,7 @@ test("an idle countdown (stopped) does not suppress the repeat", async () => {
     device_id: null,
     last_client_event_at: "2026-06-20T03:01:00.000Z",
   });
-  await dispatchAt("10:02");
+  await dispatchAt("10:05");
   assert.equal(todoPushes().length, 2);
 });
 
@@ -359,7 +361,7 @@ test("completing the todo cancels the pending repeat; renaming it keeps it", asy
 
   await todosService.completeTodo(USER_ID, "t1", {});
   assert.deepEqual(await pendingRepeatRunAts(), []);
-  await dispatchAt("10:02");
+  await dispatchAt("10:05");
   assert.equal(todoPushes().length, 1);
 });
 
@@ -370,7 +372,7 @@ test("changing the appointment time cancels the repeat of the old time", async (
   await todosService.updateTodo(USER_ID, "t1", { time: "11:00" });
 
   assert.deepEqual(await pendingRepeatRunAts(), []);
-  await dispatchAt("10:02");
+  await dispatchAt("10:05");
   assert.equal(todoPushes().length, 1);
 });
 

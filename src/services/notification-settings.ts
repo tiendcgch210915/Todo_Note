@@ -22,6 +22,10 @@ export type NotificationSettingsView = {
   /** Giờ thông báo rà soát cuối ngày (mặc định 21:30). */
   reviewTime: string;
   timezone: string;
+  /** Bật/tắt từng nhóm tổng kết (mặc định bật hết). Giờ vẫn được giữ khi tắt. */
+  morningEnabled: boolean;
+  eveningEnabled: boolean;
+  reviewEnabled: boolean;
 };
 
 const toView = (
@@ -34,6 +38,9 @@ const toView = (
     habitSummaryTime: settings.habitSummaryTime,
     reviewTime: settings.reviewTime,
     timezone: settings.timezone,
+    morningEnabled: settings.enabled.morning,
+    eveningEnabled: settings.enabled.evening,
+    reviewEnabled: settings.enabled.review,
   };
 };
 
@@ -52,6 +59,7 @@ export const getNotificationSettings = async (
 /**
  * Lưu cài đặt. Múi giờ nằm ở `users.timezone` (đồng bộ xuống app qua sync như cũ); giờ sáng/tối/rà soát
  * ở notification_settings. Sau đó dời run_at của tổng kết chưa gửi và bổ sung job còn thiếu.
+ * Tắt một nhóm không xóa job đã có: tick hủy chúng lúc đến giờ, nên bật lại trước giờ đó vẫn nhận được.
  */
 export const updateNotificationSettings = async (
   userId: string,
@@ -63,7 +71,12 @@ export const updateNotificationSettings = async (
     userId,
     input.morningTime,
     input.eveningTime,
-    input.reviewTime
+    input.reviewTime,
+    {
+      morningEnabled: input.morningEnabled,
+      eveningEnabled: input.eveningEnabled,
+      reviewEnabled: input.reviewEnabled,
+    }
   );
   if (ctx.timezone !== input.timezone) {
     await usersRepo.updateUserProfile(userId, { timezone: input.timezone });

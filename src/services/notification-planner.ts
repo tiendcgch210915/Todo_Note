@@ -12,7 +12,11 @@ import * as jobsRepo from "../repositories/notification-jobs.js";
 import * as settingsRepo from "../repositories/notification-settings.js";
 import { addDays, isValidTimeZone, localDateOf, localDateTimeToUtc } from "../utils/time.js";
 import { planChecklistDueForUsers } from "./checklist-due.js";
-import { digestRunAt, resolveSettings } from "./notification-schedule.js";
+import {
+  digestRunAt,
+  isDigestEnabled,
+  resolveSettings,
+} from "./notification-schedule.js";
 
 /** Tổng kết hôm nay và ngày mai (theo múi giờ người dùng) cho một người dùng. */
 const digestJobsFor = (
@@ -24,6 +28,8 @@ const digestJobsFor = (
   const jobs: jobsRepo.DigestJobInput[] = [];
   for (const localDate of [today, addDays(today, 1)]) {
     for (const kind of DIGEST_KINDS) {
+      // Người dùng đã tắt nhóm này: không tạo job (job đã có sẽ bị tick hủy lúc gửi).
+      if (!isDigestEnabled(kind, settings)) continue;
       const runAt = digestRunAt(kind, localDate, settings);
       // Đã trễ quá ngưỡng cho phép: không tạo (gửi muộn còn tệ hơn không gửi).
       if (now.getTime() - runAt.getTime() > LATENESS_MS[kind]) continue;
@@ -58,7 +64,7 @@ const insertMissingDigests = async (
 
 /**
  * Bảo đảm đủ 6 tổng kết cho hôm nay + ngày mai cho một người dùng: sáng, todo, thói quen, rà soát, và
- * hai tổng kết todo quan trọng quá hạn (17:00 / 07:00). Trả số job mới tạo.
+ * hai tổng kết todo quan trọng quá hạn (17:00 / 07:00), trừ nhóm người dùng đã tắt. Trả số job mới tạo.
  */
 export const planUser = async (
   userId: string,
