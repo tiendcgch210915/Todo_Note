@@ -56,11 +56,11 @@ export const LEGACY_SLOT_KINDS = ["checklist_overdue"] as const;
 export const RUNNING_KINDS = ["checklist_running"] as const;
 
 /**
- * Nhắc LẠI NGAY SAU nhắc đúng giờ của TODO: `REMINDER_REPEAT.count` lần, cách nhau
- * `REMINDER_REPEAT.intervalMs`, tính từ giờ hẹn (+2 phút, +4 phút). Mỗi lần là MỘT dòng job riêng,
- * duy nhất theo (user, kind, ref_id, run_at), và chỉ được tạo SAU KHI nhắc đúng giờ đã gửi (xem
- * `services/reminder-repeat.ts`). Dừng ngay khi người dùng đã chạm thông báo, đã bắt đầu todo (bấm giờ /
- * `in_progress`) hoặc đang mở app: app báo bằng `POST /todos/:id/reminder-ack`.
+ * Nhắc LẠI MỘT LẦN ngay sau nhắc đúng giờ của TODO "quan trọng và khẩn cấp": cách giờ hẹn
+ * `REMINDER_REPEAT.intervalMs` (+2 phút). Là MỘT dòng job riêng, duy nhất theo (user, kind, ref_id,
+ * run_at), và chỉ được tạo SAU KHI nhắc đúng giờ đã gửi (xem `services/reminder-repeat.ts`). Dừng ngay khi
+ * người dùng đã chạm thông báo, đã bắt đầu todo (bấm giờ / `in_progress`) hoặc đang mở app: app báo bằng
+ * `POST /todos/:id/reminder-ack`.
  */
 export const REMINDER_REPEAT_KINDS = ["todo_reminder_repeat"] as const;
 
@@ -173,7 +173,7 @@ export const DATA_TYPE: Record<NotificationJobKind, string> = {
   checklist_overdue: "checklist_due",
   // Giống checklist_30m trước đây: app mở đúng lần chạy đang làm dở (data.id = id của run).
   checklist_running: "checklist",
-  // Cùng type với nhắc đúng giờ; app nhận biết lần nhắc lại qua `data.repeat` ("1", "2").
+  // Cùng type với nhắc đúng giờ; app nhận biết lần nhắc lại qua `data.repeat` ("1").
   todo_reminder_repeat: "todo",
   digest_morning: "digest_morning",
   digest_todos: "digest_todos",
@@ -240,10 +240,10 @@ export const TODO_CARD_KINDS = ["todo_reminder", "todo_overdue"] as const;
 
 /**
  * Nhắc lại ngay sau nhắc đúng giờ (xem `REMINDER_REPEAT_KINDS`): `count` lần, mỗi lần cách giờ hẹn thêm
- * `intervalMs` (+2 phút, +4 phút).
+ * `intervalMs`. Hiện là MỘT lần, +2 phút, chỉ cho todo quan trọng và khẩn cấp.
  */
 export const REMINDER_REPEAT = {
-  count: 2,
+  count: 1,
   intervalMs: 2 * MINUTE,
 } as const;
 

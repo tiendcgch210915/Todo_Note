@@ -388,28 +388,28 @@ What the server guarantees / does not:
 - If the next notification of that todo is due within 4 minutes (e.g. moved to 09:03 at 10:00 -> repeat at 10:03) no dismiss is sent: that notification has the same tag and replaces the old card by itself.
 - Best effort. It is a high-priority data message, so Doze / aggressive battery savers / a force-stopped app can delay or drop it, and a phone that stays offline longer than 3 minutes misses it (the card then stays until replaced or swiped away).
 
-## Reminder repeats: +2 and +4 minutes after the on-time reminder (`todo_reminder_repeat`)
+## Reminder repeat: once, 2 minutes after the on-time reminder, important + urgent todos only (`todo_reminder_repeat`)
 
-A todo with a time gets its on-time reminder (`type: "todo"`, see above). To make sure it is not missed, the server sends **two more** pushes of the same todo, at the appointment time **+2 minutes** and **+4 minutes**. They stop the moment the user has reacted. The server cannot see taps or whether the app is open, so **the app must report them**.
+A todo with a time gets its on-time reminder (`type: "todo"`, see above). If the todo is **important AND urgent** (both flags true; any other group, including unclassified, gets none), the server sends **one more** push of the same todo at the appointment time **+2 minutes**. It stops the moment the user has reacted. The server cannot see taps or whether the app is open, so **the app must report them**. After that single repeat the todo only follows its regular pattern (`todo_overdue`, hourly for important + urgent), and that pattern is itself switched off once the todo is started.
 
-**Payload of a repeat.** Same `type: "todo"`, same `id`, `date`, `tag` (`todo:<id or series root id>`, so it replaces the card on the tray), same title and body, channel `todo_reminders`, FCM `ttl` 2 minutes. The only difference is one extra data key: **`repeat`**, `"1"` (the +2 minute one) or `"2"` (the +4 minute one). The on-time reminder and the hourly `todo_overdue` nudges have **no `repeat` key**. Old apps ignore the key and simply show the repeat.
+**Payload of the repeat.** Same `type: "todo"`, same `id`, `date`, `tag` (`todo:<id or series root id>`, so it replaces the card on the tray), same title and body, channel `todo_reminders`, FCM `ttl` 2 minutes. The only difference is one extra data key: **`repeat`**, always `"1"`. The on-time reminder and the hourly `todo_overdue` nudges have **no `repeat` key**. Old apps ignore the key and simply show the repeat.
 
-**When the server stops by itself** (nothing for the app to do): the todo is completed, archived or deleted; its date or time was edited; it became `in_progress`; or a countdown was started on it (`PUT /todos/:id/timer` with `start` / `resume`, or any timer state other than `idle`: running, paused, or ran out). It is checked again right before each send. A repeat that the server sends more than 2 minutes late is dropped, never delivered as a bunch.
+**When the server stops by itself** (nothing for the app to do): the todo is completed, archived or deleted; its date or time was edited; it is no longer important + urgent; it became `in_progress`; or a countdown was started on it (`PUT /todos/:id/timer` with `start` / `resume`, or any timer state other than `idle`: running, paused, or ran out). It is checked again right before sending. A repeat that the server sends more than 2 minutes late is dropped, never delivered late.
 
 **What the app must do: `POST /api/v1/todos/:id/reminder-ack`** (user JWT, no request body)
 
 | Status | Body | Meaning |
 |---|---|---|
-| 200 | `{ "todo_id": "<id>", "cancelled": 2 }` | Pending repeats were cancelled (`cancelled` counts them; `0` when none were pending or it was already acknowledged). Idempotent. Applies to **all devices** of the user. |
+| 200 | `{ "todo_id": "<id>", "cancelled": 1 }` | The pending repeat was cancelled (`cancelled` is `1`, or `0` when none was pending: not important + urgent, already sent, or already acknowledged). Idempotent. Applies to **all devices** of the user. |
 | 404 | `{ "error": "not_found" }` | The todo is not on the server (yet), was deleted, or is not the caller's. Drop it; do not retry. |
 | 401 | | The usual auth handling. |
 
 Call it for the `data.id` of the push, in these cases:
 
-1. **The user taps the notification** (cold start, background or foreground). Do it in the common tap path (`PushNavigation.handle`, for `data.type == "todo"`), after the user is signed in.
+1. **The user taps the notification**, which opens the todo's detail page (cold start, background or foreground). Do it in the common tap path (`PushNavigation.handle`, for `data.type == "todo"`), after the user is signed in.
 2. **A `type: "todo"` push arrives while the app is open (foreground).** The user is already inside the app, so ack it. If it has `data.repeat`, **do not show it at all** (no local notification, no sound or vibration); the on-time reminder keeps the current foreground behaviour.
 
-Best effort and fire-and-forget: never block the UI, retry a few times with a short backoff (for example 2 s, 5 s, 15 s) on network errors / 5xx / 429, and give up after about 5 minutes (the repeats are over by then). No persistent queue is needed. Starting the countdown needs **no** ack: the timer events already tell the server (the repeats are cancelled when the `start` / `resume` event is accepted).
+Best effort and fire-and-forget: never block the UI, retry a few times with a short backoff (for example 2 s, 5 s, 15 s) on network errors / 5xx / 429, and give up after about 5 minutes (the repeat is over by then). No persistent queue is needed. Starting the countdown needs **no** ack: the timer events already tell the server (the repeat is cancelled when the `start` / `resume` event is accepted).
 
 Migration `0027_todo_reminder_repeat.sql` rebuilds `notification_jobs` so its `kind` CHECK accepts `todo_reminder_repeat`. Apply it with `npm run db:migrate` **before** deploying the code. Tests: `tests/reminder-repeat.test.ts`, `tests/migration-0027.test.ts`.
 
@@ -420,7 +420,7 @@ Migration `0027_todo_reminder_repeat.sql` rebuilds `notification_jobs` so its `k
 - Migration `0017_checklist_schedules.sql` creates `checklist_schedules`, `checklist_schedule_overrides` and rebuilds `notification_jobs` so its `kind` CHECK accepts `checklist_due`. Apply it with `npm run db:migrate` **before** deploying the code, because the new code inserts the new kind.
 - Manual send: `npm run notify:job-test -- <userId> checklist_due` (then `--cleanup`).
 - Day marks and start-day rule: migration `0023_checklist_occurrence_marks.sql` creates `checklist_occurrence_marks` and indexes `checklist_runs` by `started_at` (dropping the unused `completed_at` index). Apply it with `npm run db:migrate` **before** deploying the code: the sync pull selects the new table, so an unmigrated database fails every pull. Covered by `tests/checklist-occurrence-marks.test.ts` (rule, REST, sync, reminders, habits) and `tests/migration-0023.test.ts`.
-- Reminder repeats: migration `0027_todo_reminder_repeat.sql` (see "Reminder repeats" above), covered by `tests/reminder-repeat.test.ts` and `tests/migration-0027.test.ts`.
+- Reminder repeat: migration `0027_todo_reminder_repeat.sql` (see "Reminder repeat" above), covered by `tests/reminder-repeat.test.ts` and `tests/migration-0027.test.ts`.
 - Card removal on reschedule: migration `0026_notification_card_key.sql` adds the nullable column `notification_jobs.card_key` (the schedule a delivered reminder / repeat was sent for). Apply it with `npm run db:migrate` **before** deploying the code: the tick writes the column when it marks a job sent. Covered by `tests/notification-dismiss.test.ts`.
 - Removed overdue nudge: migration `0024_cancel_checklist_overdue.sql` cancels the pending `checklist_overdue` jobs (history is kept and the kind stays allowed in the table). It is a data cleanup only: even if it has not run yet, the server cancels any leftover `checklist_overdue` job when it comes due instead of sending it. Tests: `tests/overdue-nudges.test.ts` (checklist section), `tests/checklist-due.test.ts`, `tests/migration-0024.test.ts`.
 - Pause: migration `0021_checklist_schedule_pause.sql` adds the two nullable columns `paused_from` / `paused_until` (existing rows = not paused). Apply it with `npm run db:migrate` **before** deploying the code, because the code selects and writes them. Covered by the `pause` tests in `tests/checklist-schedule.test.ts` (expansion), `tests/checklist-schedule-api.test.ts` (REST, sync, jobs) and `tests/checklist-due.test.ts` (planner, overdue nudges, re-validation before sending).

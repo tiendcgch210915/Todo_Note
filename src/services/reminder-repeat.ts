@@ -1,14 +1,17 @@
 /**
- * Nhắc LẠI ngay sau nhắc đúng giờ của một todo: `REMINDER_REPEAT.count` lần (2), cách nhau
- * `REMINDER_REPEAT.intervalMs` (2 phút), tính từ giờ hẹn: +2 phút và +4 phút. Chỉ để chắc người dùng
- * không bỏ lỡ lời nhắc, nên phải DỪNG ngay khi họ đã phản ứng:
+ * Nhắc LẠI MỘT LẦN ngay sau nhắc đúng giờ của todo "quan trọng và khẩn cấp": `REMINDER_REPEAT.count`
+ * lần (1), cách giờ hẹn `REMINDER_REPEAT.intervalMs` (2 phút), tức +2 phút. Todo thuộc nhóm khác (kể cả
+ * chưa phân loại) không có nhắc lại này; nhịp nhắc theo giờ của nó là việc của `overdue-nudges`.
+ * Chỉ để chắc người dùng không bỏ lỡ lời nhắc, nên phải DỪNG ngay khi họ đã phản ứng:
  *
- *  - chạm vào thông báo, hoặc đang mở app lúc thông báo đến: app gọi `POST /todos/:id/reminder-ack`
- *    (`acknowledgeReminder`); server không có cách tự biết hai việc này;
+ *  - chạm vào thông báo (mở màn hình chi tiết todo), hoặc đang mở app lúc thông báo đến: app gọi
+ *    `POST /todos/:id/reminder-ack` (`acknowledgeReminder`); server không có cách tự biết hai việc này;
  *  - bắt đầu todo: bấm giờ (`todo_timers` không `idle`) hoặc `status = in_progress`;
- *  - todo xong / bị xóa / đổi giờ hay ngày hẹn.
+ *  - todo xong / bị xóa / đổi giờ hay ngày hẹn / không còn "quan trọng và khẩn cấp".
  *
- * Mỗi lần nhắc lại là MỘT dòng job (`todo_reminder_repeat`, duy nhất theo user/kind/ref_id/run_at):
+ * Todo đã bắt đầu chỉ còn theo nhịp nhắc thường (`todo_overdue`, mà chính nó cũng dừng khi todo đã bắt đầu).
+ *
+ * Lần nhắc lại là MỘT dòng job (`todo_reminder_repeat`, duy nhất theo user/kind/ref_id/run_at):
  *  - được tạo SAU KHI nhắc đúng giờ đã gửi (`scheduleReminderRepeats`, gọi từ `afterSent` của tick), nên
  *    không cần planner/backfill: todo không có nhắc đúng giờ thì không có nhắc lại;
  *  - hook (`reconcileReminderRepeats`): todo đổi -> hủy lần nhắc lại không còn khớp giờ hẹn;
@@ -38,7 +41,7 @@ export class ReminderRepeatError extends Error {
 
 // ── Hàm thuần ────────────────────────────────────────────────────────────────
 
-/** Các mốc nhắc lại của giờ hẹn `scheduledAt`: +interval, +2·interval, ... (`count` mốc). */
+/** Các mốc nhắc lại của giờ hẹn `scheduledAt`: +interval, +2·interval, ... (`count` mốc; hiện là MỘT mốc, +2 phút). */
 export const repeatSlots = (scheduledAt: Date): Date[] =>
   Array.from(
     { length: REMINDER_REPEAT.count },
@@ -53,25 +56,41 @@ export const repeatIndexOf = (scheduledAt: Date, runAt: Date): number | null => 
   return index <= REMINDER_REPEAT.count ? index : null;
 };
 
+type Flag = number | boolean | null | undefined;
+
 type RepeatTodoFields = {
   id: string;
   status: string;
   parent_id: string | null;
   scheduled_date: string | null;
+  is_important: Flag;
+  is_urgent: Flag;
 };
 
-/** Todo còn thuộc diện nhắc lại: chưa bắt đầu (`open`), là todo cấp trên cùng và có ngày hẹn. */
+const isTrue = (value: Flag): boolean => value === 1 || value === true;
+
+/** Chỉ nhóm "quan trọng và khẩn cấp" (cả hai cờ bật) mới có nhắc lại; chưa phân loại (null) thì không. */
+export const isImportantAndUrgent = (todo: Pick<RepeatTodoFields, "is_important" | "is_urgent">): boolean =>
+  isTrue(todo.is_important) && isTrue(todo.is_urgent);
+
+/**
+ * Todo còn thuộc diện nhắc lại: quan trọng và khẩn cấp, chưa bắt đầu (`open`), là todo cấp trên cùng và
+ * có ngày hẹn.
+ */
 const wantsRepeats = (todo: RepeatTodoFields): todo is RepeatTodoFields & { scheduled_date: string } =>
-  todo.status === "open" && todo.parent_id === null && todo.scheduled_date !== null;
+  isImportantAndUrgent(todo) &&
+  todo.status === "open" &&
+  todo.parent_id === null &&
+  todo.scheduled_date !== null;
 
 const toIso = (slots: readonly Date[]): string[] => slots.map((slot) => slot.toISOString());
 
 // ── Tạo / giữ / hủy ──────────────────────────────────────────────────────────
 
 /**
- * Gọi sau khi nhắc đúng giờ ĐÃ GỬI: tạo các lần nhắc lại còn ở tương lai (nhắc đúng giờ gửi muộn thì lần
- * nhắc lại đã qua giờ bị bỏ qua). Idempotent, và không bao giờ throw: lỗi ở đây không được làm hỏng
- * việc ghi kết quả của nhắc đúng giờ.
+ * Gọi sau khi nhắc đúng giờ ĐÃ GỬI: tạo lần nhắc lại nếu todo thuộc diện (quan trọng và khẩn cấp) và mốc
+ * còn ở tương lai (nhắc đúng giờ gửi muộn quá +2 phút thì không còn lần nhắc lại). Idempotent, và không
+ * bao giờ throw: lỗi ở đây không được làm hỏng việc ghi kết quả của nhắc đúng giờ.
  */
 export const scheduleReminderRepeats = async (
   userId: string,
@@ -96,9 +115,9 @@ export const scheduleReminderRepeats = async (
 };
 
 /**
- * Hook sau mỗi thay đổi của todo (đã đọc từ DB, còn tồn tại): giữ các lần nhắc lại đang chờ chỉ khi
- * chúng vẫn khớp giờ hẹn hiện tại và todo chưa bắt đầu. Sửa tiêu đề không đổi gì; đổi giờ/ngày hẹn hoặc
- * chuyển `in_progress` thì hủy hết phần còn chờ.
+ * Hook sau mỗi thay đổi của todo (đã đọc từ DB, còn tồn tại): giữ lần nhắc lại đang chờ chỉ khi nó vẫn
+ * khớp giờ hẹn hiện tại, todo chưa bắt đầu và vẫn là "quan trọng và khẩn cấp". Sửa tiêu đề không đổi gì;
+ * đổi giờ/ngày hẹn, chuyển `in_progress` hay đổi nhóm thì hủy phần còn chờ.
  */
 export const reconcileReminderRepeats = async (
   userId: string,
@@ -117,7 +136,7 @@ export const cancelReminderRepeats = (todoIds: readonly string[]): Promise<numbe
 
 export type ReminderAckResult = {
   todo_id: string;
-  /** Số lần nhắc lại đang chờ vừa bị hủy. */
+  /** Số lần nhắc lại đang chờ vừa bị hủy (0 hoặc 1). */
   cancelled: number;
 };
 

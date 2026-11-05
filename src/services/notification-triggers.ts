@@ -104,7 +104,7 @@ const rearmTodoJobs = async (
   );
 
   const runAt = localDateTimeToUtc(todo.scheduled_date, todo.time, timezone);
-  // Nhắc lại (+2, +4 phút) chỉ còn giá trị khi vẫn khớp giờ hẹn mới và todo chưa bắt đầu.
+  // Nhắc lại (+2 phút) chỉ còn giá trị khi vẫn khớp giờ hẹn mới, todo chưa bắt đầu và còn quan trọng + khẩn cấp.
   await safely("reminder_repeat_changed", () =>
     reconcileReminderRepeats(userId, todo, runAt)
   );

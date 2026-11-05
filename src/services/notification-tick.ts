@@ -58,7 +58,11 @@ import {
 } from "./notification-planner.js";
 import { resolveSettings } from "./notification-schedule.js";
 import { notifyUser } from "./notifications.js";
-import { repeatIndexOf, scheduleReminderRepeats } from "./reminder-repeat.js";
+import {
+  isImportantAndUrgent,
+  repeatIndexOf,
+  scheduleReminderRepeats,
+} from "./reminder-repeat.js";
 import {
   backfillTodoOverdue,
   isOverdueSlot,
@@ -185,7 +189,8 @@ const prepare = async (job: jobsRepo.JobRow, now: Date): Promise<Prepared> => {
         date,
         tag: todoTag(job.kind, todo),
         cardKey: todoCardKey(todo) ?? undefined,
-        // Nhắc đúng giờ đã đi thì mới hẹn nhắc lại (+2, +4 phút); xem services/reminder-repeat.ts.
+        // Nhắc đúng giờ đã đi thì mới hẹn nhắc lại một lần (+2 phút, chỉ todo quan trọng và khẩn cấp);
+        // xem services/reminder-repeat.ts.
         afterSent: () => scheduleReminderRepeats(job.user_id, todo, expected, now),
       };
     }
@@ -193,9 +198,11 @@ const prepare = async (job: jobsRepo.JobRow, now: Date): Promise<Prepared> => {
     case "todo_reminder_repeat": {
       if (!job.ref_id || !job.local_date) return CANCEL;
       const todo = await todosRepo.getTodoByIdScoped(job.ref_id, job.user_id);
-      // `open` = chưa bắt đầu: `in_progress` (đã bắt đầu), xong, cất hay xóa đều không nhắc nữa.
+      // `open` = chưa bắt đầu: `in_progress` (đã bắt đầu), xong, cất hay xóa đều không nhắc nữa. Đổi sang
+      // nhóm khác sau khi job được tạo thì cũng bỏ: chỉ todo quan trọng và khẩn cấp được nhắc lại.
       if (
         !todo ||
+        !isImportantAndUrgent(todo) ||
         todo.status !== "open" ||
         todo.parent_id !== null ||
         !todo.time ||

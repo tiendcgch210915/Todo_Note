@@ -99,7 +99,7 @@ export const applyTimerEvent = async (
       );
       if (!device) throw new TimerServiceError("device_not_found");
 
-      // Đã bắt đầu làm: nhắc lại (+2, +4 phút) sau nhắc đúng giờ không còn cần nữa.
+      // Đã bắt đầu làm: nhắc lại (+2 phút) sau nhắc đúng giờ không còn cần nữa.
       await cancelReminderRepeats([todoId]);
 
       // Sự kiện đến muộn quá ngưỡng: trừ phần độ trễ khỏi thời gian còn lại.

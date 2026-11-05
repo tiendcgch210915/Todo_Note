@@ -288,7 +288,7 @@ export default async function todosRoutes(app: FastifyInstance) {
   });
 
   // POST /:id/reminder-ack — người dùng đã chạm thông báo / đang mở app: dừng các lần nhắc lại
-  // (+2, +4 phút sau nhắc đúng giờ). Không có body; idempotent.
+  // (lần nhắc lại +2 phút sau nhắc đúng giờ của todo quan trọng và khẩn cấp). Không có body; idempotent.
   app.post<{ Params: { id: string } }>("/:id/reminder-ack", async (req, reply) => {
     try {
       return await acknowledgeReminder(req.userId, req.params.id);
