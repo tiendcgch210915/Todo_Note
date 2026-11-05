@@ -189,7 +189,7 @@ const prepare = async (job: jobsRepo.JobRow, now: Date): Promise<Prepared> => {
         date,
         tag: todoTag(job.kind, todo),
         cardKey: todoCardKey(todo) ?? undefined,
-        // Nhắc đúng giờ đã đi thì mới hẹn nhắc lại một lần (+2 phút, chỉ todo quan trọng và khẩn cấp);
+        // Nhắc đúng giờ đã đi thì mới hẹn nhắc lại một lần (+5 phút, chỉ todo quan trọng và khẩn cấp);
         // xem services/reminder-repeat.ts.
         afterSent: () => scheduleReminderRepeats(job.user_id, todo, expected, now),
       };
@@ -427,6 +427,55 @@ const logSent = (
   );
 };
 
+/** Tên và thông điệp lỗi để log: thông điệp của lỗi DB không chứa dữ liệu người dùng. */
+const errorFields = (error: unknown) => ({
+  errorName: error instanceof Error ? error.name : "unknown",
+  errorMessage: error instanceof Error ? error.message : String(error),
+});
+
+/**
+ * Ghi kết quả của một job mà tin đã được GỬI. Mọi lỗi ở đây chỉ được log, KHÔNG được ném ra: ném ra
+ * sẽ bị coi là "gửi lỗi tạm" và job được gửi lại 2 phút sau (tối đa 3 lần), tức người dùng nhận cùng một
+ * thông báo nhiều lần dù lần đầu đã tới nơi.
+ *  - ghi `sent` kèm khóa lịch lỗi (ví dụ cột `card_key` chưa có vì chưa áp migration 0026) thì ghi lại
+ *    bản tối thiểu không có khóa lịch; chỉ mất việc gỡ thông báo cũ khi đổi giờ;
+ *  - `afterSent` lỗi (ví dụ chưa áp migration 0027 nên chưa tạo được nhắc lại) thì bỏ qua phần đó.
+ */
+const settleDelivered = async (
+  claimed: jobsRepo.JobRow,
+  prepared: Extract<Prepared, { cancel?: false }>,
+  fcmMs: number,
+  logger: PushLogger
+): Promise<void> => {
+  const sentAt = new Date().toISOString();
+  // Chỉ lần gửi thật mới ghi khóa lịch: chạy thử (NOTIFY_DRY_RUN) không để lại thông báo nào trên máy.
+  try {
+    await jobsRepo.markSent(claimed.id, claimed.run_at, sentAt, prepared.cardKey ?? null);
+  } catch (error) {
+    logger.error(
+      { jobId: claimed.id, kind: claimed.kind, ...errorFields(error) },
+      "marking a delivered notification as sent failed; retrying without the card key"
+    );
+    try {
+      await jobsRepo.markSent(claimed.id, claimed.run_at, sentAt, null);
+    } catch (fallbackError) {
+      logger.error(
+        { jobId: claimed.id, kind: claimed.kind, ...errorFields(fallbackError) },
+        "could not mark a delivered notification as sent; it will not be retried"
+      );
+    }
+  }
+  logSent(logger, claimed, sentAt, fcmMs);
+  try {
+    await prepared.afterSent?.();
+  } catch (error) {
+    logger.error(
+      { jobId: claimed.id, kind: claimed.kind, ...errorFields(error) },
+      "after-send step failed"
+    );
+  }
+};
+
 const processClaimed = async (
   claimed: jobsRepo.JobRow,
   options: { dryRun: boolean; logger: PushLogger; now?: Date }
@@ -472,11 +521,8 @@ const processClaimed = async (
 
     const fcmMs = Math.round(performance.now() - fcmStartedAt);
     if (result.sent > 0) {
-      const sentAt = new Date().toISOString();
-      // Chỉ lần gửi thật mới ghi khóa lịch: chạy thử (NOTIFY_DRY_RUN) không để lại thông báo nào trên máy.
-      await jobsRepo.markSent(claimed.id, claimed.run_at, sentAt, prepared.cardKey ?? null);
-      logSent(options.logger, claimed, sentAt, fcmMs);
-      await prepared.afterSent?.();
+      // Tin ĐÃ tới FCM: từ đây không được để lỗi nào dẫn tới gửi lại.
+      await settleDelivered(claimed, prepared, fcmMs, options.logger);
       return "sent";
     }
     // notifyUser báo lỗi nội bộ bằng error (kèm devices = 0): đó là lỗi tạm, không phải "hết thiết bị".
@@ -489,11 +535,7 @@ const processClaimed = async (
     return settleTransientFailure(claimed, attempts);
   } catch (error) {
     options.logger.error(
-      {
-        jobId: claimed.id,
-        kind: claimed.kind,
-        errorName: error instanceof Error ? error.name : "unknown",
-      },
+      { jobId: claimed.id, kind: claimed.kind, ...errorFields(error) },
       "notification job crashed"
     );
     try {
@@ -532,38 +574,65 @@ const maintain = async (
 ): Promise<void> => {
   const now = options.now ?? new Date();
   const nowMs = now.getTime();
+  const logger = options.logger ?? pushLogger;
+
+  // Mỗi bước độc lập: một bước lỗi (ví dụ thiếu migration cho đúng loại job của nó) chỉ bị log, các bước
+  // còn lại vẫn chạy. Nếu không, một bước hỏng mãi sẽ chặn cả việc đánh `missed` và dọn dẹp.
+  const step = async (name: string, run: () => Promise<void>): Promise<void> => {
+    try {
+      await run();
+    } catch (error) {
+      logger.error({ step: name, ...errorFields(error) }, "notification maintenance step failed");
+    }
+  };
 
   // 0. Job kẹt ở processing (tiến trình chết giữa chừng).
-  const stuck = await jobsRepo.recoverStuckJobs(
-    new Date(nowMs - DISPATCH.stuckAfterMs).toISOString(),
-    DISPATCH.maxAttempts
-  );
-  summary.recovered = stuck.requeued;
-  summary.stuck_failed = stuck.failed;
+  await step("recover_stuck", async () => {
+    const stuck = await jobsRepo.recoverStuckJobs(
+      new Date(nowMs - DISPATCH.stuckAfterMs).toISOString(),
+      DISPATCH.maxAttempts
+    );
+    summary.recovered = stuck.requeued;
+    summary.stuck_failed = stuck.failed;
+  });
 
   // 1a. Lịch checklist đã qua ngày kết thúc bị xóa trước, để planner không lập job cho chúng.
-  summary.schedules_expired = await expireChecklistSchedules(now);
+  await step("expire_schedules", async () => {
+    summary.schedules_expired = await expireChecklistSchedules(now);
+  });
 
   // 1b. Lập lịch (idempotent): tổng kết hôm nay/ngày mai + vá nhắc giờ todo thiếu job.
-  summary.planned = await planAllUsers(now);
-  summary.backfilled = await backfillTodoReminders(now);
-  summary.overdue_backfilled = await backfillTodoOverdue(now);
-  summary.overdue_backfilled += await backfillChecklistRunNudges(now);
+  await step("plan_digests", async () => {
+    summary.planned = await planAllUsers(now);
+  });
+  await step("backfill_reminders", async () => {
+    summary.backfilled = await backfillTodoReminders(now);
+  });
+  await step("backfill_todo_overdue", async () => {
+    summary.overdue_backfilled += await backfillTodoOverdue(now);
+  });
+  await step("backfill_checklist_running", async () => {
+    summary.overdue_backfilled += await backfillChecklistRunNudges(now);
+  });
 
   // 2. Chính sách trễ (quét hàng loạt): job pending chạy muộn quá ngưỡng thì bỏ, KHÔNG gửi.
   //    Đường nhanh cũng tự kiểm tra từng ứng viên nên không phụ thuộc bước này.
-  const cutoffs = Object.fromEntries(
-    NOTIFICATION_KINDS.map((kind) => [
-      kind,
-      new Date(nowMs - LATENESS_MS[kind]).toISOString(),
-    ])
-  ) as Record<NotificationJobKind, string>;
-  summary.missed += await jobsRepo.markMissed(cutoffs);
+  await step("mark_missed", async () => {
+    const cutoffs = Object.fromEntries(
+      NOTIFICATION_KINDS.map((kind) => [
+        kind,
+        new Date(nowMs - LATENESS_MS[kind]).toISOString(),
+      ])
+    ) as Record<NotificationJobKind, string>;
+    summary.missed += await jobsRepo.markMissed(cutoffs);
+  });
 
   // Dọn job đã kết thúc từ lâu để bảng không phình mãi.
-  summary.purged = await jobsRepo.purgeFinishedJobs(
-    new Date(nowMs - JOB_RETENTION_MS).toISOString()
-  );
+  await step("purge_finished", async () => {
+    summary.purged = await jobsRepo.purgeFinishedJobs(
+      new Date(nowMs - JOB_RETENTION_MS).toISOString()
+    );
+  });
 };
 
 /**
