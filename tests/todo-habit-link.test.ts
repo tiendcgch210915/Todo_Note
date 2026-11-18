@@ -385,24 +385,41 @@ test("complete linked todos auto-logs habit only when all day todos are done on 
   assert.equal(log?.completed, 1);
 });
 
-test("late completion writes incomplete habit log and preserves manual note", async () => {
+test("late completion on a day nobody logged writes an incomplete log", async () => {
   await insertHabit("habit-late");
   await insertTodo("todo-late", {
     habit_id: "habit-late",
     scheduled_date: "2020-01-01",
-  });
-  await turso.execute({
-    sql: `INSERT INTO habit_logs
-          (id, habit_id, log_date, completed, note, created_at, updated_at)
-          VALUES ('manual-log', 'habit-late', '2020-01-01', 1, 'manual note', ?, ?)`,
-    args: [OLD, OLD],
   });
 
   await todosService.completeTodo(USER_ID, "todo-late", {});
 
   const log = await getHabitLog("habit-late", "2020-01-01");
   assert.equal(log?.completed, 0);
+});
+
+// A log the user wrote (a row with auto_closed = 0) is theirs: a todo finished late must not
+// lower it. The old behaviour (late completion rewrote a manual tick to 0) is gone on purpose;
+// the full rule is covered in habit-auto-log.test.ts.
+test("late completion leaves a log the user already set untouched, note included", async () => {
+  await insertHabit("habit-late-manual");
+  await insertTodo("todo-late-manual", {
+    habit_id: "habit-late-manual",
+    scheduled_date: "2020-01-01",
+  });
+  await turso.execute({
+    sql: `INSERT INTO habit_logs
+          (id, habit_id, log_date, completed, note, created_at, updated_at)
+          VALUES ('manual-log', 'habit-late-manual', '2020-01-01', 1, 'manual note', ?, ?)`,
+    args: [OLD, OLD],
+  });
+
+  await todosService.completeTodo(USER_ID, "todo-late-manual", {});
+
+  const log = await getHabitLog("habit-late-manual", "2020-01-01");
+  assert.equal(log?.completed, 1);
   assert.equal(log?.note, "manual note");
+  assert.equal(log?.updated_at, OLD);
 });
 
 test("uncomplete and habit link changes do not mutate existing habit logs", async () => {

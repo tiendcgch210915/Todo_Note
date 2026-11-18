@@ -22,6 +22,14 @@ const hasCompletedChecklistRunOn = async (
   return isDoneOn(userId, templateId, date, effectiveTimeZone(user?.timezone));
 };
 
+/**
+ * Một todo gắn habit vừa hoàn thành → ghi log tự động cho ngày của todo (xong hết todo của ngày
+ * đúng hạn thì tick, chưa thì giữ chỗ bằng 0).
+ *
+ * Tự động không bao giờ sửa trạng thái người dùng đã đặt cho ngày đó (đánh dấu bỏ lỡ trước, tick
+ * tay): `upsertAutoLog` bỏ qua dòng ấy và trả về nguyên bản; chỉ người dùng đổi được. Trả về log
+ * hiện có của ngày đó, dù có được ghi hay không.
+ */
 export const autoLogHabitForCompletedTodo = async (
   userId: string,
   todo: todosRepo.TodoRow
@@ -48,11 +56,11 @@ export const autoLogHabitForCompletedTodo = async (
       todo.scheduled_date
     );
   }
-  const log = await habitsRepo.upsertAutoLog(
+  const { log, written } = await habitsRepo.upsertAutoLog(
     todo.habit_id,
     todo.scheduled_date,
     completed
   );
-  await habitsRepo.recomputeStreaks(todo.habit_id);
+  if (written) await habitsRepo.recomputeStreaks(todo.habit_id);
   return log;
 };

@@ -8,6 +8,8 @@ import * as devicesRepo from "../repositories/notifications.js";
 import * as timersRepo from "../repositories/todo-timers.js";
 import * as todosRepo from "../repositories/todos.js";
 import type { TodoTimerInput } from "../schemas/api/todos.js";
+import { dismissTodoCardOnStart } from "./notification-cards.js";
+import { requeueTodoReminders } from "./reminder-queue.js";
 import { cancelReminderRepeats } from "./reminder-repeat.js";
 
 export class TimerServiceError extends Error {
@@ -44,11 +46,31 @@ const toState = (
 const isLive = (status: string): boolean =>
   status === "open" || status === "in_progress";
 
+/**
+ * Một sự kiện đồng hồ của app. Đồng hồ vừa đổi (bắt đầu, tiếp tục, tạm dừng, dừng, hết giờ) thì giờ gửi của
+ * các nhắc giờ KHÁC của người dùng phải tính lại: đang đếm ngược thì chúng chờ đến khi đếm ngược kết thúc + 2
+ * phút, và được thả khi đồng hồ dừng sớm (xem `services/reminder-queue.ts`).
+ *
+ * Bắt đầu / tiếp tục còn dừng các nhắc lại (+5 phút) sắp tới, hẹn job hết giờ, và nhờ app gỡ thẻ nhắc của todo
+ * đã nằm trên máy (`dismissTodoCardOnStart`, gửi trong nền). Sự kiện cũ bị bỏ qua, tạm dừng, dừng, hết giờ và các
+ * lỗi `device_not_found` / `todo_completed` không gỡ gì.
+ */
 export const applyTimerEvent = async (
   userId: string,
   todoId: string,
   input: TodoTimerInput,
   now: Date = new Date()
+): Promise<TimerState> => {
+  const state = await applyEvent(userId, todoId, input, now);
+  if (!state.ignored) await requeueTodoReminders(userId, now);
+  return state;
+};
+
+const applyEvent = async (
+  userId: string,
+  todoId: string,
+  input: TodoTimerInput,
+  now: Date
 ): Promise<TimerState> => {
   const todo = await todosRepo.getTodoByIdScoped(todoId, userId);
   if (!todo) throw new TimerServiceError("not_found");
@@ -124,6 +146,8 @@ export const applyTimerEvent = async (
           estimated_seconds: estimated,
           remaining_seconds: 0,
         });
+        // Không có job hết giờ nào sẽ thay thẻ cũ, nên thẻ nhắc còn trên máy khác phải gỡ.
+        dismissTodoCardOnStart(userId, todo, remaining, now);
         return toState(todoId, row, false);
       }
 
@@ -143,6 +167,9 @@ export const applyTimerEvent = async (
         ends_at: endsAt,
         device_id: device.id,
       });
+      // Bắt đầu làm rồi: thẻ nhắc đã hiện trên các máy khác (và trên máy này nếu app chưa kịp hủy) không còn ý nghĩa.
+      // Gửi trong nền, không chờ: không làm chậm response và không bao giờ làm hỏng nó.
+      dismissTodoCardOnStart(userId, todo, remaining, now);
       return toState(todoId, row, false);
     }
 

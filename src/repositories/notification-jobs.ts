@@ -540,6 +540,131 @@ export const cancelEventJobs = async (
   return cancelled;
 };
 
+/**
+ * Hủy nhắc giờ còn pending/processing của một todo mà `local_date` KHÁC ngày hẹn hiện tại `currentDate`: nó
+ * được tạo cho ngày hẹn CŨ. Dùng khi ngày hẹn bị dời sang một ngày đã qua (dời sang ngày còn ở tương lai thì
+ * job đã được ghi lại với ngày mới). Job như vậy không thể là nhắc "đang bị giữ" của ngày hẹn hiện tại, mà nếu
+ * để lại nó vẫn gửi vào giờ cũ (giờ gửi cũ muộn hơn giờ hẹn mới nên bước kiểm tra trước khi gửi không hủy nó).
+ */
+export const cancelReminderOfOtherDate = async (
+  userId: string,
+  refId: string,
+  currentDate: string
+): Promise<number> => {
+  const res = await turso.execute({
+    sql: `UPDATE notification_jobs SET status = 'cancelled'
+          WHERE user_id = ? AND kind = 'todo_reminder' AND ref_id = ?
+            AND status IN ('pending', 'processing')
+            AND local_date IS NOT NULL AND local_date <> ?`,
+    args: [userId, refId, currentDate],
+  });
+  return res.rowsAffected;
+};
+
+// ── Hàng đợi nhắc giờ todo (xem services/reminder-queue.ts) ─────────────────
+
+/** Một nhắc giờ đang chờ gửi, kèm phần của todo cần để xếp thứ tự. */
+export type QueuedReminder = {
+  job_id: string;
+  todo_id: string;
+  run_at: string;
+  /** Ngày hẹn mà job được tạo cho (`local_date`); khác ngày hẹn hiện tại của todo = job đã lỗi thời. */
+  job_local_date: string | null;
+  scheduled_date: string;
+  time: string;
+  is_important: number | null;
+  is_urgent: number | null;
+  /** Lúc tạo todo: todo tạo trước được ưu tiên khi cùng giờ và cùng nhóm. */
+  todo_created_at: string;
+};
+
+const nullableFlag = (value: unknown): number | null =>
+  value === null || value === undefined ? null : Number(value);
+
+/**
+ * Nhắc giờ `pending` của một người dùng có `run_at` trong [fromIso, toIso], chỉ của todo còn làm, cấp trên
+ * cùng và còn giờ hẹn. Một dòng chờ mà todo đã hết hiệu lực không được xếp: bước kiểm tra trước khi gửi hủy nó.
+ */
+export const listPendingTodoReminders = async (
+  userId: string,
+  fromIso: string,
+  toIso: string
+): Promise<QueuedReminder[]> => {
+  const res = await turso.execute({
+    sql: `SELECT j.id AS job_id, j.ref_id AS todo_id, j.run_at, j.local_date AS job_local_date,
+                 t.scheduled_date, t.time, t.is_important, t.is_urgent,
+                 t.created_at AS todo_created_at
+          FROM notification_jobs j
+          JOIN todos t ON t.id = j.ref_id AND t.user_id = j.user_id
+          WHERE j.user_id = ? AND j.kind = 'todo_reminder' AND j.status = 'pending'
+            AND j.run_at >= ? AND j.run_at <= ?
+            AND t.deleted_at IS NULL AND t.parent_id IS NULL
+            AND t.status IN ('open', 'in_progress')
+            AND t.time IS NOT NULL AND t.scheduled_date IS NOT NULL`,
+    args: [userId, fromIso, toIso],
+  });
+  return (res.rows as unknown as Record<string, unknown>[]).map((row) => ({
+    job_id: row.job_id as string,
+    todo_id: row.todo_id as string,
+    run_at: row.run_at as string,
+    job_local_date: (row.job_local_date as string | null) ?? null,
+    scheduled_date: row.scheduled_date as string,
+    time: row.time as string,
+    is_important: nullableFlag(row.is_important),
+    is_urgent: nullableFlag(row.is_urgent),
+    todo_created_at: row.todo_created_at as string,
+  }));
+};
+
+/**
+ * Mốc `run_at` muộn nhất của nhắc giờ ĐÃ ĐI (đang gửi hoặc đã gửi) từ `sinceIso`: nhắc đang chờ không được
+ * xếp sát hay chồng lên nó.
+ */
+export const latestTodoReminderRunAt = async (
+  userId: string,
+  sinceIso: string
+): Promise<string | null> => {
+  const res = await turso.execute({
+    sql: `SELECT MAX(run_at) AS run_at FROM notification_jobs
+          WHERE user_id = ? AND kind = 'todo_reminder'
+            AND status IN ('processing', 'sent') AND run_at >= ?`,
+    args: [userId, sinceIso],
+  });
+  const value = (res.rows[0] as unknown as { run_at: string | null } | undefined)?.run_at;
+  return value ?? null;
+};
+
+/**
+ * Dời `run_at` của một nhắc giờ còn `pending`, chỉ khi nó vẫn ở mốc `fromRunAt` đã đọc (job vừa bị giành
+ * quyền hoặc vừa bị tính lại bởi bên khác thì không ghi đè). Không đụng tới attempts/locked_at.
+ */
+export const moveTodoReminder = async (
+  jobId: string,
+  fromRunAt: string,
+  toRunAt: string
+): Promise<boolean> => {
+  const res = await turso.execute({
+    sql: `UPDATE notification_jobs SET run_at = ?
+          WHERE id = ? AND kind = 'todo_reminder' AND status = 'pending' AND run_at = ?`,
+    args: [toRunAt, jobId, fromRunAt],
+  });
+  return res.rowsAffected > 0;
+};
+
+/** Người dùng có nhắc giờ `pending` đến hạn trong [fromIso, toIso] (bước dọn dẹp xếp lại hàng đợi cho họ). */
+export const listUsersWithPendingTodoReminders = async (
+  fromIso: string,
+  toIso: string
+): Promise<string[]> => {
+  const res = await turso.execute({
+    sql: `SELECT DISTINCT user_id FROM notification_jobs
+          WHERE kind = 'todo_reminder' AND status = 'pending' AND run_at >= ? AND run_at <= ?
+          ORDER BY user_id ASC`,
+    args: [fromIso, toIso],
+  });
+  return (res.rows as unknown as Record<string, unknown>[]).map((row) => row.user_id as string);
+};
+
 // ── Thông báo đã gửi còn nằm trên máy ───────────────────────────────────────
 
 const TODO_CARD_KIND_SQL = sqlList(TODO_CARD_KINDS);
@@ -565,21 +690,35 @@ export const clearStaleCardKeys = async (
   return res.rowsAffected;
 };
 
-/** Todo có nhắc giờ / nhắc lặp đang chờ gửi mà đến hạn trong khoảng [fromIso, toIso] không? */
-export const hasCardJobDueBetween = async (
+/** Một nhắc giờ / nhắc lặp đang chờ gửi của todo, đủ để xét xem nó còn khớp lịch hiện tại không. */
+export type CardJobDue = {
+  kind: "todo_reminder" | "todo_overdue";
+  run_at: string;
+  local_date: string | null;
+};
+
+/**
+ * Nhắc giờ / nhắc lặp đang chờ gửi (hoặc đang gửi) của todo mà đến hạn trong khoảng [fromIso, toIso].
+ * Chỉ là ứng viên: dòng nào đó có thể thuộc lịch CŨ của todo (xem `replacesCard` trong notification-cards),
+ * nên chỗ gọi phải đối chiếu lại với lịch hiện tại trước khi coi nó là thông báo sắp thay thẻ.
+ */
+export const listCardJobsDueBetween = async (
   userId: string,
   refId: string,
   fromIso: string,
   toIso: string
-): Promise<boolean> => {
+): Promise<CardJobDue[]> => {
   const res = await turso.execute({
-    sql: `SELECT 1 FROM notification_jobs
+    sql: `SELECT kind, run_at, local_date FROM notification_jobs
           WHERE user_id = ? AND ref_id = ? AND kind IN (${TODO_CARD_KIND_SQL})
-            AND status IN ('pending', 'processing') AND run_at >= ? AND run_at <= ?
-          LIMIT 1`,
+            AND status IN ('pending', 'processing') AND run_at >= ? AND run_at <= ?`,
     args: [userId, refId, fromIso, toIso],
   });
-  return res.rows.length > 0;
+  return (res.rows as unknown as Record<string, unknown>[]).map((row) => ({
+    kind: row.kind as CardJobDue["kind"],
+    run_at: row.run_at as string,
+    local_date: (row.local_date as string | null) ?? null,
+  }));
 };
 
 // ── Vòng đời khi xử lý ───────────────────────────────────────────────────────

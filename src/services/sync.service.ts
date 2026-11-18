@@ -380,10 +380,12 @@ async function processOp(
     if (habitId && logDate) {
       const nk = await getHabitLogByNaturalKey(habitId, logDate, userId);
       if (nk && nk.id !== id) {
-        // A tombstone, or the zero row the midnight job wrote for a day nobody logged
-        // (auto_closed), carries no user intent: the client's log takes over that row.
-        // Without this a tick made offline at 23:50 and pushed after midnight would lose
-        // to the job's 00:00 row.
+        // A tombstone, or a row written by automation (auto_closed: the midnight job's zero
+        // for a day nobody logged, or a tick/zero from a linked todo or checklist), carries no
+        // user intent: the client's log takes over that row. Without this a tick made offline
+        // at 23:50 and pushed after midnight would lose to the job's 00:00 row, and a day the
+        // user marked missed in advance would lose to a todo completion that reached the
+        // server first. A row the user set (auto_closed = 0) is never taken over this way.
         if (nk.deleted_at !== null || nk.auto_closed) {
           // Resurrect / take over
           await resurrectHabitLogRow(nk.id, {

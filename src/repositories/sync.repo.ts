@@ -1568,7 +1568,7 @@ export const resurrectHabitLogRow = async (
   // completed comes in as boolean from push payload; store as 0/1
   const completed = patch.completed === true || patch.completed === 1 ? 1 : 0;
   // updated_at is the SERVER time, not the client's: this row was already delivered to other
-  // devices (as a tombstone or as the midnight job's zero), and a client timestamp older than
+  // devices (as a tombstone or as an automatic row), and a client timestamp older than
   // their `since` cursor would keep the change from ever reaching them in a delta pull.
   await turso.execute({
     sql: `UPDATE habit_logs

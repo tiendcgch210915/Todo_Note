@@ -27,6 +27,7 @@ import { dismissStaleTodoCard } from "./notification-cards.js";
 import { recomputePendingDigests, planUser } from "./notification-planner.js";
 import { resolveSettings } from "./notification-schedule.js";
 import { reconcileAllTodoOverdue, reconcileTodoOverdue } from "./overdue-nudges.js";
+import { requeueTodoReminders } from "./reminder-queue.js";
 import { cancelReminderRepeats, reconcileReminderRepeats } from "./reminder-repeat.js";
 
 const safely = async (op: string, fn: () => Promise<void>): Promise<void> => {
@@ -109,8 +110,11 @@ const rearmTodoJobs = async (
     reconcileReminderRepeats(userId, todo, runAt)
   );
   if (runAt.getTime() <= now.getTime()) {
-    // Chỉ nhắc giờ ở TƯƠNG LAI; giờ đã qua thì bỏ job đang chờ (nếu có).
-    await jobsRepo.cancelEventJobs("todo_reminder", [todo.id]);
+    // Chỉ TẠO nhắc giờ ở tương lai. Job đang chờ (nếu có) của một giờ hẹn đã qua chỉ còn đúng khi nó đang bị
+    // GIỮ lại (đang có đếm ngược của todo khác, hoặc xếp sau một nhắc cùng giờ): `onTodoChanged` chạy hàng
+    // đợi ngay sau đây, giữ nó nếu vẫn bị giữ và hủy nếu không (hành vi cũ). Riêng job mang NGÀY hẹn cũ (ngày
+    // hẹn vừa bị dời về quá khứ) thì hủy ngay: hàng đợi bỏ qua nó (lệch ngày) nên nó sẽ gửi vào giờ cũ.
+    await jobsRepo.cancelReminderOfOtherDate(userId, todo.id, todo.scheduled_date);
     return;
   }
 
@@ -135,20 +139,26 @@ export const onTodoChanged = async (
   now: Date = new Date()
 ): Promise<void> => {
   await safely("todo_changed", () => rearmTodoJobs(userId, todoId, now));
+  // Xếp lại hàng đợi nhắc giờ: todo đổi có thể đổi giờ gửi của chính nó và của các nhắc khác (nhắc cùng giờ),
+  // và hoàn thành/xóa/bắt đầu một todo đang đếm ngược thì thả các nhắc đang bị nó giữ (xem services/reminder-queue.ts).
+  // Phải đứng SAU khi job được tạo/hủy và TRƯỚC việc gỡ thông báo cũ, vì việc gỡ xét xem nhắc kế tiếp có đến ngay không.
+  await requeueTodoReminders(userId, now, todoId);
   await safely("todo_stale_card", async () => {
     await dismissStaleTodoCard(userId, todoId, now);
   });
 };
 
 /** Todo bị xóa (kể cả xóa lan xuống todo con / cả chuỗi lặp). */
-export const onTodosRemoved = (
-  _userId: string,
-  todoIds: readonly string[]
-): Promise<void> =>
-  safely("todos_removed", async () => {
-    if (todoIds.length === 0) return;
-    await clearTodoArtifacts(todoIds, true);
-  });
+export const onTodosRemoved = async (
+  userId: string,
+  todoIds: readonly string[],
+  now: Date = new Date()
+): Promise<void> => {
+  if (todoIds.length === 0) return;
+  await safely("todos_removed", () => clearTodoArtifacts(todoIds, true));
+  // Một todo đang đếm ngược bị xóa thì nhắc đang bị nó giữ được thả. `now` chỉ để test.
+  await requeueTodoReminders(userId, now);
+};
 
 /**
  * Checklist run bắt đầu / hoàn thành / dừng / xóa (REST hoặc sync):

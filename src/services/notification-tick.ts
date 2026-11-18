@@ -59,6 +59,7 @@ import {
 } from "./notification-planner.js";
 import { isDigestEnabled, resolveSettings } from "./notification-schedule.js";
 import { notifyUser } from "./notifications.js";
+import { isBusyWithAnotherTodo, reconcileAllReminderQueues } from "./reminder-queue.js";
 import {
   isImportantAndUrgent,
   repeatIndexOf,
@@ -180,13 +181,22 @@ const prepare = async (job: jobsRepo.JobRow, now: Date): Promise<Prepared> => {
       ) {
         return CANCEL;
       }
-      // Giờ nhắc đã bị sửa sau khi job được tạo -> job này lỗi thời.
+      // `run_at` là giờ GỬI (có thể muộn hơn giờ hẹn vì đếm ngược của todo khác hoặc nhắc cùng giờ đi trước,
+      // xem services/reminder-queue.ts) nên chỉ cần không SỚM hơn giờ hẹn. Giờ hẹn bị dời về sau khi job được
+      // tạo -> job này lỗi thời. (Giờ hẹn bị dời về trước thì hàng đợi đã dời job theo ngay khi todo đổi.)
       const expected = localDateTimeToUtc(
         todo.scheduled_date,
         todo.time,
         settings.timezone
       );
-      if (expected.getTime() !== runAtMs) return CANCEL;
+      if (runAtMs < expected.getTime()) return CANCEL;
+      // Đã bấm giờ (đang chạy, tạm dừng hay hết giờ) từ trước giờ hẹn tức là đã bắt đầu làm: không nhắc "đến giờ" nữa,
+      // như nhắc lại và nhắc lặp. Hủy Ở ĐÂY lúc gửi chứ không hủy job khi bắt đầu, để dừng hẳn đồng hồ (idle) trước giờ
+      // hẹn thì nhắc vẫn đến. Lưu ý: đồng hồ `finished`/`paused` còn sót (chưa `stop`) cũng tính là đã bắt đầu.
+      const timer = await timersRepo.getTimer(todo.id);
+      if (timer && timer.user_id === job.user_id && timersRepo.isTimerStarted(timer.status)) {
+        return CANCEL;
+      }
       return {
         text: buildTodoReminder(todo.title, todo.is_important, todo.is_urgent),
         id: todo.id,
@@ -223,6 +233,9 @@ const prepare = async (job: jobsRepo.JobRow, now: Date): Promise<Prepared> => {
       if (timer && timer.user_id === job.user_id && timersRepo.isTimerStarted(timer.status)) {
         return CANCEL;
       }
+      // Người dùng đang đếm ngược một todo khác: không làm phiền, và nhắc lại này (trễ quá 2 phút thì bỏ) không
+      // còn ý nghĩa nếu để dành sau đó.
+      if (await isBusyWithAnotherTodo(job.user_id, todo.id, now)) return CANCEL;
       return {
         // Cùng nội dung và thẻ với nhắc đúng giờ: thẻ trên khay được thay bằng bản này và kêu lại.
         text: buildTodoReminder(todo.title, todo.is_important, todo.is_urgent),
@@ -326,6 +339,8 @@ const prepare = async (job: jobsRepo.JobRow, now: Date): Promise<Prepared> => {
       if (timer && timer.user_id === job.user_id && timersRepo.isTimerStarted(timer.status)) {
         return CANCEL;
       }
+      // Người dùng đang đếm ngược một todo khác: bỏ mốc này (mốc kế tiếp, 1-2 giờ sau, được xét lại như thường).
+      if (await isBusyWithAnotherTodo(job.user_id, todo.id, now)) return CANCEL;
       // Thông báo cũ của todo bị thay nên bản này phải tự nói được "đã trễ bao lâu".
       const lateMinutes = Math.round((runAtMs - scheduledAt.getTime()) / 60_000);
       return {
@@ -611,6 +626,11 @@ const maintain = async (
   });
   await step("backfill_reminders", async () => {
     summary.backfilled = await backfillTodoReminders(now);
+  });
+  // Xếp lại hàng đợi nhắc giờ SAU khi vá job thiếu: dữ liệu có trước tính năng và hook bị lỡ được kéo về đúng
+  // (đếm ngược đang chạy, nhắc cùng giờ). Không đổi gì khi mọi thứ đã đúng.
+  await step("reminder_queue", async () => {
+    await reconcileAllReminderQueues(now);
   });
   await step("backfill_todo_overdue", async () => {
     summary.overdue_backfilled += await backfillTodoOverdue(now);

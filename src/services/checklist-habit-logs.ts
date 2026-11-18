@@ -23,7 +23,8 @@ const parseInstant = (iso: string | null): Date | null => {
  *
  * Quy tắc giống todo-habit-logs: chỉ chạy ở sự kiện hoàn thành; đổi/xóa/bỏ hoàn thành run
  * sau đó không sửa log đã ghi; `note` của log được giữ; log ngày đã bị job nửa đêm đóng
- * (completed=0, auto_closed=1) được nâng lên completed=1.
+ * (completed=0, auto_closed=1) được nâng lên completed=1. Trạng thái người dùng đã đặt cho ngày
+ * đó (đánh dấu bỏ lỡ trước, tick tay) KHÔNG bao giờ bị đổi: xem `upsertAutoLog`.
  */
 export const autoLogHabitsForCompletedRun = async (
   userId: string,
@@ -44,8 +45,9 @@ export const autoLogHabitsForCompletedRun = async (
 
   const logs: habitsRepo.HabitLogRow[] = [];
   for (const habit of habits) {
-    logs.push(await habitsRepo.upsertAutoLog(habit.id, logDate, true));
-    await habitsRepo.recomputeStreaks(habit.id);
+    const { log, written } = await habitsRepo.upsertAutoLog(habit.id, logDate, true);
+    logs.push(log);
+    if (written) await habitsRepo.recomputeStreaks(habit.id);
   }
   return logs;
 };
@@ -54,6 +56,7 @@ export const autoLogHabitsForCompletedRun = async (
  * Người dùng đánh dấu tay "Đã xong" cho ngày `date` của checklist → mọi habit đang hoạt động gắn
  * với checklist đó được tick cho đúng ngày ấy (như khi một lần chạy hoàn thành). Đánh dấu ngược lại
  * ("Chưa hoàn thành") KHÔNG gỡ log đã ghi, cùng quy tắc với run: log là lịch sử, không tự rút lại.
+ * Ngày mà người dùng đã đặt trạng thái cho habit (vd. bỏ lỡ trước) cũng không bị đổi.
  */
 export const autoLogHabitsForMarkedDay = async (
   userId: string,
@@ -63,8 +66,9 @@ export const autoLogHabitsForMarkedDay = async (
   const habits = await habitsRepo.listLinkedHabits(userId, templateId);
   const logs: habitsRepo.HabitLogRow[] = [];
   for (const habit of habits) {
-    logs.push(await habitsRepo.upsertAutoLog(habit.id, date, true));
-    await habitsRepo.recomputeStreaks(habit.id);
+    const { log, written } = await habitsRepo.upsertAutoLog(habit.id, date, true);
+    logs.push(log);
+    if (written) await habitsRepo.recomputeStreaks(habit.id);
   }
   return logs;
 };

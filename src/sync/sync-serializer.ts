@@ -321,7 +321,8 @@ const fromBoolNullable = (v: unknown): number | null => {
 
 const SERVER_ONLY: Partial<Record<EntityType, string[]>> = {
   habit: ["current_streak", "longest_streak"],
-  // auto_closed: provenance flag of the midnight job, never set or shown by clients
+  // auto_closed: provenance flag of automation (midnight job, or a linked todo/checklist
+  // auto-log): the row carries no user intent. Never set or shown by clients
   habit_log: ["auto_closed"],
   checklist_category: ["is_system"],
   checklist_template: ["times_used", "last_used_at", "is_system"],

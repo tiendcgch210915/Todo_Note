@@ -63,11 +63,19 @@ Reference implementation: `doneDatesOf()` in `src/services/checklist-occurrence-
 Consequences worth knowing:
 
 - Marking a day `done` is exactly like completing a run for reminders: that day's `checklist_due` job is cancelled; marking it `open` (or deleting the mark) re-arms them.
-- Marking a day `done` ticks the habits linked to the checklist for **that** day. Marking it `open` does **not** remove a log that was already written (same rule as for runs: logs are history). A completed run ticks the linked habits on its **start** day.
+- Marking a day `done` ticks the habits linked to the checklist for **that** day. Marking it `open` does **not** remove a log that was already written (same rule as for runs: logs are history). A completed run ticks the linked habits on its **start** day. A habit status the user already set for that day is never changed by these ticks (next section).
 - A non-repeating schedule is finished (removed, see below) when its day is done, whether by a run or by a `done` mark. After that there is no occurrence left to long-press; the schedule is not recreated by an `open` mark.
 - A repeating schedule is never removed by a mark.
 - A mark belongs to the checklist's day, not to the schedule: deleting or re-creating the schedule keeps the marks; deleting the checklist soft-deletes them.
 - `updated_at` of the mark is the moment of the user's tap and is part of the rule (`open` only holds against runs completed before it), so the app must set it to the real tap time (client clock, same clock that stamps run `completed_at`).
+
+## Automatic habit ticks never override the user
+
+A linked todo or checklist (a completed run, a `done` mark) ticks its habit **only on a day nobody has set**. A habit log the user wrote (a day marked missed in advance, or ticked by hand) is never changed by these ticks, whichever way it points; only the user's own edit changes it. Deleting the log hands the day back to automation.
+
+- The server may raise a day it filled itself (or the midnight job's `completed = false`) to done. It never lowers a tick it wrote, and completing a todo late does not lower anything.
+- A `habit_log` pushed for a habit and day the server already filled automatically (under another id) replaces that automatic row; the push answers `conflict` with the row to adopt, like any natural-key collision. A row the user wrote is kept: the push gets `conflict` with the server copy.
+- The app's local mirror of the tick (instant feedback before the pull: the todo-completion projection and the checklist tick overlay) must follow the same rule. It cannot tell the user's `completed = false` from the midnight job's, so it may only fill a day that has **no live log**; it must not raise an existing `false` log. The next pull brings the server's answer.
 
 ## Pausing a schedule
 
@@ -298,7 +306,7 @@ Rules:
 - A schedule or override for a checklist the user cannot see (someone else's, or deleted) is acknowledged but not written, as `checklist_template_order` does. Push the checklist before its schedule in the same batch.
 - A mark for a checklist the user cannot see is acknowledged but not written, like the other two. `status` must be `done` or `open` and `local_date` a real date, otherwise `bad_input`.
 - Marks are not validated against the schedule (the app may push a mark and its schedule in one batch in any order). After pulling, resolve two local marks for the same `(template_id, local_date)` by keeping the one the server returned.
-- A pushed `done` mark also ticks the linked habits for that day on the server.
+- A pushed `done` mark also ticks the linked habits for that day on the server, unless the user already set that habit's status for the day (see "Automatic habit ticks never override the user").
 - Every accepted change cancels and recreates the affected reminder jobs on the server.
 
 ## Push Notification `checklist_due`
@@ -347,7 +355,7 @@ Other copy changed in the same release:
 
 - Digests keep their titles, but the first body line is now a short numbers line (the collapsed notification only shows the first ~45 characters). Morning: `📋 Hôm nay: 5 todo (xong 2, còn 3) · 3 thói quen` / blank line / `💪 Động lực: “...”` / `💡 Suy ngẫm: ...` (a zero part is left out). Todos: `📋 Xong 2/5 todo · còn 3 đang chờ` (or `📋 Xong cả 5 todo hôm nay`) plus an optional `💪 ...` line. Habits: `📋 Đã duy trì 1/3 thói quen` (or `📋 Đã duy trì đủ 3/3 thói quen`) plus an optional `💪 ...` line. All labels live in `src/config/notification-labels.ts`.
 - `todo_overdue` (the repeated nudge after the appointment time) now says how late the todo is, because it replaces the previous nudge: `⏰ Trễ 2 giờ (hẹn 10:00) · Làm ngay hoặc dời lịch!` (it used to be `⏰ Quá giờ 10:00 · ...`).
-- `todo_overdue` stops once the todo is **started**, even if it is not completed: `status = "in_progress"`, or a countdown that was started on it (`PUT /todos/:id/timer` events `start`/`resume` -> running, `pause` -> paused, or the countdown ran out -> finished). Sending the timer event `stop` (back to `idle`) makes the todo eligible for the next slot again. The on-time `todo_reminder` is not affected.
+- `todo_overdue` stops once the todo is **started**, even if it is not completed: `status = "in_progress"`, or a countdown that was started on it (`PUT /todos/:id/timer` events `start`/`resume` -> running, `pause` -> paused, or the countdown ran out -> finished). Sending the timer event `stop` (back to `idle`) makes the todo eligible for the next slot again. The on-time `todo_reminder` follows the same rule for the countdown: if the countdown (running, paused, or ran out and not stopped) is still on when the reminder comes due, the server does **not** send it. Stopping the countdown (`stop`) before the reminder time brings the reminder back. `status = "in_progress"` alone does not suppress the on-time reminder. The card that a reminder or nudge already left on the phone is removed when the countdown starts, see "Removing a card" below.
 
 ## Notification tags (one card per task)
 
@@ -385,8 +393,17 @@ What the server guarantees / does not:
 
 - Sent once per stale card, to every device of the user, after the new reminder / repeat jobs have been re-armed. The repeats follow the new time, e.g. at 10:00 an important+urgent todo moved from 10:00 to 09:10 loses its card now and still gets its next repeat at 10:10.
 - Not sent for edits that keep the date and time (title, importance, estimate...), for completed / archived / deleted todos, or for cards sent before server migration `0026`.
-- If the next notification of that todo is due within 4 minutes (e.g. moved to 09:03 at 10:00 -> repeat at 10:03) no dismiss is sent: that notification has the same tag and replaces the old card by itself.
+- If the next notification of that todo **for its new schedule** is due within 4 minutes (e.g. moved to 09:03 at 10:00 -> repeat at 10:03, or moved to 10:03 -> the new reminder at 10:03) no dismiss is sent: that notification has the same tag and replaces the old card by itself. A leftover notification of the *old* schedule does not count (the server cancels it without sending), so the dismiss is still sent.
+- The tag of an occurrence of a recurring todo is the series root's id, so the dismiss removes whatever card currently carries that tag on the phone. Todos of one series normally have a single open occurrence at a time, so this is the card of the todo that was edited.
 - Best effort. It is a high-priority data message, so Doze / aggressive battery savers / a force-stopped app can delay or drop it, and a phone that stays offline longer than 3 minutes misses it (the card then stays until replaced or swiped away).
+
+**The same `dismiss` message is also sent when the user starts or resumes a countdown** (`PUT /todos/:id/timer`, `action` `start` or `resume`). Once the user is working on the todo the reminder / nudge card on the phone is obsolete, but the server can only stop *future* nudges, so it asks every device to remove the card. Same payload, same handling in the app (cancel by `data.tag`), nothing new to implement. Details:
+
+- It goes to **all** the user's devices, the starting one included; your own local cancel on the starting device (done the moment the user taps start) stays, the message only covers the other devices and cards that were posted between the tap and the moment the server received the event. Cancelling an already-cancelled tag is a no-op.
+- It is sent **after** the event was accepted and does not delay or change the response of `PUT /todos/:id/timer`; if the send fails the request still succeeds.
+- Not sent for: `pause`, `stop`, `finish`; an event the server ignores as old or replayed (`ignored: true`); a rejected event (`device_not_found`, `todo_completed`, unknown todo); a subtask (no card of its own).
+- Not sent when **240 seconds or less** are left on a new countdown: the end-of-countdown push (`todo_timer_end`) is then due within the 4-minute replace window, shares the tag, and replaces the card itself (a late `dismiss` could remove it). With 0 seconds left (the countdown is already over) no end-of-countdown push exists, so the card is removed.
+- The tag is the one the card was sent with: `todo:<todo id>`, or `todo:<series root id>` for an occurrence of a recurring todo.
 
 ## Reminder repeat: once, 5 minutes after the on-time reminder, important + urgent todos only (`todo_reminder_repeat`)
 
@@ -394,7 +411,7 @@ A todo with a time gets its on-time reminder (`type: "todo"`, see above). If the
 
 **Payload of the repeat.** Same `type: "todo"`, same `id`, `date`, `tag` (`todo:<id or series root id>`, so it replaces the card on the tray), same title and body, channel `todo_reminders`, FCM `ttl` 2 minutes. The only difference is one extra data key: **`repeat`**, always `"1"`. The on-time reminder and the hourly `todo_overdue` nudges have **no `repeat` key**. Old apps ignore the key and simply show the repeat.
 
-**When the server stops by itself** (nothing for the app to do): the todo is completed, archived or deleted; its date or time was edited; it is no longer important + urgent; it became `in_progress`; or a countdown was started on it (`PUT /todos/:id/timer` with `start` / `resume`, or any timer state other than `idle`: running, paused, or ran out). It is checked again right before sending. A repeat that the server sends more than 2 minutes late is dropped, never delivered late.
+**When the server stops by itself** (nothing for the app to do): the todo is completed, archived or deleted; its date or time was edited; it is no longer important + urgent; it became `in_progress`; or a countdown was started on it (`PUT /todos/:id/timer` with `start` / `resume`, or any timer state other than `idle`: running, paused, or ran out). It is checked again right before sending. The on-time reminder itself is also skipped when a countdown is on at its time (any state other than `idle`). A repeat that the server sends more than 2 minutes late is dropped, never delivered late.
 
 **What the app must do: `POST /api/v1/todos/:id/reminder-ack`** (user JWT, no request body)
 
@@ -412,6 +429,18 @@ Call it for the `data.id` of the push, in these cases:
 Best effort and fire-and-forget: never block the UI, retry a few times with a short backoff (for example 2 s, 5 s, 15 s) on network errors / 5xx / 429, and give up after about 6 minutes (the repeat is due at +5 minutes, so it is over by then). No persistent queue is needed. Starting the countdown needs **no** ack: the timer events already tell the server (the repeat is cancelled when the `start` / `resume` event is accepted).
 
 Migration `0027_todo_reminder_repeat.sql` rebuilds `notification_jobs` so its `kind` CHECK accepts `todo_reminder_repeat`. Apply it with `npm run db:migrate` **before** deploying the code. Tests: `tests/reminder-repeat.test.ts`, `tests/migration-0027.test.ts`.
+
+## Reminders wait while another todo is being counted down, and same-time reminders queue (server only)
+
+**No app change is needed and no payload or endpoint changed.** The on-time `todo_reminder` simply arrives later than the appointment time in two situations. It is still the same push (same `type`, `id`, `date`, `tag`, no `repeat` key).
+
+1. **A countdown is running on another todo.** The app already reports it with `PUT /todos/:id/timer` (`start` / `resume` carry `remainingSeconds`, so the server knows when it ends). Every other todo whose reminder time falls **before or exactly when that countdown ends** is held and sent at **countdown end + 2 minutes**; if several are held they follow each other 2 minutes apart. Example: three todos at 14:00, 14:30, 15:30; Todo 1 started at 14:03 with 60 minutes (ends 15:03) -> Todo 2 arrives at 15:05, Todo 3 at 15:30 as usual. Started at 14:06 with 90 minutes (ends 15:36) -> Todo 2 at 15:38, Todo 3 at 15:40.
+   - A countdown that **stops early** (`stop`, `pause`, `finish`, or the todo is completed, archived or deleted) releases the held reminders **2 minutes after that moment**. `resume` holds again. A paused, finished or `idle` countdown holds nothing. A countdown never holds the reminder of its own todo.
+   - Only a **running** countdown counts, so the app must keep sending the timer events (it already does). If an event reaches the server late, the hold starts when it arrives; a reminder that already went out is not recalled.
+   - While a countdown runs on another todo the server also **drops** (does not postpone) the `todo_reminder_repeat` (+5 min) and `todo_overdue` nudges of the other todos that come due in that window; the next `todo_overdue` slot is judged on its own. Digests, checklist reminders and the countdown-end push (`todo_timer_end`) are not affected.
+2. **Several reminders share a time.** They go out 2 minutes apart, first the todo with the earliest appointment, then by group (important + urgent, urgent only, important only, neither; an unset flag counts as "no"), then the one created first. A reminder that lands on or before an earlier one in the queue goes 2 minutes after it. The `todo_reminder_repeat` keeps its own timing (appointment +5 min, important + urgent only), so repeats of same-time todos are not spaced out.
+
+A reminder that was held or spaced out and goes out later than the appointment time no longer gets the +5 minute repeat if that moment has already passed. Tests: `tests/reminder-queue.test.ts`.
 
 ## Verification
 

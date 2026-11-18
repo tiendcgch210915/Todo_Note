@@ -19,6 +19,7 @@ const firebase = await import("../src/services/firebase.js");
 const { runDispatch, runMaintenance } = await import("../src/services/notification-tick.js");
 const triggers = await import("../src/services/notification-triggers.js");
 const cards = await import("../src/services/notification-cards.js");
+const jobsRepo = await import("../src/repositories/notification-jobs.js");
 const todosService = await import("../src/services/todos.js");
 const { processPush } = await import("../src/services/sync.service.js");
 const { localDateTimeToUtc } = await import("../src/utils/time.js");
@@ -218,6 +219,34 @@ test("a repeated nudge is removed too when the time is moved, even by a whole nu
   assert.deepEqual((await pendingNudges("t1"))[0], runAtVn(TODAY, "12:00"));
 });
 
+test("an edit cancels the pending +5 minute repeat of the old time, so a repeat never has to count as the next notification", async () => {
+  await sentReminder();
+  const pendingRepeats = () =>
+    fx.jobsFor(turso, USER_ID, "AND kind = 'todo_reminder_repeat' AND status = 'pending'");
+  assert.equal((await pendingRepeats()).length, 1, "the on-time reminder armed the 10:05 repeat");
+
+  // A repeat is only re-created by a reminder SENT for the new time, never by the edit itself.
+  await setTodo("t1", "time = '09:20'");
+  await changed("t1", at(TODAY, "10:01"));
+
+  assert.deepEqual(await pendingRepeats(), []);
+  assert.equal(dismissMessages().length, 2);
+});
+
+test("the card shown by the +5 minute repeat is removed too: the reminder row's key stands for it", async () => {
+  await sentReminder();
+  await dispatchAt(TODAY, "10:05");
+  assert.equal(shownMessages().filter((m) => m.data?.repeat === "1").length, 2, "the repeat replaced the card");
+  assert.deepEqual(await cardKeys("t1"), [["todo_reminder", `${TODAY}T10:00`]], "a repeat records no key of its own");
+  fake.messages.length = 0;
+
+  await setTodo("t1", "time = '09:20'"); // next nudge 10:20: far enough not to replace the card by itself
+  await changed("t1", at(TODAY, "10:06"));
+
+  assert.equal(dismissMessages().length, 2);
+  assert.deepEqual(await cardKeys("t1"), []);
+});
+
 // ── what must NOT remove anything ────────────────────────────────────────────
 
 test("edits that do not touch the date or time leave the card alone", async () => {
@@ -245,6 +274,24 @@ test("a card is removed only once, however many times the todo is saved afterwar
   assert.equal(dismissMessages().length, 2, "one message per device, once");
 });
 
+test("two edits saved at the same moment send the removal once: the key is claimed by a single UPDATE", async () => {
+  await sentReminder();
+  await setTodo("t1", "time = '09:10'");
+  const now = at(TODAY, "10:00", 30);
+
+  await Promise.all([triggers.onTodoChanged(USER_ID, "t1", now), triggers.onTodoChanged(USER_ID, "t1", now)]);
+  await cards.flushDismissals();
+  assert.equal(dismissMessages().length, 2, "one message per device, not one per edit");
+
+  // The claim itself: of two concurrent callers exactly one sees the stale rows.
+  await turso.execute("UPDATE notification_jobs SET card_key = '2026-06-20T10:00' WHERE kind = 'todo_reminder'");
+  const claims = await Promise.all([
+    jobsRepo.clearStaleCardKeys(USER_ID, "t1", `${TODAY}T09:10`),
+    jobsRepo.clearStaleCardKeys(USER_ID, "t1", `${TODAY}T09:10`),
+  ]);
+  assert.deepEqual([...claims].sort(), [0, 1]);
+});
+
 test("nothing is removed when no notification was ever delivered for the todo", async () => {
   await fx.insertDevice(turso, USER_ID, "reg-A", { id: "device-A" });
   await fx.insertTodo(turso, { id: "t1", scheduledDate: TODAY, time: "10:00", isImportant: 1, isUrgent: 1 });
@@ -269,11 +316,13 @@ test("completing or deleting the todo is outside this feature: no removal messag
 
 test("only the todo that changed is touched: another todo's card stays", async () => {
   await fx.insertTodo(turso, { id: "t2", title: "Việc khác", scheduledDate: TODAY, time: "10:00", isImportant: 1, isUrgent: 1 });
-  await sentReminder(); // arms and sends both t1 and t2 at 10:00
+  await sentReminder(); // arms both; t1 goes out at 10:00 and t2, sharing its time, queues 2 minutes behind it
+  await dispatchAt(TODAY, "10:02");
+  fake.messages.length = 0;
   assert.deepEqual(await cardKeys("t2"), [["todo_reminder", `${TODAY}T10:00`]]);
 
   await setTodo("t1", "time = '09:10'");
-  await changed("t1", at(TODAY, "10:01"));
+  await changed("t1", at(TODAY, "10:03"));
 
   assert.deepEqual(dismissMessages().map((m) => m.data?.tag), ["todo:t1", "todo:t1"]);
   assert.deepEqual(await cardKeys("t2"), [["todo_reminder", `${TODAY}T10:00`]]);
@@ -324,6 +373,95 @@ test("the margin: a nudge due in more than 4 minutes does not stop the removal",
   assert.equal(dismissMessages().length, 2);
 });
 
+test("the NEW reminder itself, due in under 4 minutes, replaces the card: no removal message", async () => {
+  await sentReminder({ isImportant: 0, isUrgent: 0 });
+
+  await setTodo("t1", "time = '10:03'"); // 2.5 minutes after the edit
+  await changed("t1", at(TODAY, "10:00", 30));
+  assert.equal(dismissMessages().length, 0);
+  assert.deepEqual(await cardKeys("t1"), [], "the stale card is accounted for");
+
+  await dispatchAt(TODAY, "10:03");
+  assert.equal(shownMessages().length, 2);
+  assert.equal(shownMessages()[0].android?.notification?.tag, "todo:t1");
+});
+
+test("a new reminder due in more than 4 minutes does not stop the removal, and still goes out afterwards", async () => {
+  await sentReminder({ isImportant: 0, isUrgent: 0 });
+
+  await setTodo("t1", "time = '10:05'"); // 4.5 minutes after the edit
+  await changed("t1", at(TODAY, "10:00", 30));
+  assert.equal(dismissMessages().length, 2);
+
+  fake.messages.length = 0;
+  await dispatchAt(TODAY, "10:05");
+  assert.equal(shownMessages().length, 2);
+});
+
+test("a pending nudge of the OLD time is not 'the next notification': the tick cancels it, so the removal must not be skipped", async () => {
+  await sentReminder();
+  await setTodo("t1", "time = '15:00'");
+  // The edit's re-arm did not clean up (it failed, or has not run yet): a nudge of the old schedule, due in 90 s.
+  await fx.insertRawJob(turso, {
+    id: "stale-nudge",
+    kind: "todo_overdue",
+    refId: "t1",
+    localDate: TODAY,
+    runAt: at(TODAY, "10:02").toISOString(),
+  });
+
+  assert.equal(await cards.dismissStaleTodoCard(USER_ID, "t1", at(TODAY, "10:00", 30)), "dismissed");
+  await cards.flushDismissals();
+  assert.equal(dismissMessages().length, 2);
+
+  fake.messages.length = 0;
+  await dispatchAt(TODAY, "10:02");
+  assert.equal(shownMessages().length, 0, "it really would have replaced nothing");
+  assert.equal(await fx.statusOf(turso, "stale-nudge"), "cancelled");
+});
+
+test("a reminder row that still carries the old DATE is not 'the next notification' either", async () => {
+  await sentReminder({ isImportant: 0, isUrgent: 0 });
+  await setTodo("t1", `scheduled_date = '${NEXT}'`);
+  // Reset by an earlier edit but never re-based: pending at 10:02 of the OLD day, with the stale key still on it.
+  await turso.execute({
+    sql: "UPDATE notification_jobs SET status = 'pending', run_at = ?, local_date = ? WHERE kind = 'todo_reminder'",
+    args: [at(TODAY, "10:02").toISOString(), TODAY],
+  });
+
+  assert.equal(await cards.dismissStaleTodoCard(USER_ID, "t1", at(TODAY, "10:00", 30)), "dismissed");
+  await cards.flushDismissals();
+  assert.equal(dismissMessages().length, 2);
+});
+
+test("a reminder held back by the queue (later than the appointment) still replaces the card when it is due soon", async () => {
+  await sentReminder({ isImportant: 0, isUrgent: 0 });
+  await setTodo("t1", "time = '09:55'"); // appointment already past
+  // Held behind another todo's countdown and released at 10:03: the card is replaced by it, not removed.
+  await turso.execute({
+    sql: "UPDATE notification_jobs SET status = 'pending', run_at = ?, local_date = ? WHERE kind = 'todo_reminder'",
+    args: [at(TODAY, "10:03").toISOString(), TODAY],
+  });
+
+  assert.equal(await cards.dismissStaleTodoCard(USER_ID, "t1", at(TODAY, "10:00", 30)), "replaced");
+  assert.equal(dismissMessages().length, 0);
+});
+
+test("moving a todo whose reminder has not gone out yet to a PAST date cancels that reminder instead of sending it", async () => {
+  await fx.insertDevice(turso, USER_ID, "reg-A", { id: "device-A" });
+  await fx.insertTodo(turso, { id: "t1", scheduledDate: TODAY, time: "10:00" });
+  await maintenance(at(TODAY, "09:00"));
+  const pendingReminders = () => fx.jobsFor(turso, USER_ID, "AND kind = 'todo_reminder' AND status = 'pending'");
+  assert.equal((await pendingReminders()).length, 1);
+
+  await setTodo("t1", "scheduled_date = '2026-06-19'");
+  await changed("t1", at(TODAY, "09:50"));
+
+  assert.deepEqual(await pendingReminders(), []);
+  await dispatchAt(TODAY, "10:00");
+  assert.equal(fake.messages.length, 0, "no reminder for a day that has already passed");
+});
+
 // ── delivery contract ────────────────────────────────────────────────────────
 
 test("the removal is only sent to registrations that exist; dead ones are pruned like for any push", async () => {
@@ -369,6 +507,49 @@ test("NOTIFY_DRY_RUN only logs: no removal reaches FCM, and the stale card is st
 
   assert.equal(fake.messages.length, 0);
   assert.deepEqual(await cardKeys("t1"), []);
+});
+
+test("a database error while accounting for the stale card is logged and never reaches the todo update", async () => {
+  await sentReminder();
+  const logged: string[] = [];
+  firebase.setPushLogger({ info() {}, warn() {}, error: (_fields, message) => logged.push(message) });
+  // What a database without migration 0026 does to the statement that clears the key.
+  await turso.execute(`CREATE TRIGGER zz_no_key_clear BEFORE UPDATE OF card_key ON notification_jobs
+    WHEN NEW.card_key IS NULL BEGIN SELECT RAISE(ABORT, 'simulated: no such column: card_key'); END`);
+  try {
+    await setTodo("t1", "time = '09:10'");
+    await assert.doesNotReject(changed("t1", at(TODAY, "10:00", 30)));
+  } finally {
+    await turso.execute("DROP TRIGGER zz_no_key_clear");
+  }
+
+  assert.ok(logged.includes("notification trigger failed"), "the failure is visible in the logs");
+  assert.equal(dismissMessages().length, 0);
+  assert.equal((await pendingNudges("t1")).length, 14, "the new schedule is armed regardless");
+});
+
+test("if the card key cannot be recorded the push is still delivered exactly once and the fallback is logged", async () => {
+  await fx.insertDevice(turso, USER_ID, "reg-A", { id: "device-A" });
+  await fx.insertTodo(turso, { id: "t1", scheduledDate: TODAY, time: "10:00", isImportant: 0, isUrgent: 0 });
+  await maintenance(at(TODAY, "09:00"));
+  const logged: string[] = [];
+  const logger = { info() {}, warn() {}, error: (_fields: object, message: string) => logged.push(message) };
+  await turso.execute(`CREATE TRIGGER zz_no_key_write BEFORE UPDATE OF card_key ON notification_jobs
+    WHEN NEW.card_key IS NOT NULL BEGIN SELECT RAISE(ABORT, 'simulated: no such column: card_key'); END`);
+  try {
+    await runDispatch({ now: at(TODAY, "10:00", 10), logger });
+    await runDispatch({ now: at(TODAY, "10:03"), logger }); // past the 2-minute retry spacing: a resend would show up here
+  } finally {
+    await turso.execute("DROP TRIGGER zz_no_key_write");
+  }
+
+  assert.equal(shownMessages().length, 1, "delivered once, never retried");
+  assert.ok(logged.includes("marking a delivered notification as sent failed; retrying without the card key"));
+  assert.deepEqual(
+    (await fx.jobsFor(turso, USER_ID, "AND kind = 'todo_reminder'")).map((row) => [row.status, row.card_key]),
+    [["sent", null]],
+    "degraded mode: sent, but no key, so a later edit cannot remove this card (the log line is the alarm)"
+  );
 });
 
 test("without push configured nothing is sent and nothing throws", async () => {
@@ -444,6 +625,120 @@ test("a sync push that changes the time removes the delivered card as well", asy
   assert.equal(dismissMessages()[0].data?.tag, `todo:${id}`);
 });
 
+/** Todo thật (qua service) có nhắc 10:00 đã gửi tới một máy. */
+const deliveredReminder = async (fields: Record<string, unknown> = {}) => {
+  await fx.insertDevice(turso, USER_ID, "reg-A", { id: "device-A" });
+  const { todo } = await todosService.createTodo(USER_ID, {
+    title: "Họp",
+    scheduled_date: DATE,
+    time: "10:00",
+    ...fields,
+  });
+  await markDelivered(todo.id, `${DATE}T10:00`);
+  return todo;
+};
+
+test("clearing only the time through the todo service removes the delivered card", async () => {
+  const todo = await deliveredReminder();
+
+  await todosService.updateTodo(USER_ID, todo.id, { time: null });
+  await cards.flushDismissals();
+
+  assert.equal(dismissMessages().length, 1);
+  assert.deepEqual(await cardKeys(todo.id), []);
+});
+
+test("clearing the date (and with it the time) through the todo service removes the delivered card", async () => {
+  const todo = await deliveredReminder();
+
+  await todosService.updateTodo(USER_ID, todo.id, { scheduled_date: null, time: null });
+  await cards.flushDismissals();
+
+  assert.equal(dismissMessages().length, 1);
+});
+
+test("move-to-day removes the delivered card, whether it picks another day or clears the day", async () => {
+  const todo = await deliveredReminder();
+
+  await todosService.moveToDay(USER_ID, todo.id, { date: fx.utcDateFromToday(4) });
+  await cards.flushDismissals();
+  assert.equal(dismissMessages().length, 1);
+  assert.equal(dismissMessages()[0].data?.tag, `todo:${todo.id}`);
+
+  // A card delivered for the new day, then the day is cleared (move-to-day null also clears the time).
+  fake.messages.length = 0;
+  await markDelivered(todo.id, `${fx.utcDateFromToday(4)}T10:00`);
+  await todosService.moveToDay(USER_ID, todo.id, { date: null });
+  await cards.flushDismissals();
+  assert.equal(dismissMessages().length, 1);
+});
+
+test("a sync push that clears the time removes the delivered card", async () => {
+  await fx.insertDevice(turso, USER_ID, "reg-A", { id: "device-A" });
+  const id = "sync-todo-clear";
+  const stamp = (offsetMs = 0): string => new Date(Date.now() + offsetMs).toISOString();
+  await processPush(USER_ID, [
+    { op: "create", type: "todo", payload: { id, title: "Từ máy khác", status: "open", position: 0, scheduled_date: DATE, time: "10:00", created_at: stamp(), updated_at: stamp() } },
+  ]);
+  await markDelivered(id, `${DATE}T10:00`);
+
+  await processPush(USER_ID, [{ op: "update", type: "todo", payload: { id, time: null, updated_at: stamp(1000) } }]);
+  await cards.flushDismissals();
+
+  assert.equal(dismissMessages().length, 1);
+});
+
+test("one sync batch that re-times two todos removes each card once, under its own tag", async () => {
+  await fx.insertDevice(turso, USER_ID, "reg-A", { id: "device-A" });
+  const stamp = (offsetMs = 0): string => new Date(Date.now() + offsetMs).toISOString();
+  const create = (id: string) => ({
+    op: "create" as const,
+    type: "todo" as const,
+    payload: { id, title: id, status: "open", position: 0, scheduled_date: DATE, time: "10:00", created_at: stamp(), updated_at: stamp() },
+  });
+  await processPush(USER_ID, [create("batch-a"), create("batch-b")]);
+  await markDelivered("batch-a", `${DATE}T10:00`);
+  await markDelivered("batch-b", `${DATE}T10:00`);
+
+  await processPush(USER_ID, [
+    { op: "update", type: "todo", payload: { id: "batch-a", time: "11:00", updated_at: stamp(1000) } },
+    { op: "update", type: "todo", payload: { id: "batch-b", scheduled_date: fx.utcDateFromToday(4), updated_at: stamp(1000) } },
+    { op: "update", type: "todo", payload: { id: "batch-a", title: "đổi tên", updated_at: stamp(2000) } },
+  ]);
+  await cards.flushDismissals();
+
+  assert.deepEqual(dismissMessages().map((m) => m.data?.tag).sort(), ["todo:batch-a", "todo:batch-b"]);
+});
+
+test("recurrence: a parked occurrence that comes back on another date removes the card it had, once, under the series tag", async () => {
+  await fx.insertDevice(turso, USER_ID, "reg-A", { id: "device-A" });
+  const { todo: root } = await todosService.createTodo(USER_ID, {
+    title: "Tập",
+    scheduled_date: DATE,
+    time: "10:00",
+    recurrence_type: "daily",
+    recurrence_interval: 1,
+  });
+  const next = (await todosService.completeTodo(USER_ID, root.id, {})).next_recurring_todo!;
+  await markDelivered(next.id, `${next.scheduled_date}T10:00`);
+
+  // Undoing the completion parks the generated occurrence: archived is outside this feature, so its card stays.
+  await todosService.uncompleteTodo(USER_ID, root.id);
+  await cards.flushDismissals();
+  assert.equal(dismissMessages().length, 0);
+
+  // The series moves; completing again revives the parked occurrence on a different date.
+  await todosService.updateTodo(USER_ID, root.id, { scheduled_date: fx.utcDateFromToday(5) });
+  const revived = (await todosService.completeTodo(USER_ID, root.id, {})).next_recurring_todo!;
+  await cards.flushDismissals();
+
+  assert.equal(revived.id, next.id);
+  assert.notEqual(revived.scheduled_date, next.scheduled_date);
+  assert.equal(dismissMessages().length, 1);
+  assert.equal(dismissMessages()[0].data?.tag, `todo:${root.id}`);
+  assert.equal(dismissMessages()[0].data?.id, next.id);
+});
+
 test("an occurrence of a recurring todo is removed under the series tag the card was sent with", async () => {
   await fx.insertDevice(turso, USER_ID, "reg-A", { id: "device-A" });
   await fx.insertTodo(turso, { id: "series-root", scheduledDate: "2026-06-19", time: "08:00", status: "done" });
@@ -457,6 +752,52 @@ test("an occurrence of a recurring todo is removed under the series tag the card
   assert.equal(dismissMessages().length, 1);
   assert.equal(dismissMessages()[0].data?.tag, "todo:series-root");
   assert.equal(dismissMessages()[0].data?.id, "occ");
+});
+
+// ── starting / resuming the countdown ────────────────────────────────────────
+
+test("dismissTodoCardOnStart: outcome per case, and the tag always comes from the todo's series", async () => {
+  await fx.insertDevice(turso, USER_ID, "reg-A", { id: "device-A" });
+  const now = at(TODAY, "10:00");
+  const occurrence = { id: "occ", parent_id: null, recurrence_template_id: "series-root" };
+
+  assert.equal(cards.dismissTodoCardOnStart(USER_ID, { ...occurrence, parent_id: "p" }, 3600, now), "none", "subtask");
+  assert.equal(cards.dismissTodoCardOnStart(USER_ID, occurrence, 240, now), "replaced", "end-of-timer push due in 4 min");
+  assert.equal(cards.dismissTodoCardOnStart(USER_ID, occurrence, 1, now), "replaced", "...or in 1 s");
+  assert.equal(cards.dismissTodoCardOnStart(USER_ID, occurrence, 241, now), "dismissed", "just outside the window");
+  assert.equal(cards.dismissTodoCardOnStart(USER_ID, occurrence, 0, now), "dismissed", "nothing remains: no end-of-timer card");
+  assert.equal(cards.dismissTodoCardOnStart(USER_ID, occurrence, -30, now), "dismissed");
+  await cards.flushDismissals();
+
+  const sent = dismissMessages();
+  assert.equal(sent.length, 3, "one device, three removals (241 s, 0 s, -30 s)");
+  for (const message of sent) {
+    assert.deepEqual(
+      { ...message.data, before: "<time>" },
+      { type: "dismiss", id: "occ", tag: "todo:series-root", before: "<time>" }
+    );
+    assert.equal(message.data?.before, now.toISOString());
+  }
+});
+
+test("dismissTodoCardOnStart never throws and never waits: no devices, a failing FCM, or no push configured", async () => {
+  const todo = { id: "t1", parent_id: null, recurrence_template_id: null };
+  assert.doesNotThrow(() => cards.dismissTodoCardOnStart(USER_ID, todo, 3600), "no device registered at all");
+  await assert.doesNotReject(cards.flushDismissals());
+
+  await fx.insertDevice(turso, USER_ID, "reg-A", { id: "device-A" });
+  firebase.setMessagingClientForTests({
+    sendEach: async () => {
+      throw new Error("network down");
+    },
+  });
+  assert.doesNotThrow(() => cards.dismissTodoCardOnStart(USER_ID, todo, 3600));
+  await assert.doesNotReject(cards.flushDismissals());
+
+  firebase.setMessagingClientForTests(null);
+  assert.doesNotThrow(() => cards.dismissTodoCardOnStart(USER_ID, todo, 3600));
+  await assert.doesNotReject(cards.flushDismissals());
+  assert.equal(fake.messages.length, 0);
 });
 
 // ── pure helpers ─────────────────────────────────────────────────────────────

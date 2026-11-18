@@ -291,25 +291,47 @@ export const upsertLog = async (
   return row;
 };
 
+/**
+ * Ghi log do TỰ ĐỘNG (todo/checklist liên kết hoàn thành). Quy tắc: tự động không bao giờ sửa
+ * trạng thái mà người dùng đã đặt (đánh dấu bỏ lỡ trước, hoặc tick tay); chỉ người dùng mới đổi
+ * được. Dòng do người dùng đặt là dòng sống có `auto_closed = 0`; mọi dòng do tự động ghi (job
+ * nửa đêm hoặc hàm này) mang `auto_closed = 1` = "không có ý người dùng". Nên:
+ *
+ *   - chưa có dòng, hoặc dòng đã xóa mềm → ghi `completed` (ngày chưa có trạng thái nào);
+ *   - dòng tự động đang là 0 → chỉ được NÂNG lên 1. Số 0 là chỗ giữ chỗ ("chưa đủ todo", hoặc job
+ *     nửa đêm đã đóng ngày); một tick tự động đã có thì không bị hạ xuống;
+ *   - dòng do người dùng đặt (0 hay 1) → không đụng gì, kể cả `note` và `updated_at`.
+ *
+ * Một câu lệnh nguyên tử (điều kiện nằm ở WHERE của DO UPDATE), nên không có khe đọc-rồi-ghi trước
+ * một lần sửa tay đang diễn ra. `written` = false khi không ghi gì: nơi gọi bỏ qua tính lại streak
+ * (tính lại sẽ bump `habits.updated_at` vô ích).
+ *
+ * Dòng ghi trước quy tắc này có `auto_closed = 0` nên được coi là của người dùng (an toàn hơn).
+ */
 export const upsertAutoLog = async (
   habitId: string,
   logDate: string,
   completed: boolean
-): Promise<HabitLogRow> => {
+): Promise<{ log: HabitLogRow; written: boolean }> => {
   const now = nowISO();
-  await turso.execute({
-    sql: `INSERT INTO habit_logs (id, habit_id, log_date, completed, note, created_at, updated_at, deleted_at)
-          VALUES (?, ?, ?, ?, NULL, ?, ?, NULL)
+  const res = await turso.execute({
+    sql: `INSERT INTO habit_logs
+            (id, habit_id, log_date, completed, note, created_at, updated_at, deleted_at, auto_closed)
+          VALUES (?, ?, ?, ?, NULL, ?, ?, NULL, 1)
           ON CONFLICT(habit_id, log_date) DO UPDATE SET
             completed = excluded.completed,
             updated_at = excluded.updated_at,
             deleted_at = NULL,
-            auto_closed = 0`,
+            auto_closed = 1
+          WHERE habit_logs.deleted_at IS NOT NULL
+             OR (habit_logs.auto_closed = 1
+                 AND habit_logs.completed = 0
+                 AND excluded.completed = 1)`,
     args: [newId(), habitId, logDate, completed ? 1 : 0, now, now],
   });
-  const row = await getLog(habitId, logDate);
-  if (!row) throw new Error("upsertAutoLog: row missing");
-  return row;
+  const log = await getLog(habitId, logDate);
+  if (!log) throw new Error("upsertAutoLog: row missing");
+  return { log, written: res.rowsAffected > 0 };
 };
 
 export const getLog = async (

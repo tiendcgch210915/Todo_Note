@@ -17,6 +17,8 @@ const timersRepo = await import("../src/repositories/todo-timers.js");
 const timers = await import("../src/services/todo-timers.js");
 const todosService = await import("../src/services/todos.js");
 const notifications = await import("../src/services/notifications.js");
+const cards = await import("../src/services/notification-cards.js");
+const triggers = await import("../src/services/notification-triggers.js");
 const { runTick } = await import("../src/services/notification-tick.js");
 const { default: Fastify } = await import("fastify");
 const { default: userAuth } = await import("../src/plugins/user-auth.js");
@@ -68,7 +70,33 @@ const timerJob = () => jobsRepo.getEventJob(USER_ID, "todo_timer_end", TODO_ID);
 
 const tick = (now: Date) => runTick({ now, logger: fx.silentLogger });
 
-let fake = fx.fakeMessaging();
+/**
+ * Mọi tin FCM của test này đều qua `raw`. `fake` chỉ cho thấy các tin HIỆN THÔNG BÁO (hết giờ, nhắc giờ): tin gỡ
+ * thẻ (`type: "dismiss"`, gửi trong nền khi bắt đầu/tiếp tục) được kiểm riêng bằng `dismissals()`, nên các test về
+ * tin hết giờ không phụ thuộc việc có hay không và lúc nào tin gỡ được gửi.
+ */
+let raw = fx.fakeMessaging();
+const isDismiss = (message: { data?: Record<string, string> }): boolean => message.data?.type === "dismiss";
+const targetOf = (message: object): string => {
+  const m = message as { fid?: string; token?: string };
+  return (m.fid ?? m.token) as string;
+};
+const fake = {
+  get messages() {
+    return raw.messages.filter((message) => !isDismiss(message));
+  },
+  targets: () => fake.messages.map(targetOf),
+};
+/** Tin gỡ thẻ đã gửi (chờ tin đang gửi trong nền xong trước). */
+const dismissals = async () => {
+  await cards.flushDismissals();
+  return raw.messages.filter(isDismiss);
+};
+/** Xóa các tin đã ghi, sau khi chờ tin gỡ đang gửi trong nền xong (nếu không nó rơi vào sau khi xóa). */
+const clearPushes = async (): Promise<void> => {
+  await cards.flushDismissals();
+  raw.messages.length = 0;
+};
 const app = Fastify();
 
 before(async () => {
@@ -83,6 +111,8 @@ after(async () => {
 });
 
 beforeEach(async () => {
+  // Tin gỡ của test trước có thể còn đang gửi trong nền: chờ xong rồi mới dọn dữ liệu và đổi FCM giả.
+  await cards.flushDismissals();
   for (const table of [
     "notification_jobs",
     "todo_timers",
@@ -93,7 +123,7 @@ beforeEach(async () => {
   ]) {
     await turso.execute(`DELETE FROM ${table}`);
   }
-  await turso.execute("UPDATE todos SET parent_id = NULL, trigger_after_todo_id = NULL");
+  await turso.execute("UPDATE todos SET parent_id = NULL, trigger_after_todo_id = NULL, recurrence_template_id = NULL");
   await turso.execute("DELETE FROM todos");
   await turso.execute(`DELETE FROM users WHERE id IN ('${USER_ID}', '${OTHER_USER_ID}')`);
 
@@ -103,8 +133,8 @@ beforeEach(async () => {
   await fx.insertDevice(turso, USER_ID, "reg-B", { id: DEVICE_B });
   await fx.insertTodo(turso, { id: TODO_ID, title: "Viết báo cáo", scheduledDate: "2026-06-20" });
 
-  fake = fx.fakeMessaging();
-  firebase.setMessagingClientForTests(fake.client);
+  raw = fx.fakeMessaging();
+  firebase.setMessagingClientForTests(raw.client);
   firebase.setPushLogger(fx.silentLogger);
 });
 
@@ -518,4 +548,290 @@ test("PUT /todos/:id/timer: success body, unknown device, unknown todo and compl
   });
   assert.equal(completed.statusCode, 409);
   assert.deepEqual(completed.json(), { error: "todo_completed" });
+});
+
+// ── removing the delivered card when the countdown starts or resumes ─────────
+
+const SERIES_ID = "series-root";
+const countdown = (extra: Partial<Extra> = {}): Extra => ({
+  remainingSeconds: 1500,
+  estimatedSeconds: 1500,
+  registrationId: "reg-A",
+  ...extra,
+});
+
+test("start removes the delivered card: ONE data-only dismiss per device, under the todo's tag", async () => {
+  await start();
+
+  const sent = await dismissals();
+  assert.equal(sent.length, 2, "one message per device of the user (the other device and the starting one)");
+  assert.deepEqual(sent.map(targetOf).sort(), ["reg-A", "reg-B"]);
+  for (const message of sent) {
+    assert.equal(message.notification, undefined, "nothing is shown by the system");
+    assert.deepEqual(
+      { ...message.data, before: "<time>" },
+      { type: "dismiss", id: TODO_ID, tag: `todo:${TODO_ID}`, before: "<time>" }
+    );
+    assert.equal(message.data?.before, NOW.toISOString());
+    assert.equal(message.android?.priority, "high");
+    assert.equal(message.android?.ttl, 180_000, "short-lived so a late delivery cannot hit a newer card");
+  }
+  assert.equal((await timerJob())?.status, "pending", "the end-of-timer job is still scheduled");
+});
+
+test("resume removes it too, from whichever device resumes; pause, stop and finish remove nothing", async () => {
+  await start();
+  await clearPushes();
+
+  await event("pause", { remainingSeconds: 1200 }, { now: at(300) });
+  assert.equal((await dismissals()).length, 0, "pause");
+
+  await event("resume", countdown({ remainingSeconds: 1200, registrationId: "reg-B" }), { now: at(600) });
+  const sent = await dismissals();
+  assert.equal(sent.length, 2, "resume: every device again");
+  assert.deepEqual(new Set(sent.map((m) => m.data?.tag)), new Set([`todo:${TODO_ID}`]));
+  await clearPushes();
+
+  await event("stop", {}, { now: at(700) });
+  await event("finish", {}, { now: at(800) });
+  assert.equal((await dismissals()).length, 0, "stop and finish");
+});
+
+test("an occurrence of a recurring todo is removed under the series root's tag", async () => {
+  await fx.insertTodo(turso, { id: SERIES_ID, title: "Gốc", scheduledDate: "2026-06-19", status: "done" });
+  await fx.insertTodo(turso, { id: "occ-1", scheduledDate: "2026-06-20", recurrenceTemplateId: SERIES_ID });
+
+  await event("start", countdown(), { todoId: "occ-1" });
+
+  const sent = await dismissals();
+  assert.equal(sent.length, 2);
+  for (const message of sent) {
+    assert.equal(message.data?.tag, `todo:${SERIES_ID}`);
+    assert.equal(message.data?.id, "occ-1");
+  }
+});
+
+test("a subtask has no card of its own: nothing is removed, the countdown still runs", async () => {
+  await fx.insertTodo(turso, { id: "sub-1", parentId: TODO_ID, scheduledDate: null });
+
+  const state = await event("start", countdown(), { todoId: "sub-1" });
+
+  assert.equal(state.status, "running");
+  assert.equal((await dismissals()).length, 0);
+});
+
+test("the end-of-timer card replaces the old one by itself: no dismiss when at most 4 minutes remain", async () => {
+  const state = await event("start", countdown({ remainingSeconds: 240, estimatedSeconds: 240 }));
+  assert.equal(state.status, "running");
+  assert.equal((await timerJob())?.status, "pending");
+  assert.equal((await dismissals()).length, 0, "240 s: the end-of-timer push is due inside the replace window");
+
+  await event("stop", {}, { now: at(10) });
+  await event("start", countdown({ remainingSeconds: 241, estimatedSeconds: 241 }), { now: at(20) });
+  assert.equal((await dismissals()).length, 2, "241 s: just outside the window, so the card is removed");
+});
+
+test("a countdown that has already run out has no end-of-timer card to replace anything: the card is removed", async () => {
+  // 100 s left reported, but the event arrives 200 s late: nothing remains, the timer is finished at once.
+  const state = await event("start", countdown({ remainingSeconds: 100 }), {
+    now: NOW,
+    clientEventAt: at(-200),
+  });
+  assert.equal(state.status, "finished");
+  assert.equal(await timerJob(), null);
+
+  assert.equal((await dismissals()).length, 2);
+
+  await clearPushes();
+  await event("resume", countdown({ remainingSeconds: 0 }), { now: at(60) });
+  assert.equal((await dismissals()).length, 2, "an explicit 0 s left behaves the same");
+});
+
+test("an old or replayed event is ignored and removes nothing", async () => {
+  await start({ now: at(100) });
+  await clearPushes();
+
+  const older = await start({ now: at(110), clientEventAt: at(50) });
+  const retry = await start({ now: at(120), clientEventAt: at(100) });
+
+  assert.equal(older.ignored, true);
+  assert.equal(retry.ignored, true);
+  assert.equal((await dismissals()).length, 0);
+});
+
+test("nothing is removed when the event is refused: unknown device, completed todo, unknown todo", async () => {
+  await assert.rejects(
+    event("start", countdown({ registrationId: "nope" })),
+    (error: unknown) => error instanceof timers.TimerServiceError && error.code === "device_not_found"
+  );
+  await assert.rejects(
+    event("start", countdown(), { todoId: "missing" }),
+    (error: unknown) => error instanceof timers.TimerServiceError && error.code === "not_found"
+  );
+  await turso.execute("UPDATE todos SET status = 'done' WHERE id = 'todo-1'");
+  await assert.rejects(
+    start(),
+    (error: unknown) => error instanceof timers.TimerServiceError && error.code === "todo_completed"
+  );
+
+  assert.equal((await dismissals()).length, 0);
+});
+
+test("the removal never waits for FCM: the timer event is answered while the send is still blocked", async () => {
+  let release: () => void = () => {};
+  const gate = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  firebase.setMessagingClientForTests({
+    sendEach: async (batch: unknown[]) => {
+      await gate;
+      return { responses: batch.map(() => ({ success: true })) };
+    },
+  } as never);
+
+  let timeout: NodeJS.Timeout | undefined;
+  const outcome = await Promise.race([
+    start().then((state) => state.status),
+    new Promise<string>((resolve) => {
+      timeout = setTimeout(() => resolve("blocked"), 3000);
+    }),
+  ]);
+  clearTimeout(timeout);
+  release();
+  await cards.flushDismissals();
+
+  assert.equal(outcome, "running");
+});
+
+test("a failing dismiss send does not fail PUT /timer, and the response is exactly the same", async () => {
+  const startBody = (offsetMs: number) => ({
+    action: "start",
+    remainingSeconds: 1500,
+    estimatedSeconds: 1500,
+    registrationId: "reg-A",
+    clientEventAt: new Date(Date.now() + offsetMs).toISOString(),
+  });
+  const normalized = (body: Record<string, unknown>) => ({ ...body, ends_at: "<time>" });
+
+  const healthy = await put(startBody(0));
+  assert.equal(healthy.statusCode, 200);
+  await cards.flushDismissals();
+  assert.equal(raw.messages.filter(isDismiss).length, 2, "the healthy run did send the removal");
+
+  firebase.setMessagingClientForTests({
+    sendEach: async () => {
+      throw new Error("network down");
+    },
+  });
+  const broken = await put(startBody(1000));
+  await assert.doesNotReject(cards.flushDismissals());
+
+  assert.equal(broken.statusCode, 200);
+  assert.deepEqual(normalized(broken.json()), normalized(healthy.json()));
+  assert.equal((await timerJob())?.status, "pending");
+});
+
+test("NOTIFY_DRY_RUN only logs: starting a countdown sends no removal", async () => {
+  const { env } = await import("../src/config/env.js");
+  env.NOTIFY_DRY_RUN = true;
+  try {
+    const state = await start();
+    assert.equal(state.status, "running");
+    assert.equal((await dismissals()).length, 0);
+    assert.equal(raw.messages.length, 0);
+  } finally {
+    env.NOTIFY_DRY_RUN = false;
+  }
+});
+
+// ── the on-time reminder of a todo that is already being worked on ───────────
+
+const TIMED_ID = "todo-timed";
+
+/** Todo hẹn 10:30 (NOW là 10:00), nhắc giờ đã được hẹn như khi người dùng vừa tạo nó. */
+const armTimedTodo = async (flags: { isImportant?: number; isUrgent?: number } = {}) => {
+  await fx.insertTodo(turso, {
+    id: TIMED_ID,
+    title: "Họp nhóm",
+    scheduledDate: "2026-06-20",
+    time: "10:30",
+    ...flags,
+  });
+  await triggers.onTodoChanged(USER_ID, TIMED_ID, NOW);
+  assert.equal((await jobsRepo.getEventJob(USER_ID, "todo_reminder", TIMED_ID))?.status, "pending");
+};
+
+const reminderStatus = async () =>
+  (await jobsRepo.getEventJob(USER_ID, "todo_reminder", TIMED_ID))?.status;
+
+const startTimed = (now: Date) =>
+  event("start", countdown({ remainingSeconds: 3600, estimatedSeconds: 3600 }), { now, todoId: TIMED_ID });
+
+test("a todo whose countdown started before its time is not reminded on time: the job is cancelled when it comes due", async () => {
+  await armTimedTodo({ isImportant: 1, isUrgent: 1 });
+  await startTimed(at(60));
+  assert.equal(await reminderStatus(), "pending", "starting leaves the job alone, so stopping can bring the reminder back");
+
+  await tick(at(1800 + 10)); // 10:30
+
+  assert.equal(fake.messages.length, 0, "no reminder while the user is already working on it");
+  assert.equal(await reminderStatus(), "cancelled");
+
+  await tick(at(2100 + 10)); // 10:35: and no +5 minute repeat either (it only follows a sent reminder)
+  assert.equal(fake.messages.length, 0);
+});
+
+test("a paused countdown counts as started too: the on-time reminder is still cancelled", async () => {
+  await armTimedTodo();
+  await startTimed(at(60));
+  await event("pause", { remainingSeconds: 3000 }, { now: at(600), todoId: TIMED_ID });
+
+  await tick(at(1800 + 10));
+
+  assert.equal(fake.messages.length, 0);
+  assert.equal(await reminderStatus(), "cancelled");
+});
+
+test("so does a countdown that ran out and was never stopped", async () => {
+  await armTimedTodo();
+  await startTimed(at(60));
+  await event("finish", {}, { now: at(600), todoId: TIMED_ID });
+  assert.equal((await timersRepo.getTimer(TIMED_ID))?.status, "finished");
+
+  await tick(at(1800 + 10));
+
+  assert.equal(fake.messages.length, 0);
+  assert.equal(await reminderStatus(), "cancelled");
+});
+
+test("stopping the countdown (idle) before the time restores the normal on-time reminder and its repeat", async () => {
+  await armTimedTodo({ isImportant: 1, isUrgent: 1 });
+  await startTimed(at(60));
+  await event("stop", {}, { now: at(600), todoId: TIMED_ID });
+
+  await tick(at(1800 + 10));
+
+  assert.equal(fake.messages.length, 2, "both devices are reminded");
+  for (const message of fake.messages) {
+    assert.equal(message.data?.type, "todo");
+    assert.equal(message.data?.id, TIMED_ID);
+    assert.equal(message.data?.repeat, undefined);
+    assert.equal(message.android?.notification?.tag, `todo:${TIMED_ID}`);
+  }
+  assert.equal(await reminderStatus(), "sent");
+
+  await clearPushes();
+  await tick(at(2100 + 10)); // the +5 minute repeat follows as usual
+  assert.deepEqual(fake.messages.map((m) => m.data?.repeat), ["1", "1"]);
+});
+
+test("a countdown on ANOTHER todo that is over long before the time does not cancel this todo's reminder", async () => {
+  await armTimedTodo();
+  // todo-1 counts down 10:01 -> 10:11: nothing is held at 10:30 and nothing is cancelled.
+  await event("start", countdown({ remainingSeconds: 600, estimatedSeconds: 600 }), { now: at(60) });
+
+  await tick(at(1800 + 10));
+
+  assert.equal(fake.messages.filter((m) => m.data?.id === TIMED_ID).length, 2);
+  assert.equal(await reminderStatus(), "sent");
 });

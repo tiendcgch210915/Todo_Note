@@ -263,6 +263,20 @@ export const REMINDER_REPEAT = {
   intervalMs: 5 * MINUTE,
 } as const;
 
+/**
+ * Hàng đợi nhắc giờ của TODO (xem `services/reminder-queue.ts`): nhắc giờ không còn đi thẳng đúng giờ hẹn
+ * mà qua một hàng đợi theo từng người dùng.
+ *  - Giờ hẹn rơi vào lúc người dùng đang đếm ngược một todo KHÁC (đã bấm "bắt đầu") thì nhắc chờ đến khi đếm
+ *    ngược kết thúc rồi cộng `gapMs`;
+ *  - nhiều nhắc cùng giờ (hoặc cùng bị giữ tới một mốc) thì cách nhau `gapMs`, theo thứ tự ưu tiên của todo.
+ * `gapMs` cũng là khoảng đệm khi đếm ngược dừng SỚM: nhắc đang bị giữ được thả sau chừng này kể từ lúc dừng.
+ */
+export const REMINDER_QUEUE = {
+  gapMs: 2 * MINUTE,
+  /** Chỉ xếp hàng các nhắc đến hạn trong chừng này kể từ bây giờ; xa hơn thì đến lúc gần mới được xếp. */
+  horizonMs: 48 * HOUR,
+} as const;
+
 /** Giá trị `data.type` của tin "gỡ thông báo" (tin chỉ có data, không hiện gì): app hủy thông báo theo `data.tag`. */
 export const DISMISS_DATA_TYPE = "dismiss";
 

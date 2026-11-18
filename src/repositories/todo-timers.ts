@@ -48,6 +48,27 @@ export const getTimer = async (todoId: string): Promise<TimerRow | null> => {
   return mapTimer(res.rows[0] as unknown as Record<string, unknown>);
 };
 
+export type RunningTimer = { todo_id: string; ends_at: string };
+
+/**
+ * Đồng hồ đếm ngược ĐANG CHẠY của người dùng mà chưa hết giờ (`ends_at` sau `afterIso`). Đây là "người dùng
+ * đang bận làm một todo": tạm dừng hay đã hết giờ thì không tính (không biết bao giờ họ quay lại).
+ */
+export const listRunningTimers = async (
+  userId: string,
+  afterIso: string
+): Promise<RunningTimer[]> => {
+  const res = await turso.execute({
+    sql: `SELECT todo_id, ends_at FROM todo_timers
+          WHERE user_id = ? AND status = 'running' AND ends_at IS NOT NULL AND ends_at > ?`,
+    args: [userId, afterIso],
+  });
+  return (res.rows as unknown as Record<string, unknown>[]).map((row) => ({
+    todo_id: row.todo_id as string,
+    ends_at: row.ends_at as string,
+  }));
+};
+
 export const upsertTimer = async (
   row: Omit<TimerRow, "updated_at">
 ): Promise<void> => {
