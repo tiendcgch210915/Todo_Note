@@ -114,6 +114,11 @@ export const createNotificationTables = async (db: TestDb): Promise<void> => {
     const columns = await db.execute("PRAGMA table_info(notification_settings)");
     return !columns.rows.some((row) => row.name === "morning_enabled");
   });
+  await applyMigrationFileWhen(db, "0029_checklist_occurrence_skip.sql", async () => {
+    const columns = await db.execute("PRAGMA table_info(checklist_schedule_overrides)");
+    return !columns.rows.some((row) => row.name === "skipped");
+  });
+  await applyMigrationFileOnce(db, "0030_todo_series_reminder_times.sql", "todo_series_reminder_times");
 };
 
 /**

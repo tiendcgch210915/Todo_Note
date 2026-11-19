@@ -6,12 +6,14 @@
 import * as schedulesRepo from "../repositories/checklist-schedules.js";
 import * as templatesRepo from "../repositories/checklist-templates.js";
 import * as settingsRepo from "../repositories/notification-settings.js";
+import type { OccurrenceEdit } from "../schemas/api/checklist-schedules.js";
 import { addDays, localDateTimeToUtc } from "../utils/time.js";
 import { doneDatesOf } from "./checklist-occurrence-done.js";
 import {
   indexRowsByChecklist,
   isOccurrenceDate,
   occurrencesBetween,
+  toScheduleOverride,
   toScheduleRule,
 } from "./checklist-schedule.js";
 import { finishSchedulesForUserSafely } from "./checklist-schedule-expiry.js";
@@ -157,8 +159,7 @@ export const listOccurrences = async (
   const runsFor = indexRowsByChecklist(runs);
   const marksFor = indexRowsByChecklist(marks);
   for (const schedule of schedules) {
-    const overrides = overridesFor(schedule)
-      .map((row) => ({ localDate: row.local_date, time: row.time }));
+    const overrides = overridesFor(schedule).map(toScheduleOverride);
     const scheduleMarks = marksFor(schedule);
     const done = doneDatesOf(
       { userId, templateId: schedule.template_id }, runsFor(schedule), scheduleMarks, timezone
@@ -193,17 +194,18 @@ export const putOccurrence = async (
   userId: string,
   templateId: string,
   date: string,
-  time: string
-): Promise<{ checklistId: string; date: string; time: string; overridden: true }> => {
+  edit: OccurrenceEdit
+) => {
   await requireVisibleTemplate(userId, templateId);
   const schedule = await schedulesRepo.getLiveSchedule(userId, templateId);
   if (!schedule) throw new ScheduleServiceError("not_found");
   if (!isOccurrenceDate(toScheduleRule(schedule), date)) {
     throw new ScheduleServiceError("not_an_occurrence");
   }
-  await schedulesRepo.upsertOverride(userId, templateId, date, time);
+  await schedulesRepo.upsertOverride(userId, templateId, date, edit.time ?? schedule.time, edit.skipped);
   await notificationTriggers.onChecklistScheduleChanged(userId, templateId);
-  return { checklistId: templateId, date, time, overridden: true };
+  if (edit.skipped) return { checklistId: templateId, date, skipped: true };
+  return { checklistId: templateId, date, time: edit.time, overridden: true };
 };
 
 /**
@@ -218,9 +220,12 @@ export const putOccurrenceStatus = async (
   status: schedulesRepo.MarkStatus
 ): Promise<{ checklistId: string; date: string; manual: schedulesRepo.MarkStatus; done: boolean }> => {
   await requireVisibleTemplate(userId, templateId);
-  const schedule = await schedulesRepo.getLiveSchedule(userId, templateId);
+  const [schedule, override] = await Promise.all([
+    schedulesRepo.getLiveSchedule(userId, templateId),
+    schedulesRepo.getLiveOverride(userId, templateId, date),
+  ]);
   if (!schedule) throw new ScheduleServiceError("not_found");
-  if (!isOccurrenceDate(toScheduleRule(schedule), date)) {
+  if (override?.skipped || !isOccurrenceDate(toScheduleRule(schedule), date)) {
     throw new ScheduleServiceError("not_an_occurrence");
   }
   await schedulesRepo.upsertMark(userId, templateId, date, status);

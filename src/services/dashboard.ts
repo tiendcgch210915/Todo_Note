@@ -115,6 +115,7 @@ export type EisenhowerTodo = {
   status: string;
   scheduled_date: string | null;
   time: string | null;
+  is_recurring?: boolean; // Available on live dashboard rows.
   is_important: boolean;
   is_urgent: boolean;
   is_frog: boolean;
@@ -142,6 +143,7 @@ const toEisenhowerTodo = (
     status: t.status,
     scheduled_date: t.scheduled_date,
     time: t.time,
+    is_recurring: t.is_recurring,
     is_important: t.is_important === 1,
     is_urgent: t.is_urgent === 1,
     is_frog: t.is_frog === 1,

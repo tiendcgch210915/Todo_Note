@@ -40,7 +40,10 @@ export type ScheduleRule = {
 };
 
 /** Đổi giờ của MỘT ngày cụ thể. */
-export type ScheduleOverride = { localDate: string; time: string };
+export type ScheduleOverride = { localDate: string; time: string; skipped?: boolean };
+
+export const toScheduleOverride = (row: { local_date: string; time: string; skipped: number }): ScheduleOverride =>
+  ({ localDate: row.local_date, time: row.time, skipped: row.skipped === 1 });
 
 type ChecklistOwner = { user_id: string; template_id: string };
 
@@ -207,13 +210,19 @@ export const occurrencesBetween = (
   fromDate: string,
   toDate: string
 ): ChecklistOccurrence[] => {
-  const timeByDate = new Map(overrides.map((o) => [o.localDate, o.time]));
-  return baseOccurrenceDates(schedule, fromDate, toDate).map((date) => ({
-    checklistId: schedule.templateId,
-    date,
-    time: timeByDate.get(date) ?? schedule.time,
-    overridden: timeByDate.has(date),
-  }));
+  const byDate = new Map(overrides.map((override) => [override.localDate, override]));
+  const occurrences: ChecklistOccurrence[] = [];
+  for (const date of baseOccurrenceDates(schedule, fromDate, toDate)) {
+    const override = byDate.get(date);
+    if (override?.skipped) continue;
+    occurrences.push({
+      checklistId: schedule.templateId,
+      date,
+      time: override?.time ?? schedule.time,
+      overridden: override !== undefined,
+    });
+  }
+  return occurrences;
 };
 
 /**

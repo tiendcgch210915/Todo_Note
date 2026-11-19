@@ -93,7 +93,6 @@ const getTodoRow = async (
 };
 
 before(async () => {
-  await createNotificationTables(turso);
   await turso.execute(`
     CREATE TABLE IF NOT EXISTS users (
       id TEXT PRIMARY KEY,
@@ -152,6 +151,7 @@ before(async () => {
       deleted_at TEXT
     )
   `);
+  await createNotificationTables(turso);
   await turso.execute(`
     CREATE TABLE IF NOT EXISTS todo_tags (
       todo_id TEXT NOT NULL,

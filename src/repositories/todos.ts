@@ -1,4 +1,6 @@
 import { turso } from "../config/db.js";
+import type { InStatement, ResultSet } from "@libsql/client";
+import type { TodoTimeScope } from "../schemas/api/todos.js";
 import { newId } from "../utils/id.js";
 import { addDays, nowISO } from "../utils/time.js";
 import type { TagRow } from "./tags.js";
@@ -359,13 +361,78 @@ export type UpdateTodoPatch = Partial<{
   recurrence_template_id: string | null;
 }>;
 
-export const updateTodo = async (
+export type SeriesTimeEdit = {
+  scope: TodoTimeScope;
+  seriesId: string;
+  time: string | null;
+};
+
+export const listPastSeriesDatesForTimeEdit = async (
+  userId: string,
+  seriesId: string,
+  today: string
+): Promise<string[]> => {
+  const result = await turso.execute({
+    sql: `SELECT DISTINCT scheduled_date FROM todos
+          WHERE user_id = ? AND (id = ? OR recurrence_template_id = ?)
+            AND parent_id IS NULL AND deleted_at IS NULL AND status != 'done'
+            AND scheduled_date < ?`,
+    args: [userId, seriesId, seriesId, today],
+  });
+  return result.rows.map((row) => String(row.scheduled_date));
+};
+
+/** Save the selected row and its series default in one write transaction. */
+export const writeTodoUpdate = async (
   id: string,
   userId: string,
-  patch: UpdateTodoPatch
-): Promise<TodoRow | null> => {
+  statement: InStatement,
+  updatedAt: string,
+  edit?: SeriesTimeEdit
+): Promise<{ result: ResultSet; siblingIds: string[] }> => {
+  if (!edit) return { result: await turso.execute(statement), siblingIds: [] };
+
+  const seriesArgs = [id, userId, edit.seriesId];
+  const statements: InStatement[] = [{
+    sql: `INSERT INTO todo_series_reminder_times (user_id, series_id, time)
+          SELECT user_id, COALESCE(recurrence_template_id, id), ${edit.scope === "this" ? "time" : "?"}
+          FROM todos WHERE id = ? AND user_id = ? AND COALESCE(recurrence_template_id, id) = ?
+            AND deleted_at IS NULL AND parent_id IS NULL
+          ON CONFLICT(user_id, series_id) ${edit.scope === "this" ? "DO NOTHING" : "DO UPDATE SET time = excluded.time"}`,
+    args: edit.scope === "this" ? seriesArgs : [edit.time, ...seriesArgs],
+  }, statement];
+
+  if (edit.scope === "all") {
+    statements.push({
+      sql: `UPDATE todos SET time = ?, updated_at = MAX(updated_at, ?)
+            WHERE user_id = ? AND (id = ? OR recurrence_template_id = ?)
+              AND id != ? AND parent_id IS NULL AND deleted_at IS NULL
+              AND status != 'done' AND scheduled_date IS NOT NULL
+              AND EXISTS (SELECT 1 FROM todos WHERE id = ? AND user_id = ? AND deleted_at IS NULL
+                            AND parent_id IS NULL AND COALESCE(recurrence_template_id, id) = ?)
+            RETURNING id`,
+      args: [edit.time, updatedAt, userId, edit.seriesId, edit.seriesId, id, ...seriesArgs],
+    });
+  } else {
+    // When a single request moves the date and explicitly chooses a time, that
+    // choice wins over the date-change trigger, even if it matches the old time.
+    statements.push({
+      sql: "UPDATE todos SET time = ? WHERE id = ? AND user_id = ? AND deleted_at IS NULL AND time IS NOT ?",
+      args: [edit.time, id, userId, edit.time],
+    });
+  }
+  const [, result, siblings] = await turso.batch(statements, "write");
+  return { result, siblingIds: siblings?.rows.map((row) => String(row.id)) ?? [] };
+};
+
+export const updateTodoAndSeriesTime = async (
+  id: string,
+  userId: string,
+  patch: UpdateTodoPatch,
+  edit?: SeriesTimeEdit
+): Promise<{ todo: TodoRow | null; siblingIds: string[] }> => {
   const current = await getTodoByIdScoped(id, userId);
-  if (!current) return null;
+  if (!current) return { todo: null, siblingIds: [] };
 
   // Parent ownership + cycle
   if (patch.parent_id !== undefined && patch.parent_id !== null) {
@@ -426,20 +493,24 @@ export const updateTodo = async (
   if (patch.recurrence_template_id !== undefined)
     push("recurrence_template_id = ?", patch.recurrence_template_id);
 
-  if (sets.length === 0) return current;
+  if (sets.length === 0) return { todo: current, siblingIds: [] };
 
+  const updatedAt = nowISO();
   sets.push("updated_at = ?");
-  args.push(nowISO());
+  args.push(updatedAt);
   args.push(id, userId);
 
-  const res = await turso.execute({
+  const { result, siblingIds } = await writeTodoUpdate(id, userId, {
     sql: `UPDATE todos SET ${sets.join(", ")}
           WHERE id = ? AND user_id = ? AND deleted_at IS NULL`,
     args,
-  });
-  if (res.rowsAffected === 0) return null;
-  return getTodoByIdScoped(id, userId);
+  }, updatedAt, edit);
+  const todo = result.rowsAffected ? await getTodoByIdScoped(id, userId) : null;
+  return { todo, siblingIds };
 };
+
+export const updateTodo = async (id: string, userId: string, patch: UpdateTodoPatch) =>
+  (await updateTodoAndSeriesTime(id, userId, patch)).todo;
 
 // ============================================================
 // Complete / Uncomplete / Soft delete / Frog / Classify

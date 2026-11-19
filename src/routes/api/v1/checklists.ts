@@ -315,7 +315,7 @@ export default async function checklistsRoutes(app: FastifyInstance) {
           req.userId,
           req.params.id,
           date.data.date,
-          body.data.time
+          body.data
         );
       } catch (e) {
         return mapErr(e, reply);

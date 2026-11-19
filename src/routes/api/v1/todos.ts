@@ -23,6 +23,9 @@ import {
 } from "../../../services/todo-timers.js";
 
 const mapErr = (e: unknown, reply: FastifyReply): FastifyReply => {
+  if (e instanceof todos.TimeScopeRequired) {
+    return reply.code(409).send({ error: e.code, prompt: e.prompt });
+  }
   if (e instanceof todos.ServiceError) {
     if (e.code === "not_found") return reply.code(404).send({ error: "not_found" });
     if (e.code === "duplicate") return reply.code(409).send({ error: "duplicate" });

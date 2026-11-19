@@ -1,12 +1,13 @@
 import * as todosRepo from "../repositories/todos.js";
 import * as tagsRepo from "../repositories/tags.js";
+import { getUserById } from "../repositories/users.js";
 import {
   firstRuleDateOnOrAfter,
   nextRecurrenceDateAfter,
   ruleAllowsDate,
   type RecurrenceRule,
 } from "../utils/recurrence.js";
-import { addDays, dayDiff } from "../utils/time.js";
+import { addDays, dayDiff, effectiveTimeZone, localDateOf } from "../utils/time.js";
 import { autoLogHabitForCompletedTodo } from "./todo-habit-logs.js";
 import {
   ensurePastTodoDayClosedForMutation,
@@ -35,12 +36,63 @@ export class ServiceError extends Error {
       | "invalid_trigger"
       | "invalid_habit"
       | "bad_input"
+      | "time_scope_required"
       | "cycle"
       | "duplicate"
   ) {
     super(code);
   }
 }
+
+export class TimeScopeRequired extends ServiceError {
+  readonly prompt;
+
+  constructor(today: boolean) {
+    super("time_scope_required");
+    this.prompt = {
+      message: "Which reminders should use the new time?",
+      options: [
+        { value: "this", label: today ? "Today only" : "This occurrence only" },
+        { value: "all", label: "All occurrences" },
+      ],
+    };
+  }
+}
+
+/** Resolve the choice before writing any part of a REST edit or sync update. */
+export const prepareSeriesTimeEdit = async (
+  before: todosRepo.TodoRow,
+  patch: Pick<UpdateTodoInput,
+    "time" | "time_scope" | "scheduled_date" | "parent_id" | "recurrence_template_id" | "recurrence_type">
+): Promise<todosRepo.SeriesTimeEdit | undefined> => {
+  const scope = patch.time_scope;
+  if (patch.time === undefined) {
+    if (scope !== undefined) throw new ServiceError("bad_input");
+    return;
+  }
+  // Clearing the date also removes its reminder. A non-recurring todo has one time.
+  const seriesId = before.recurrence_template_id ?? before.id;
+  const templateId = patch.recurrence_template_id === undefined
+    ? before.recurrence_template_id : patch.recurrence_template_id;
+  const rule = patch.recurrence_type === undefined ? before.recurrence_type : patch.recurrence_type;
+  const sameSeries = (before.recurrence_type || before.recurrence_template_id) &&
+    (rule || templateId) && templateId === before.recurrence_template_id;
+  if (!sameSeries || before.parent_id !== null || patch.parent_id != null || patch.scheduled_date === null) {
+    if (scope === "all") throw new ServiceError("bad_input");
+    return;
+  }
+  if (!scope) {
+    if (patch.time === before.time) return;
+    const user = await getUserById(before.user_id);
+    const today = localDateOf(new Date(), effectiveTimeZone(user?.timezone));
+    throw new TimeScopeRequired((patch.scheduled_date ?? before.scheduled_date) === today);
+  }
+  if (scope === "all") {
+    const dates = await todosRepo.listPastSeriesDatesForTimeEdit(before.user_id, seriesId, vietnamToday());
+    for (const date of dates) await ensurePastTodoDayClosedForMutation(before.user_id, date);
+  }
+  return { scope, seriesId, time: patch.time };
+};
 
 const wrapRepo = (e: unknown): never => {
   if (e instanceof todosRepo.TodoRepoError) {
@@ -495,11 +547,12 @@ export const updateTodo = async (
   id: string,
   patch: UpdateTodoInput
 ): Promise<todosRepo.TodoWithTags> => {
-  const { tags, tag_ids, ...todoPatch } = patch;
+  const { tags, tag_ids, time_scope, ...todoPatch } = patch;
   const shouldReplaceTags = tags !== undefined || tag_ids !== undefined;
   try {
     const before = await todosRepo.getTodoByIdScoped(id, userId);
     if (!before) throw new ServiceError("not_found");
+    const timeEdit = await prepareSeriesTimeEdit(before, { ...todoPatch, time_scope });
     await ensureTodoDayClosedForMutation(userId, before);
     if (todoPatch.scheduled_date !== undefined) {
       await ensurePastTodoDayClosedForMutation(
@@ -545,8 +598,12 @@ export const updateTodo = async (
       todoPatch.is_urgent = true;
     }
 
-    let row = await todosRepo.updateTodo(id, userId, todoPatch);
+    const saved = await todosRepo.updateTodoAndSeriesTime(id, userId, todoPatch, timeEdit);
+    let row = saved.todo;
     if (!row) throw new ServiceError("not_found");
+    for (const siblingId of saved.siblingIds) {
+      await notificationTriggers.onTodoChanged(userId, siblingId);
+    }
     if (shouldResolveFrogDate && !clearFrogBecauseDateRemoved && frogDate) {
       row = await todosRepo.setSingleFrogForDay(id, userId, frogDate);
       if (!row) throw new ServiceError("not_found");

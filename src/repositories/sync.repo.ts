@@ -6,6 +6,7 @@
  * API_CONTRACT §4 (pull) + §5 (push helpers)
  */
 import { turso } from "../config/db.js";
+import { writeTodoUpdate, type SeriesTimeEdit } from "./todos.js";
 import { nowISO } from "../utils/time.js";
 import {
   toSyncEntity,
@@ -40,11 +41,14 @@ export type SyncChanges = {
 // Read each parent and its live associations in one statement. Each subquery
 // uses the junction index for that parent, including on a one-row delta.
 const todoSelect = `SELECT e.*,
+  CASE WHEN s.series_id IS NULL THEN e.time ELSE s.time END AS recurrence_time,
   (SELECT json_group_array(tt.tag_id) FROM todo_tags tt
    JOIN tags g ON g.id = tt.tag_id WHERE tt.todo_id = e.id AND g.deleted_at IS NULL) AS tag_ids,
   (SELECT json_group_array(l.note_id) FROM note_todo_links l
    JOIN notes n ON n.id = l.note_id WHERE l.todo_id = e.id AND n.deleted_at IS NULL) AS linked_note_ids
-  FROM todos e`;
+  FROM todos e LEFT JOIN todo_series_reminder_times s
+    ON s.user_id = e.user_id AND s.series_id = COALESCE(e.recurrence_template_id, e.id)
+    AND (e.recurrence_type IS NOT NULL OR e.recurrence_template_id IS NOT NULL)`;
 
 const noteSelect = `SELECT e.*,
   (SELECT json_group_array(nt.tag_id) FROM note_tags nt
@@ -128,8 +132,9 @@ const syncTodoFields = [
 
 const updateExistingTodoFromSync = async (
   userId: string,
-  p: Record<string, unknown>
-): Promise<void> => {
+  p: Record<string, unknown>,
+  edit?: SeriesTimeEdit
+): Promise<string[]> => {
   const sets: string[] = [];
   const args: unknown[] = [];
 
@@ -141,13 +146,26 @@ const updateExistingTodoFromSync = async (
   }
 
   sets.push("updated_at = ?");
-  args.push((p.updated_at as string | null) ?? nowISO());
+  const updatedAt = (p.updated_at as string | null) ?? nowISO();
+  args.push(updatedAt);
   args.push(p.id, userId);
 
-  await turso.execute({
+  const { siblingIds } = await writeTodoUpdate(String(p.id), userId, {
     sql: `UPDATE todos SET ${sets.join(", ")}
           WHERE id = ? AND user_id = ?`,
     args: dbArgs(args),
+  }, updatedAt, edit);
+  return siblingIds;
+};
+
+/** Publish derived reminder changes to devices whose last pull was after the offline edit. */
+export const publishTodoTimeChanges = async (userId: string, ids: Set<string>): Promise<void> => {
+  if (!ids.size) return;
+  const stamp = nowISO();
+  await turso.execute({
+    sql: `UPDATE todos SET updated_at = ? WHERE user_id = ? AND updated_at < ?
+          AND id IN (SELECT value FROM json_each(?))`,
+    args: [stamp, userId, stamp, JSON.stringify([...ids])],
   });
 };
 
@@ -455,8 +473,8 @@ export const upsertEntity = async (
   userId: string,
   type: EntityType,
   dbPayload: Record<string, unknown>,
-  opts: { partialUpdate?: boolean } = {}
-): Promise<void> => {
+  opts: { partialUpdate?: boolean; timeEdit?: SeriesTimeEdit } = {}
+): Promise<string[]> => {
   const p = dbPayload;
   const now = nowISO();
   const createdAt = (p.created_at as string | null) ?? now;
@@ -466,8 +484,7 @@ export const upsertEntity = async (
   switch (type) {
     case "todo": {
       if (opts.partialUpdate) {
-        await updateExistingTodoFromSync(userId, p);
-        break;
+        return updateExistingTodoFromSync(userId, p, opts.timeEdit);
       }
 
       const recurrenceInterval = hasOwn(p, "recurrence_interval")
@@ -820,30 +837,22 @@ export const upsertEntity = async (
       });
       if (visible.rows.length === 0) break;
 
-      const existing = await turso.execute({
-        sql: `SELECT id, updated_at FROM checklist_schedule_overrides
-              WHERE user_id = ? AND (id = ? OR (template_id = ? AND local_date = ?))
-              ORDER BY (id = ?) DESC LIMIT 1`,
-        args: dbArgs([userId, p.id, p.template_id, p.local_date, p.id]),
+      // Merge by id or by (user, template, day) in one write. Older clients omit skipped.
+      await turso.execute({
+        sql: `INSERT INTO checklist_schedule_overrides
+              (id, user_id, template_id, local_date, time, skipped, created_at, updated_at, deleted_at)
+              VALUES (?,?,?,?,?,?,?,?,?)
+              ON CONFLICT DO UPDATE SET
+                template_id = excluded.template_id, local_date = excluded.local_date,
+                time = excluded.time,
+                skipped = COALESCE(?, CASE WHEN deleted_at IS NULL THEN skipped ELSE 0 END),
+                updated_at = excluded.updated_at, deleted_at = excluded.deleted_at
+              WHERE user_id = excluded.user_id AND updated_at <= excluded.updated_at`,
+        args: dbArgs([
+          p.id, userId, p.template_id, p.local_date, p.time, p.skipped ?? 0,
+          createdAt, updatedAt, deletedAt, p.skipped ?? null,
+        ]),
       });
-
-      if (existing.rows.length > 0) {
-        const row = existing.rows[0] as unknown as { id: string; updated_at: string };
-        if (row.updated_at > updatedAt) break;
-        await turso.execute({
-          sql: `UPDATE checklist_schedule_overrides
-                SET template_id = ?, local_date = ?, time = ?, updated_at = ?, deleted_at = ?
-                WHERE id = ? AND user_id = ?`,
-          args: dbArgs([p.template_id, p.local_date, p.time, updatedAt, deletedAt, row.id, userId]),
-        });
-      } else {
-        await turso.execute({
-          sql: `INSERT INTO checklist_schedule_overrides
-                (id, user_id, template_id, local_date, time, created_at, updated_at, deleted_at)
-                VALUES (?,?,?,?,?,?,?,?)`,
-          args: dbArgs([p.id, userId, p.template_id, p.local_date, p.time, createdAt, updatedAt, deletedAt]),
-        });
-      }
       break;
     }
 
@@ -968,6 +977,7 @@ export const upsertEntity = async (
       break;
     }
   }
+  return [];
 };
 
 // ── softDeleteEntity ─────────────────────────────────────────────────────────

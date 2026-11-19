@@ -35,13 +35,13 @@ const NOT_NULL: Record<string, string[]> = {
   checklist_runs: ["id", "template_id", "user_id", "status", "started_at", "created_at", "updated_at"],
   checklist_run_items: ["id", "run_id", "template_item_id", "status", "created_at", "updated_at"],
   checklist_schedules: ["id", "user_id", "template_id", "start_date", "time", "enabled", "created_at", "updated_at"],
-  checklist_schedule_overrides: ["id", "user_id", "template_id", "local_date", "time", "created_at", "updated_at"],
+  checklist_schedule_overrides: ["id", "user_id", "template_id", "local_date", "time", "skipped", "created_at", "updated_at"],
   checklist_occurrence_marks: ["id", "user_id", "template_id", "local_date", "status", "created_at", "updated_at"],
 };
 
 // ── REQUIRED KEYS per entity type (must be present even if null) ─────────────
 const REQUIRED_KEYS: Record<string, string[]> = {
-  todos: ["id", "habit_id", "time", "tag_ids", "linked_note_ids"],
+  todos: ["id", "habit_id", "time", "recurrence_time", "tag_ids", "linked_note_ids"],
   notes: [
     "id",
     "body",
@@ -65,7 +65,7 @@ const REQUIRED_KEYS: Record<string, string[]> = {
     "recurrence_days_of_week", "recurrence_end_date", "enabled", "paused_from", "paused_until",
     "created_at", "updated_at", "deleted_at",
   ],
-  checklist_schedule_overrides: ["id", "user_id", "template_id", "local_date", "time", "created_at", "updated_at", "deleted_at"],
+  checklist_schedule_overrides: ["id", "user_id", "template_id", "local_date", "time", "skipped", "created_at", "updated_at", "deleted_at"],
   checklist_occurrence_marks: ["id", "user_id", "template_id", "local_date", "status", "created_at", "updated_at", "deleted_at"],
 };
 

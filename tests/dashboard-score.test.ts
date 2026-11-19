@@ -95,6 +95,8 @@ before(async () => {
       status TEXT NOT NULL DEFAULT 'open',
       scheduled_date TEXT,
       time TEXT,
+      recurrence_type TEXT,
+      recurrence_template_id TEXT,
       is_important INTEGER,
       is_urgent INTEGER,
       is_frog INTEGER NOT NULL DEFAULT 0,

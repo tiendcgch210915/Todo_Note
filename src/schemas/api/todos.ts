@@ -43,8 +43,15 @@ export const CreateTodoSchema = z.object({
 });
 export type CreateTodoInput = z.infer<typeof CreateTodoSchema>;
 
+export const TodoTimeScopeSchema = z.enum(["this", "all"]);
+export type TodoTimeScope = z.infer<typeof TodoTimeScopeSchema>;
+
 export const UpdateTodoSchema = CreateTodoSchema.partial().extend({
   actual_minutes: Minutes.nullable().optional(),
+  time_scope: TodoTimeScopeSchema.optional(),
+}).refine((p) => p.time_scope === undefined || p.time !== undefined, {
+  path: ["time"],
+  message: "A time change requires time (HH:mm or null).",
 });
 export type UpdateTodoInput = z.infer<typeof UpdateTodoSchema>;
 

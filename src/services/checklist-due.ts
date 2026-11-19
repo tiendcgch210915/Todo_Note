@@ -23,6 +23,7 @@ import { dayBoundsUtc, doneDatesOf, loadDoneDates } from "./checklist-occurrence
 import {
   indexRowsByChecklist,
   occurrencesBetween,
+  toScheduleOverride,
   toScheduleRule,
   type ScheduleOverride,
   type ScheduleRule,
@@ -62,10 +63,6 @@ export const dueSlotsFor = (
 export const creatableSlots = (slots: readonly DueSlot[], now: Date): DueSlot[] =>
   slots.filter((slot) => now.getTime() - slot.runAt.getTime() <= LATENESS_MS.checklist_due);
 
-const toOverrides = (
-  rows: readonly schedulesRepo.OverrideRow[]
-): ScheduleOverride[] => rows.map((row) => ({ localDate: row.local_date, time: row.time }));
-
 // ── Hook: tính lại job của MỘT checklist ─────────────────────────────────────
 
 export const reconcileChecklistDue = async (
@@ -91,7 +88,7 @@ export const reconcileChecklistDue = async (
       ).filter((row) => row.template_id === templateId);
       const open = dueSlotsFor(
         toScheduleRule(schedule),
-        toOverrides(overrides),
+        overrides.map(toScheduleOverride),
         await loadDoneDates(userId, templateId, today, tomorrow, timezone),
         timezone,
         today,
@@ -181,7 +178,7 @@ export const planChecklistDueForUsers = async (
   let written = 0;
   for (const schedule of schedules) {
     const frame = frames.get(schedule.user_id) as Frame;
-    const overrides = toOverrides(overridesFor(schedule));
+    const overrides = overridesFor(schedule).map(toScheduleOverride);
     const done = doneDatesOf(
       { userId: schedule.user_id, templateId: schedule.template_id },
       runsFor(schedule),
@@ -252,7 +249,7 @@ export const checkOccurrenceOpen = async (
   const overrides = (await schedulesRepo.listLiveOverridesForUsers([userId], date, date)).filter(
     (row) => row.template_id === templateId
   );
-  const [occurrence] = occurrencesBetween(toScheduleRule(schedule), toOverrides(overrides), date, date);
+  const [occurrence] = occurrencesBetween(toScheduleRule(schedule), overrides.map(toScheduleOverride), date, date);
   if (!occurrence) return null;
   const scheduledAt = localDateTimeToUtc(date, occurrence.time, timezone);
 

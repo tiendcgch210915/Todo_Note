@@ -125,7 +125,6 @@ const countTodoTags = async (todoId: string): Promise<number> => {
 };
 
 before(async () => {
-  await createNotificationTables(turso);
   await turso.execute(`
     CREATE TABLE IF NOT EXISTS todos (
       id TEXT PRIMARY KEY,
@@ -158,6 +157,7 @@ before(async () => {
       deleted_at TEXT
     )
   `);
+  await createNotificationTables(turso);
   await turso.execute(`
     CREATE TABLE IF NOT EXISTS tags (
       id TEXT PRIMARY KEY,
@@ -435,7 +435,11 @@ test("sync push todo update can clear recurrence_interval with null", async () =
   assert.equal(row.recurrence_interval, null);
 });
 
-test("sync push todo update can clear time with null", async () => {
+test("sync push todo update can clear a recurring reminder with null", async () => {
+  await turso.execute({
+    sql: "INSERT INTO users (id, email, password_hash, created_at, updated_at) VALUES (?, ?, 'x', ?, ?)",
+    args: [USER_ID, "nullable@example.test", OLD_UPDATED_AT, OLD_UPDATED_AT],
+  });
   await insertTodo("todo-sync-time", {
     time: "08:30",
   });
@@ -448,6 +452,7 @@ test("sync push todo update can clear time with null", async () => {
         id: "todo-sync-time",
         updated_at: NEW_UPDATED_AT,
         time: null,
+        time_scope: "this",
       },
     },
   ]);
