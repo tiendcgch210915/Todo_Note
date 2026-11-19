@@ -1,4 +1,8 @@
-import { getChangesSince, type SyncChanges } from "../repositories/sync.repo.js";
+import {
+  getChangesSince,
+  getSyncCursorTime,
+  type SyncChanges,
+} from "../repositories/sync.repo.js";
 import { ensureHabitDaysClosedSafe } from "./habit-day-close.js";
 
 const DEFAULT_RETRY_DELAYS_MS = [100, 300] as const;
@@ -72,12 +76,22 @@ export const withSyncPullRetry = async <T>(
   }
 };
 
+export type SyncPull = {
+  /** The cursor the client stores and sends back as `since`. */
+  serverTime: string;
+  changes: SyncChanges;
+};
+
 export const pullSyncChanges = async (
   userId: string,
   since: string | null
-): Promise<SyncChanges> => {
+): Promise<SyncPull> => {
+  // The cursor comes FIRST, before anything below reads or writes (see getSyncCursorTime): a write that
+  // lands while this pull runs is then stamped at or after it and is returned by the client's next delta.
+  const serverTime = await withSyncPullRetry(() => getSyncCursorTime());
   // Trước khi đọc: nếu ngày địa phương của người dùng vừa sang ngày mới và job nền chưa kịp
   // chạy (instance mới thức dậy), điền dòng completed=0 để chúng nằm ngay trong lần pull này.
   await ensureHabitDaysClosedSafe(userId);
-  return withSyncPullRetry(() => getChangesSince(userId, since));
+  const changes = await withSyncPullRetry(() => getChangesSince(userId, since));
+  return { serverTime, changes };
 };

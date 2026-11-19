@@ -29,6 +29,7 @@ export type OverrideRow = {
   template_id: string;
   local_date: string;
   time: string;
+  skipped: number;
   created_at: string;
   updated_at: string;
   deleted_at: string | null;
@@ -71,7 +72,7 @@ const SCHEDULE_COLUMNS =
   "created_at, updated_at, deleted_at";
 
 const OVERRIDE_COLUMNS =
-  "id, user_id, template_id, local_date, time, created_at, updated_at, deleted_at";
+  "id, user_id, template_id, local_date, time, skipped, created_at, updated_at, deleted_at";
 
 const MARK_COLUMNS =
   "id, user_id, template_id, local_date, status, created_at, updated_at, deleted_at";
@@ -114,6 +115,7 @@ const mapOverride = (row: Record<string, unknown>): OverrideRow => ({
   template_id: row.template_id as string,
   local_date: row.local_date as string,
   time: row.time as string,
+  skipped: Number(row.skipped),
   created_at: row.created_at as string,
   updated_at: row.updated_at as string,
   deleted_at: (row.deleted_at as string | null) ?? null,
@@ -295,18 +297,20 @@ export const upsertOverride = async (
   userId: string,
   templateId: string,
   localDate: string,
-  time: string
+  time: string,
+  skipped = false
 ): Promise<OverrideRow> => {
   const now = nowISO();
   await turso.execute({
     sql: `INSERT INTO checklist_schedule_overrides
-          (id, user_id, template_id, local_date, time, created_at, updated_at, deleted_at)
-          VALUES (?, ?, ?, ?, ?, ?, ?, NULL)
+          (id, user_id, template_id, local_date, time, skipped, created_at, updated_at, deleted_at)
+          VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL)
           ON CONFLICT(user_id, template_id, local_date) DO UPDATE SET
             time = excluded.time,
+            skipped = excluded.skipped,
             updated_at = excluded.updated_at,
             deleted_at = NULL`,
-    args: [newId(), userId, templateId, localDate, time, now, now],
+    args: [newId(), userId, templateId, localDate, time, Number(skipped), now, now],
   });
   const row = await getLiveOverride(userId, templateId, localDate);
   if (!row) throw new Error("upsertOverride: row missing after upsert");

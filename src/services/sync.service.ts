@@ -16,6 +16,7 @@
 import { nowISO } from "../utils/time.js";
 import { fromSyncEntity } from "../sync/sync-serializer.js";
 import type { SyncOp } from "../schemas/api/sync.js";
+import { TodoTimeScopeSchema, type TodoTimeScope } from "../schemas/api/todos.js";
 import * as habitsRepo from "../repositories/habits.js";
 import { getTemplateForUser } from "../repositories/checklist-templates.js";
 import * as todosRepo from "../repositories/todos.js";
@@ -51,6 +52,7 @@ import {
   resurrectHabitLogRow,
   getFullEntity,
   upsertEntity,
+  publishTodoTimeChanges,
   softDeleteEntity,
   reconcileJunctions,
 } from "../repositories/sync.repo.js";
@@ -90,7 +92,9 @@ const normalizeSyncSchedulePayload = (
     return { ...fields, enabled: fields.enabled ? 1 : 0 };
   }
   const parsed = ScheduleOverrideFieldsSchema.safeParse(payload);
-  return parsed.success ? parsed.data : null;
+  if (!parsed.success) return null;
+  const { skipped, ...fields } = parsed.data;
+  return skipped === undefined ? fields : { ...fields, skipped: Number(skipped) };
 };
 
 /** Sau khi lịch/ghi đè/checklist đổi qua sync: hủy và tạo lại job checklist_due bị ảnh hưởng. */
@@ -147,6 +151,7 @@ export type OpResult = {
   status: "applied" | "conflict" | "error";
   server_version?: Record<string, unknown>;
   error?: string;
+  prompt?: todosService.TimeScopeRequired["prompt"];
 };
 
 // ── processPush ───────────────────────────────────────────────────────────────
@@ -166,8 +171,9 @@ export const processPush = async (
   const refused = new Set<string>();
   // Series roots whose rule was written by this batch (§3.6 rule propagation).
   const writtenRoots = new Set<string>();
+  const timeChanges = new Set<string>();
   for (const op of ops) {
-    results.push(await processOp(userId, op, refused, writtenRoots));
+    results.push(await processOp(userId, op, refused, writtenRoots, timeChanges));
   }
   // After the whole batch, not per op: the propagation stamps the occurrences it
   // touches with the server clock, which would beat (LWW) an op later in the same
@@ -175,6 +181,7 @@ export const processPush = async (
   for (const rootId of writtenRoots) {
     await todosService.propagateRecurrenceRuleSafely(userId, rootId);
   }
+  await publishTodoTimeChanges(userId, timeChanges);
   return results;
 };
 
@@ -184,7 +191,8 @@ async function processOp(
   userId: string,
   op: SyncOp,
   refused: Set<string>,
-  writtenRoots: Set<string>
+  writtenRoots: Set<string>,
+  timeChanges: Set<string>
 ): Promise<OpResult> {
   const { op: opType, type, payload } = op;
 
@@ -192,6 +200,15 @@ async function processOp(
   const id = payload.id;
   if (!id || typeof id !== "string") {
     return { id: "unknown", status: "error", error: "bad_input" };
+  }
+
+  let timeScope: TodoTimeScope | undefined;
+  if (type === "todo" && hasOwn(payload, "time_scope")) {
+    const parsed = TodoTimeScopeSchema.safeParse(payload.time_scope);
+    if (!parsed.success || opType !== "update" || !hasOwn(payload, "time")) {
+      return { id, status: "error", error: "bad_input" };
+    }
+    timeScope = parsed.data;
   }
 
   // A child of a refused occurrence (or a trigger pointing into it) has nothing
@@ -303,7 +320,7 @@ async function processOp(
   // ── §5.1 Ownership check ─────────────────────────────────────────────────
   let entityInfo: { user_id: string | null; updated_at: string | null } | null = null;
 
-  if (opType === "create") {
+  if (opType === "create" && type !== "todo") {
     // Force user_id = jwt.sub — ignore whatever mobile sent
     dbPayload.user_id = userId;
   } else {
@@ -452,6 +469,21 @@ async function processOp(
     type === "todo" && opType !== "delete"
       ? await todosRepo.getTodoByIdScoped(id, userId)
       : null;
+  let timeEdit: todosRepo.SeriesTimeEdit | undefined;
+  if (type === "todo" && opType !== "delete") {
+    if (!beforeTodo && timeScope) return { id, status: "error", error: "bad_input" };
+    if (beforeTodo) {
+      try {
+        timeEdit = await todosService.prepareSeriesTimeEdit(beforeTodo, { ...dbPayload, time_scope: timeScope });
+      } catch (e) {
+        if (e instanceof todosService.TimeScopeRequired) {
+          return { id, status: "error", error: e.code, prompt: e.prompt };
+        }
+        if (e instanceof todosService.ServiceError) return { id, status: "error", error: e.code };
+        throw e;
+      }
+    }
+  }
   // Trạng thái run trước khi áp, để chỉ tự tick habit khi run THỰC SỰ chuyển sang completed.
   const beforeRun =
     type === "checklist_run" && opType !== "delete"
@@ -555,9 +587,15 @@ async function processOp(
       }
     }
   } else {
-    await upsertEntity(userId, type, dbPayload, {
-      partialUpdate: opType === "update" && entityInfo !== null,
+    const siblingIds = await upsertEntity(userId, type, dbPayload, {
+      partialUpdate: (opType === "update" || type === "todo") && entityInfo !== null,
+      timeEdit,
     });
+    if (timeEdit) timeChanges.add(id);
+    for (const siblingId of siblingIds) {
+      timeChanges.add(siblingId);
+      await notificationTriggers.onTodoChanged(userId, siblingId);
+    }
 
     // §5.4 Junction reconcile (todo / note only)
     // Skip entirely if all junction arrays are empty AND this is a create:
@@ -583,6 +621,10 @@ async function processOp(
         );
       }
       const afterTodo = await todosRepo.getTodoByIdScoped(id, userId);
+      if (afterTodo && !beforeTodo && afterTodo.recurrence_template_id &&
+          afterTodo.time !== (dbPayload.time ?? null)) {
+        timeChanges.add(id);
+      }
       if (afterTodo?.status === "done" && beforeTodo?.status !== "done") {
         await autoLogHabitForCompletedTodo(userId, afterTodo);
       }

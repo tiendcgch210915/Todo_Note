@@ -116,6 +116,7 @@ export const ScheduleOverrideFieldsSchema = z.object({
   template_id: z.string().min(1),
   local_date: IsoDate,
   time: TimeHm,
+  skipped: z.boolean().optional(),
 });
 
 const MarkStatus = z.enum(["done", "open"]);
@@ -147,4 +148,8 @@ export const OccurrencesQuerySchema = z
 export const OccurrenceDateParamSchema = z.object({ date: IsoDate });
 
 /** Giờ ghi đè cho MỘT ngày. */
-export const PutOccurrenceSchema = z.object({ time: TimeHm });
+export const PutOccurrenceSchema = z.union([
+  z.object({ time: TimeHm, skipped: z.literal(false).optional() }),
+  z.object({ skipped: z.literal(true), time: z.never().optional() }),
+]);
+export type OccurrenceEdit = z.infer<typeof PutOccurrenceSchema>;

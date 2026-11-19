@@ -6,6 +6,7 @@
  * API_CONTRACT §4 (pull) + §5 (push helpers)
  */
 import { turso } from "../config/db.js";
+import { writeTodoUpdate, type SeriesTimeEdit } from "./todos.js";
 import { nowISO } from "../utils/time.js";
 import {
   toSyncEntity,
@@ -40,11 +41,14 @@ export type SyncChanges = {
 // Read each parent and its live associations in one statement. Each subquery
 // uses the junction index for that parent, including on a one-row delta.
 const todoSelect = `SELECT e.*,
+  CASE WHEN s.series_id IS NULL THEN e.time ELSE s.time END AS recurrence_time,
   (SELECT json_group_array(tt.tag_id) FROM todo_tags tt
    JOIN tags g ON g.id = tt.tag_id WHERE tt.todo_id = e.id AND g.deleted_at IS NULL) AS tag_ids,
   (SELECT json_group_array(l.note_id) FROM note_todo_links l
    JOIN notes n ON n.id = l.note_id WHERE l.todo_id = e.id AND n.deleted_at IS NULL) AS linked_note_ids
-  FROM todos e`;
+  FROM todos e LEFT JOIN todo_series_reminder_times s
+    ON s.user_id = e.user_id AND s.series_id = COALESCE(e.recurrence_template_id, e.id)
+    AND (e.recurrence_type IS NOT NULL OR e.recurrence_template_id IS NOT NULL)`;
 
 const noteSelect = `SELECT e.*,
   (SELECT json_group_array(nt.tag_id) FROM note_tags nt
@@ -77,6 +81,35 @@ const dbArgs = (vals: unknown[]): (string | number | bigint | ArrayBuffer | null
 
 const hasOwn = (obj: Record<string, unknown>, key: string): boolean =>
   Object.prototype.hasOwnProperty.call(obj, key);
+
+/**
+ * Delta predicate of a pull: the row was WRITTEN on the server after `since`, judged by `sync_stamps`
+ * (migration 0031: database clock, set by triggers on every insert/update of the table), not by the row's
+ * `updated_at`. `updated_at` is stamped by the writing client, so an offline edit pushed after another
+ * device's last pull is older than that device's cursor and would never reach it.
+ * One bound parameter: `since`. `table` must be a trusted literal (it is not bound).
+ *
+ * Callers write the OWNER condition of a delta as `+owner_column = ?` (unary plus). Without it SQLite prefers
+ * the owner index and walks every row of the user, testing each id against the list (61 ms on 30k todos);
+ * with it the planner drives from the `sync_stamps` index and looks rows up by primary key (1 ms), as the old
+ * `(user_id, updated_at)` range did. The initial pull keeps the plain owner index.
+ */
+const writtenSince = (table: string, idColumn: string): string =>
+  `${idColumn} IN (SELECT entity_id FROM sync_stamps WHERE entity_type = '${table}' AND synced_at > ?)`;
+
+/**
+ * `server_time` of a pull. Must be read BEFORE the pull's queries run and from the DATABASE clock (the same
+ * one the `sync_stamps` triggers use), so every write that the pull might miss is stamped at or after it and
+ * is returned by the next delta. It is 1 ms early on purpose: stamps and cursors are millisecond strings
+ * compared with `>`, so a write landing in the very same millisecond must still count as "after".
+ * Re-sending a row is harmless (clients apply pulls idempotently); skipping one is not.
+ */
+export const getSyncCursorTime = async (): Promise<string> => {
+  const res = await turso.execute(
+    "SELECT strftime('%Y-%m-%dT%H:%M:%fZ', 'now', '-0.001 seconds') AS cursor"
+  );
+  return String((res.rows[0] as unknown as { cursor: unknown }).cursor);
+};
 
 export class SyncPullQueryError extends Error {
   constructor(
@@ -128,8 +161,9 @@ const syncTodoFields = [
 
 const updateExistingTodoFromSync = async (
   userId: string,
-  p: Record<string, unknown>
-): Promise<void> => {
+  p: Record<string, unknown>,
+  edit?: SeriesTimeEdit
+): Promise<string[]> => {
   const sets: string[] = [];
   const args: unknown[] = [];
 
@@ -141,13 +175,26 @@ const updateExistingTodoFromSync = async (
   }
 
   sets.push("updated_at = ?");
-  args.push((p.updated_at as string | null) ?? nowISO());
+  const updatedAt = (p.updated_at as string | null) ?? nowISO();
+  args.push(updatedAt);
   args.push(p.id, userId);
 
-  await turso.execute({
+  const { siblingIds } = await writeTodoUpdate(String(p.id), userId, {
     sql: `UPDATE todos SET ${sets.join(", ")}
           WHERE id = ? AND user_id = ?`,
     args: dbArgs(args),
+  }, updatedAt, edit);
+  return siblingIds;
+};
+
+/** Publish derived reminder changes to devices whose last pull was after the offline edit. */
+export const publishTodoTimeChanges = async (userId: string, ids: Set<string>): Promise<void> => {
+  if (!ids.size) return;
+  const stamp = nowISO();
+  await turso.execute({
+    sql: `UPDATE todos SET updated_at = ? WHERE user_id = ? AND updated_at < ?
+          AND id IN (SELECT value FROM json_each(?))`,
+    args: [stamp, userId, stamp, JSON.stringify([...ids])],
   });
 };
 
@@ -196,7 +243,10 @@ const updateExistingNoteFromSync = async (
  * Pull delta or full snapshot.
  *
  * `since` = "" | undefined → initial sync: only living entities (deleted_at IS NULL)
- * `since` = ISO timestamp  → delta: entities where updated_at > since (incl. soft-deleted)
+ * `since` = ISO timestamp  → delta: entities WRITTEN on the server after `since` (incl. soft-deleted), see
+ *                            `writtenSince`. It is not `updated_at > since`: that clock belongs to the writer.
+ *
+ * The caller reads `getSyncCursorTime()` before calling this and hands it to the client as `server_time`.
  */
 export const getChangesSince = async (
   userId: string,
@@ -205,7 +255,11 @@ export const getChangesSince = async (
   const isInitial = !since || since === "";
   const a1 = isInitial ? [userId] : [userId, since!]; // single-arg or (userId, since)
 
-  const parentFilter = isInitial ? "e.deleted_at IS NULL" : "e.updated_at > ?";
+  // Owner + (initial: alive | delta: written since) of a parent row aliased `e`; see writtenSince for the `+`.
+  const parentFilter = (table: string) =>
+    isInitial
+      ? "e.user_id = ? AND e.deleted_at IS NULL"
+      : `+e.user_id = ? AND ${writtenSince(table, "e.id")}`;
   const [
     usersRes, tagsRes, todosRes, notesRes,
     habitsRes, habitLogsRes, categoriesRes, templatesRes, templateOrdersRes,
@@ -216,27 +270,27 @@ export const getChangesSince = async (
     runSyncQuery("users", turso.execute({
       sql: isInitial
         ? "SELECT * FROM users WHERE id = ? AND deleted_at IS NULL"
-        : "SELECT * FROM users WHERE id = ? AND updated_at > ?",
+        : `SELECT * FROM users WHERE id = ? AND ${writtenSince("users", "id")}`,
       args: a1,
     })),
     runSyncQuery("tags", turso.execute({
       sql: isInitial
         ? "SELECT * FROM tags WHERE user_id = ? AND deleted_at IS NULL ORDER BY updated_at DESC"
-        : "SELECT * FROM tags WHERE user_id = ? AND updated_at > ? ORDER BY updated_at DESC",
+        : `SELECT * FROM tags WHERE +user_id = ? AND ${writtenSince("tags", "id")} ORDER BY updated_at DESC`,
       args: a1,
     })),
     runSyncQuery("todos", turso.execute({
-      sql: `${todoSelect} WHERE e.user_id = ? AND ${parentFilter} ORDER BY e.updated_at DESC`,
+      sql: `${todoSelect} WHERE ${parentFilter("todos")} ORDER BY e.updated_at DESC`,
       args: a1,
     })),
     runSyncQuery("notes", turso.execute({
-      sql: `${noteSelect} WHERE e.user_id = ? AND ${parentFilter} ORDER BY e.updated_at DESC`,
+      sql: `${noteSelect} WHERE ${parentFilter("notes")} ORDER BY e.updated_at DESC`,
       args: a1,
     })),
     runSyncQuery("habits", turso.execute({
       sql: isInitial
         ? "SELECT * FROM habits WHERE user_id = ? AND deleted_at IS NULL ORDER BY updated_at DESC"
-        : "SELECT * FROM habits WHERE user_id = ? AND updated_at > ? ORDER BY updated_at DESC",
+        : `SELECT * FROM habits WHERE +user_id = ? AND ${writtenSince("habits", "id")} ORDER BY updated_at DESC`,
       args: a1,
     })),
     runSyncQuery("habit_logs", turso.execute({
@@ -251,7 +305,7 @@ export const getChangesSince = async (
                   l.created_at, l.updated_at, l.deleted_at
            FROM habit_logs l
            JOIN habits h ON h.id = l.habit_id
-           WHERE h.user_id = ? AND l.updated_at > ?
+           WHERE +h.user_id = ? AND ${writtenSince("habit_logs", "l.id")}
            ORDER BY l.updated_at DESC`,
       args: a1,
     })),
@@ -261,7 +315,7 @@ export const getChangesSince = async (
            WHERE (user_id = ? OR is_system = 1) AND deleted_at IS NULL
            ORDER BY is_system DESC, sort_order ASC, updated_at DESC`
         : `SELECT * FROM checklist_categories
-           WHERE (user_id = ? OR is_system = 1) AND updated_at > ?
+           WHERE (+user_id = ? OR is_system = 1) AND ${writtenSince("checklist_categories", "id")}
            ORDER BY is_system DESC, sort_order ASC, updated_at DESC`,
       args: a1,
     })),
@@ -271,7 +325,7 @@ export const getChangesSince = async (
            WHERE (user_id = ? OR is_system = 1) AND deleted_at IS NULL
            ORDER BY sort_order ASC, updated_at DESC`
         : `SELECT * FROM checklist_templates
-           WHERE (user_id = ? OR is_system = 1) AND updated_at > ?
+           WHERE (+user_id = ? OR is_system = 1) AND ${writtenSince("checklist_templates", "id")}
            ORDER BY sort_order ASC, updated_at DESC`,
       args: a1,
     })),
@@ -281,7 +335,7 @@ export const getChangesSince = async (
            WHERE user_id = ? AND deleted_at IS NULL
            ORDER BY sort_order ASC, updated_at DESC`
         : `SELECT * FROM checklist_template_orders
-           WHERE user_id = ? AND updated_at > ?
+           WHERE +user_id = ? AND ${writtenSince("checklist_template_orders", "id")}
            ORDER BY sort_order ASC, updated_at DESC`,
       args: a1,
     })),
@@ -293,14 +347,14 @@ export const getChangesSince = async (
            ORDER BY i.updated_at DESC`
         : `SELECT i.* FROM checklist_template_items i
            JOIN checklist_templates t ON t.id = i.template_id
-           WHERE (t.user_id = ? OR t.is_system = 1) AND i.updated_at > ?
+           WHERE (+t.user_id = ? OR t.is_system = 1) AND ${writtenSince("checklist_template_items", "i.id")}
            ORDER BY i.updated_at DESC`,
       args: a1,
     })),
     runSyncQuery("checklist_runs", turso.execute({
       sql: isInitial
         ? "SELECT * FROM checklist_runs WHERE user_id = ? AND deleted_at IS NULL ORDER BY updated_at DESC"
-        : "SELECT * FROM checklist_runs WHERE user_id = ? AND updated_at > ? ORDER BY updated_at DESC",
+        : `SELECT * FROM checklist_runs WHERE +user_id = ? AND ${writtenSince("checklist_runs", "id")} ORDER BY updated_at DESC`,
       args: a1,
     })),
     runSyncQuery("checklist_run_items", turso.execute({
@@ -311,7 +365,7 @@ export const getChangesSince = async (
            ORDER BY ri.updated_at DESC`
         : `SELECT ri.* FROM checklist_run_items ri
            JOIN checklist_runs r ON r.id = ri.run_id
-           WHERE r.user_id = ? AND ri.updated_at > ?
+           WHERE +r.user_id = ? AND ${writtenSince("checklist_run_items", "ri.id")}
            ORDER BY ri.updated_at DESC`,
       args: a1,
     })),
@@ -321,7 +375,7 @@ export const getChangesSince = async (
            WHERE user_id = ? AND deleted_at IS NULL
            ORDER BY updated_at DESC`
         : `SELECT * FROM checklist_schedules
-           WHERE user_id = ? AND updated_at > ?
+           WHERE +user_id = ? AND ${writtenSince("checklist_schedules", "id")}
            ORDER BY updated_at DESC`,
       args: a1,
     })),
@@ -331,7 +385,7 @@ export const getChangesSince = async (
            WHERE user_id = ? AND deleted_at IS NULL
            ORDER BY updated_at DESC`
         : `SELECT * FROM checklist_schedule_overrides
-           WHERE user_id = ? AND updated_at > ?
+           WHERE +user_id = ? AND ${writtenSince("checklist_schedule_overrides", "id")}
            ORDER BY updated_at DESC`,
       args: a1,
     })),
@@ -341,7 +395,7 @@ export const getChangesSince = async (
            WHERE user_id = ? AND deleted_at IS NULL
            ORDER BY updated_at DESC`
         : `SELECT * FROM checklist_occurrence_marks
-           WHERE user_id = ? AND updated_at > ?
+           WHERE +user_id = ? AND ${writtenSince("checklist_occurrence_marks", "id")}
            ORDER BY updated_at DESC`,
       args: a1,
     })),
@@ -455,8 +509,8 @@ export const upsertEntity = async (
   userId: string,
   type: EntityType,
   dbPayload: Record<string, unknown>,
-  opts: { partialUpdate?: boolean } = {}
-): Promise<void> => {
+  opts: { partialUpdate?: boolean; timeEdit?: SeriesTimeEdit } = {}
+): Promise<string[]> => {
   const p = dbPayload;
   const now = nowISO();
   const createdAt = (p.created_at as string | null) ?? now;
@@ -466,8 +520,7 @@ export const upsertEntity = async (
   switch (type) {
     case "todo": {
       if (opts.partialUpdate) {
-        await updateExistingTodoFromSync(userId, p);
-        break;
+        return updateExistingTodoFromSync(userId, p, opts.timeEdit);
       }
 
       const recurrenceInterval = hasOwn(p, "recurrence_interval")
@@ -820,30 +873,22 @@ export const upsertEntity = async (
       });
       if (visible.rows.length === 0) break;
 
-      const existing = await turso.execute({
-        sql: `SELECT id, updated_at FROM checklist_schedule_overrides
-              WHERE user_id = ? AND (id = ? OR (template_id = ? AND local_date = ?))
-              ORDER BY (id = ?) DESC LIMIT 1`,
-        args: dbArgs([userId, p.id, p.template_id, p.local_date, p.id]),
+      // Merge by id or by (user, template, day) in one write. Older clients omit skipped.
+      await turso.execute({
+        sql: `INSERT INTO checklist_schedule_overrides
+              (id, user_id, template_id, local_date, time, skipped, created_at, updated_at, deleted_at)
+              VALUES (?,?,?,?,?,?,?,?,?)
+              ON CONFLICT DO UPDATE SET
+                template_id = excluded.template_id, local_date = excluded.local_date,
+                time = excluded.time,
+                skipped = COALESCE(?, CASE WHEN deleted_at IS NULL THEN skipped ELSE 0 END),
+                updated_at = excluded.updated_at, deleted_at = excluded.deleted_at
+              WHERE user_id = excluded.user_id AND updated_at <= excluded.updated_at`,
+        args: dbArgs([
+          p.id, userId, p.template_id, p.local_date, p.time, p.skipped ?? 0,
+          createdAt, updatedAt, deletedAt, p.skipped ?? null,
+        ]),
       });
-
-      if (existing.rows.length > 0) {
-        const row = existing.rows[0] as unknown as { id: string; updated_at: string };
-        if (row.updated_at > updatedAt) break;
-        await turso.execute({
-          sql: `UPDATE checklist_schedule_overrides
-                SET template_id = ?, local_date = ?, time = ?, updated_at = ?, deleted_at = ?
-                WHERE id = ? AND user_id = ?`,
-          args: dbArgs([p.template_id, p.local_date, p.time, updatedAt, deletedAt, row.id, userId]),
-        });
-      } else {
-        await turso.execute({
-          sql: `INSERT INTO checklist_schedule_overrides
-                (id, user_id, template_id, local_date, time, created_at, updated_at, deleted_at)
-                VALUES (?,?,?,?,?,?,?,?)`,
-          args: dbArgs([p.id, userId, p.template_id, p.local_date, p.time, createdAt, updatedAt, deletedAt]),
-        });
-      }
       break;
     }
 
@@ -968,6 +1013,7 @@ export const upsertEntity = async (
       break;
     }
   }
+  return [];
 };
 
 // ── softDeleteEntity ─────────────────────────────────────────────────────────

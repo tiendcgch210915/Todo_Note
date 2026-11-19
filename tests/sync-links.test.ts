@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { applyAllMigrations } from "./helpers/migrations.js";
+import { applyAllMigrations, restampFromUpdatedAt } from "./helpers/migrations.js";
 
 process.env.TURSO_DATABASE_URL = "file::memory:";
 process.env.TURSO_AUTH_TOKEN = "";
@@ -32,6 +32,9 @@ test("full, delta and conflict reads embed the same live links, including unchan
     "INSERT INTO note_tags(note_id,tag_id) VALUES('parent','tag')",
     "INSERT INTO todo_tags(todo_id,tag_id) VALUES('todo','tag')",
   ], "write");
+  // The delta asks "which rows were WRITTEN after `old`" (sync_stamps), and every insert above was just written:
+  // restore the write times this fixture means, i.e. each row's own updated_at.
+  await restampFromUpdatedAt(turso);
 
   const full = await getChangesSince("u", null);
   const delta = await getChangesSince("u", old);

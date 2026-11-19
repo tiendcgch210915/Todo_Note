@@ -279,7 +279,7 @@ test("a per-day override re-times that day's job; removing it restores the sched
   const date = tomorrow();
   await schedulesService.putSchedule(USER_ID, TPL, dailyFrom(date));
 
-  await schedulesService.putOccurrence(USER_ID, TPL, date, "21:15");
+  await schedulesService.putOccurrence(USER_ID, TPL, date, { time: "21:15" });
   assert.equal((await job(date))?.run_at, runAtOf(date, "21:15"));
   assert.equal((await dueJobs()).length, 1);
 
@@ -410,6 +410,7 @@ const invalidations: Array<[string, () => Promise<void>]> = [
   ["the checklist was deleted", () => turso.execute({ sql: "UPDATE checklist_templates SET deleted_at = '2026-06-20T00:10:00.000Z' WHERE id = ?", args: [TPL] }).then(() => undefined)],
   ["a run was completed that day", () => fx.insertRun(turso, { id: "r-today", templateId: TPL, completedAt: "2026-06-20T00:10:00.000Z" })],
   ["the day's time was overridden", () => schedulesRepo.upsertOverride(USER_ID, TPL, "2026-06-20", "09:00").then(() => undefined)],
+  ["the occurrence was skipped", () => schedulesRepo.upsertOverride(USER_ID, TPL, "2026-06-20", "07:30", true).then(() => undefined)],
   ["that day was paused", () => turso.execute("UPDATE checklist_schedules SET paused_from = '2026-06-19', paused_until = '2026-06-21'").then(() => undefined)],
   ["the schedule time changed", () => turso.execute("UPDATE checklist_schedules SET time = '08:00'").then(() => undefined)],
   ["the schedule now ends before that day", () => turso.execute("UPDATE checklist_schedules SET recurrence_end_date = '2026-06-19', start_date = '2026-06-10'").then(() => undefined)],
