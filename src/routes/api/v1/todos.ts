@@ -10,9 +10,11 @@ import {
   MoveToDaySchema,
   AttachTagSchema,
   ReplaceTodoTagsSchema,
+  SnoozeTodoSchema,
   TodoTimerSchema,
 } from "../../../schemas/api/todos.js";
 import * as todos from "../../../services/todos.js";
+import { snoozeTodo, SnoozeError } from "../../../services/todo-snooze.js";
 import {
   acknowledgeReminder,
   ReminderRepeatError,
@@ -23,6 +25,9 @@ import {
 } from "../../../services/todo-timers.js";
 
 const mapErr = (e: unknown, reply: FastifyReply): FastifyReply => {
+  if (e instanceof todos.TimeScopeRequired) {
+    return reply.code(409).send({ error: e.code, prompt: e.prompt });
+  }
   if (e instanceof todos.ServiceError) {
     if (e.code === "not_found") return reply.code(404).send({ error: "not_found" });
     if (e.code === "duplicate") return reply.code(409).send({ error: "duplicate" });
@@ -284,6 +289,24 @@ export default async function todosRoutes(app: FastifyInstance) {
           return reply.code(409).send({ error: "todo_completed" });
       }
       throw e;
+    }
+  });
+
+  // POST /:id/snooze — hoãn nhắc như đồng hồ báo thức: dời giờ hẹn thêm `minutes` phút (đồng bộ mọi máy qua sync) và
+  // gỡ thông báo của todo khỏi mọi máy. Chỉ áp cho lần xuất hiện này của todo lặp (không đổi giờ của cả chuỗi).
+  app.post<{ Params: { id: string } }>("/:id/snooze", async (req, reply) => {
+    const parsed = SnoozeTodoSchema.safeParse(req.body);
+    if (!parsed.success) {
+      return reply
+        .code(400)
+        .send({ error: "bad_input", issues: parsed.error.issues });
+    }
+    try {
+      return await snoozeTodo(req.userId, req.params.id, parsed.data);
+    } catch (e) {
+      // todo_completed / no_reminder: không còn gì để hoãn; app nên bỏ thẻ thông báo.
+      if (e instanceof SnoozeError) return reply.code(409).send({ error: e.code });
+      return mapErr(e, reply);
     }
   });
 

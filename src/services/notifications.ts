@@ -206,15 +206,16 @@ export type DismissInput = {
  * The server cannot delete a notification that is already on a phone, so this sends a DATA-ONLY
  * message (`type: "dismiss"`); the app's background handler cancels the notification by tag.
  * `before` is the moment of the decision: an app that can read when a notification was posted should
- * only remove the ones posted before it. The message is short-lived (`DISMISS.ttlMs`) so a late
- * delivery cannot remove a newer notification that reuses the tag.
+ * only remove the ones posted before it. The message is short-lived (`DISMISS.ttlMs`, or the caller's
+ * shorter `options.ttlMs`) so a late delivery cannot remove a newer notification that reuses the tag.
  *
  * Never throws (best effort). With `NOTIFY_DRY_RUN` it only logs, like the tick.
  */
 export const dismissNotification = async (
   userId: string,
   input: DismissInput,
-  now: Date = new Date()
+  now: Date = new Date(),
+  options: { ttlMs?: number } = {}
 ): Promise<NotifyUserResult> => {
   try {
     const devices = await notificationsRepo.listDevicesByUser(userId);
@@ -236,7 +237,7 @@ export const dismissNotification = async (
         tag: input.tag,
         before: now.toISOString(),
       },
-      ttlMs: DISMISS.ttlMs,
+      ttlMs: options.ttlMs ?? DISMISS.ttlMs,
     });
     if (result.invalidDeviceIds.length > 0) {
       await notificationsRepo.deleteDevicesByIds(result.invalidDeviceIds);

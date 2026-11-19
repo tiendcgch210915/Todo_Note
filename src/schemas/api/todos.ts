@@ -1,5 +1,5 @@
 import { z } from "zod";
-import { TIMER } from "../../config/notification-policy.js";
+import { SNOOZE, TIMER } from "../../config/notification-policy.js";
 
 const IsoDate = z.string().regex(/^\d{4}-\d{2}-\d{2}$/, "Expected YYYY-MM-DD");
 const IsoDT = z.iso.datetime();
@@ -43,8 +43,15 @@ export const CreateTodoSchema = z.object({
 });
 export type CreateTodoInput = z.infer<typeof CreateTodoSchema>;
 
+export const TodoTimeScopeSchema = z.enum(["this", "all"]);
+export type TodoTimeScope = z.infer<typeof TodoTimeScopeSchema>;
+
 export const UpdateTodoSchema = CreateTodoSchema.partial().extend({
   actual_minutes: Minutes.nullable().optional(),
+  time_scope: TodoTimeScopeSchema.optional(),
+}).refine((p) => p.time_scope === undefined || p.time !== undefined, {
+  path: ["time"],
+  message: "A time change requires time (HH:mm or null).",
 });
 export type UpdateTodoInput = z.infer<typeof UpdateTodoSchema>;
 
@@ -81,6 +88,13 @@ export type DeleteTodoQueryInput = z.infer<typeof DeleteTodoQuerySchema>;
 
 export const ToggleFrogSchema = z.object({ date: IsoDate });
 export type ToggleFrogInput = z.infer<typeof ToggleFrogSchema>;
+
+// ── Hoãn nhắc (POST /todos/:id/snooze) ───────────────────────────────────────
+// Số phút nguyên: 5/10/15/30/60 là các lựa chọn sẵn của app, "tùy chỉnh" là số bất kỳ trong khoảng.
+export const SnoozeTodoSchema = z.object({
+  minutes: z.number().int().min(SNOOZE.minMinutes).max(SNOOZE.maxMinutes),
+});
+export type SnoozeTodoInput = z.infer<typeof SnoozeTodoSchema>;
 
 export const ClassifyEisenhowerSchema = z.object({
   is_important: z.boolean().nullable(),

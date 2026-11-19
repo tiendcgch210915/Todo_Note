@@ -13,6 +13,7 @@
 import {
   DISMISS,
   LATENESS_MS,
+  SNOOZE,
   notificationTag,
   type NotificationJobKind,
 } from "../config/notification-policy.js";
@@ -102,6 +103,21 @@ const sendInBackground = (task: () => Promise<unknown>): void => {
   inFlight.add(promise);
 };
 
+export type DismissOptions = {
+  /**
+   * Hoãn nhắc (`services/todo-snooze.ts`): người dùng vừa yêu cầu gỡ thẻ nên tin gỡ đi tới mọi máy BẤT KỂ có ghi
+   * nhận thẻ đã gửi hay không và BẤT KỂ nhắc kế tiếp đến trong `DISMISS.replaceWithinMs` (một lần hoãn 3 phút
+   * vẫn phải gỡ thẻ ngay). Khóa lịch cũ vẫn được xóa như thường để lần sửa sau không gỡ lần hai.
+   */
+  force?: boolean;
+  /**
+   * Thời gian FCM giữ tin gỡ (ms); mặc định `DISMISS.ttlMs`. App không đọc được giờ đăng của thẻ nên tin gỡ đến trễ
+   * có thể xóa nhầm nhắc mới cùng thẻ: với `force`, người gọi đặt giá trị ngắn hơn thời gian tới nhắc mới
+   * (xem `snoozeDismissTtlMs`).
+   */
+  ttlMs?: number;
+};
+
 /**
  * Gọi sau MỌI thay đổi của một todo (sau khi job đã được tính lại): nếu một thông báo đã gửi theo lịch
  * CŨ có thể còn nằm trên máy thì gỡ nó.
@@ -117,37 +133,52 @@ const sendInBackground = (task: () => Promise<unknown>): void => {
  *    đó đã gửi, và mọi lần đổi lịch đã hủy nó (`reconcileReminderRepeats`), nên không bao giờ đang chờ lúc này.
  *
  * Việc gửi chạy trong nền (không làm chậm request); dùng `flushDismissals()` để chờ nó.
+ * `options.force` bỏ hai điều kiện "có thẻ cũ" và "nhắc kế tiếp thay thẻ" (xem `DismissOptions`).
  */
 export const dismissStaleTodoCard = async (
   userId: string,
   todoId: string,
-  now: Date = new Date()
+  now: Date = new Date(),
+  options: DismissOptions = {}
 ): Promise<DismissOutcome> => {
   const todo = await todosRepo.getTodoByIdScoped(todoId, userId);
   if (!todo || (todo.status !== "open" && todo.status !== "in_progress")) return "none";
 
   const cleared = await jobsRepo.clearStaleCardKeys(userId, todo.id, todoCardKey(todo) ?? "");
-  if (cleared === 0) return "none";
+  if (!options.force) {
+    if (cleared === 0) return "none";
 
-  const nowMs = now.getTime();
-  const lateness = Math.max(LATENESS_MS.todo_reminder, LATENESS_MS.todo_overdue);
-  const upcoming = await jobsRepo.listCardJobsDueBetween(
-    userId,
-    todo.id,
-    new Date(nowMs - lateness).toISOString(),
-    new Date(nowMs + DISMISS.replaceWithinMs).toISOString()
-  );
-  if (upcoming.length > 0) {
-    const ctx = await settingsRepo.getUserContext(userId);
-    const { timezone } = resolveSettings(
-      ctx ?? { timezone: null, morning_time: null, evening_time: null }
+    const nowMs = now.getTime();
+    const lateness = Math.max(LATENESS_MS.todo_reminder, LATENESS_MS.todo_overdue);
+    const upcoming = await jobsRepo.listCardJobsDueBetween(
+      userId,
+      todo.id,
+      new Date(nowMs - lateness).toISOString(),
+      new Date(nowMs + DISMISS.replaceWithinMs).toISOString()
     );
-    if (upcoming.some((job) => replacesCard(job, todo, timezone))) return "replaced";
+    if (upcoming.length > 0) {
+      const ctx = await settingsRepo.getUserContext(userId);
+      const { timezone } = resolveSettings(
+        ctx ?? { timezone: null, morning_time: null, evening_time: null }
+      );
+      if (upcoming.some((job) => replacesCard(job, todo, timezone))) return "replaced";
+    }
   }
 
-  dismissInBackground(userId, todo, now);
+  dismissInBackground(userId, todo, now, options.ttlMs);
   return "dismissed";
 };
+
+/**
+ * TTL của tin gỡ gửi kèm một lần hoãn nhắc: ngắn hơn thời gian từ lúc gửi tới nhắc mới (`remindInMs`) một khoảng
+ * đệm, để tin gỡ đến trễ (máy mất mạng) bị FCM bỏ trước khi nhắc mới hiện, tối đa `DISMISS.ttlMs`, tối thiểu
+ * `SNOOZE.dismissMinTtlMs`.
+ */
+export const snoozeDismissTtlMs = (remindInMs: number): number =>
+  Math.min(
+    DISMISS.ttlMs,
+    Math.max(SNOOZE.dismissMinTtlMs, Math.floor(remindInMs - SNOOZE.dismissMarginMs))
+  );
 
 /**
  * Gỡ thẻ của todo khỏi MỌI máy của người dùng, trong nền. Thẻ tính bằng `todoTag` (chuỗi lặp dùng id GỐC chuỗi),
@@ -156,12 +187,13 @@ export const dismissStaleTodoCard = async (
 const dismissInBackground = (
   userId: string,
   todo: { id: string; recurrence_template_id: string | null },
-  now: Date
+  now: Date,
+  ttlMs?: number
 ): void => {
   const tag = todoTag("todo_reminder", todo);
   sendInBackground(async () => {
     const { dismissNotification } = await import("./notifications.js");
-    await dismissNotification(userId, { tag, id: todo.id }, now);
+    await dismissNotification(userId, { tag, id: todo.id }, now, { ttlMs });
   });
 };
 

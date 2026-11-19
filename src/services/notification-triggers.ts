@@ -23,7 +23,7 @@ import {
   reconcileChecklistDue,
 } from "./checklist-due.js";
 import { finishSchedulesForUserSafely } from "./checklist-schedule-expiry.js";
-import { dismissStaleTodoCard } from "./notification-cards.js";
+import { dismissStaleTodoCard, type DismissOptions } from "./notification-cards.js";
 import { recomputePendingDigests, planUser } from "./notification-planner.js";
 import { resolveSettings } from "./notification-schedule.js";
 import { reconcileAllTodoOverdue, reconcileTodoOverdue } from "./overdue-nudges.js";
@@ -131,12 +131,14 @@ const rearmTodoJobs = async (
  * Gọi sau MỌI thay đổi của một todo (tạo, sửa, dời ngày, hoàn thành, bỏ hoàn thành, hồi sinh
  * bản lặp, sync). Đọc trạng thái hiện tại rồi tạo/sửa/hủy job nhắc giờ và nhắc lặp cho khớp, rồi gỡ
  * khỏi máy thông báo đã gửi theo giờ/ngày hẹn CŨ (xem `dismissStaleTodoCard`). Phải gỡ SAU khi tính lại
- * job, vì việc gỡ xét xem thông báo kế tiếp của todo có đến ngay không. `now` chỉ để test.
+ * job, vì việc gỡ xét xem thông báo kế tiếp của todo có đến ngay không. `now` chỉ để test. `options.dismiss` chỉ
+ * dành cho hoãn nhắc (`services/todo-snooze.ts`): ép gỡ thẻ ngay trên mọi máy, xem `DismissOptions`.
  */
 export const onTodoChanged = async (
   userId: string,
   todoId: string,
-  now: Date = new Date()
+  now: Date = new Date(),
+  options: { dismiss?: DismissOptions } = {}
 ): Promise<void> => {
   await safely("todo_changed", () => rearmTodoJobs(userId, todoId, now));
   // Xếp lại hàng đợi nhắc giờ: todo đổi có thể đổi giờ gửi của chính nó và của các nhắc khác (nhắc cùng giờ),
@@ -144,7 +146,7 @@ export const onTodoChanged = async (
   // Phải đứng SAU khi job được tạo/hủy và TRƯỚC việc gỡ thông báo cũ, vì việc gỡ xét xem nhắc kế tiếp có đến ngay không.
   await requeueTodoReminders(userId, now, todoId);
   await safely("todo_stale_card", async () => {
-    await dismissStaleTodoCard(userId, todoId, now);
+    await dismissStaleTodoCard(userId, todoId, now, options.dismiss);
   });
 };
 

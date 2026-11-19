@@ -61,6 +61,7 @@ export type SyncTodo = {
   due_at: string | null;
   scheduled_date: string | null;
   time: string | null;
+  recurrence_time: string | null;
   trigger_after_todo_id: string | null;
   habit_id: string | null;
   completed_at: string | null;
@@ -257,6 +258,7 @@ export type SyncChecklistScheduleOverride = {
   template_id: string;
   local_date: string;
   time: string;
+  skipped: boolean;
   created_at: string;
   updated_at: string;
   deleted_at: string | null;
@@ -320,6 +322,7 @@ const fromBoolNullable = (v: unknown): number | null => {
 // ── Server-only fields (stripped on fromSyncEntity push) ────────────────────
 
 const SERVER_ONLY: Partial<Record<EntityType, string[]>> = {
+  todo: ["recurrence_time", "time_scope"],
   habit: ["current_streak", "longest_streak"],
   // auto_closed: provenance flag of automation (midnight job, or a linked todo/checklist
   // auto-log): the row carries no user intent. Never set or shown by clients
@@ -417,6 +420,9 @@ export function toSyncEntity(
         enabled: toBool(row.enabled),
       };
     }
+
+    case "checklist_schedule_override":
+      return { ...row, skipped: toBool(row.skipped) };
 
     case "checklist_template_item": {
       // Defensive: created_at/updated_at existed before 0005 but may be

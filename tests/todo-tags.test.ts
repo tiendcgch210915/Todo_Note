@@ -5,7 +5,7 @@ process.env.TURSO_DATABASE_URL = "file::memory:";
 process.env.TURSO_AUTH_TOKEN = "";
 
 const { turso } = await import("../src/config/db.js");
-const { createNotificationTables } = await import("./helpers/migrations.js");
+const { createNotificationTables, installSyncStamps } = await import("./helpers/migrations.js");
 const tagsService = await import("../src/services/tags.js");
 const todosService = await import("../src/services/todos.js");
 const dashboard = await import("../src/services/dashboard.js");
@@ -93,7 +93,6 @@ const getTodoRow = async (
 };
 
 before(async () => {
-  await createNotificationTables(turso);
   await turso.execute(`
     CREATE TABLE IF NOT EXISTS users (
       id TEXT PRIMARY KEY,
@@ -152,6 +151,7 @@ before(async () => {
       deleted_at TEXT
     )
   `);
+  await createNotificationTables(turso);
   await turso.execute(`
     CREATE TABLE IF NOT EXISTS todo_tags (
       todo_id TEXT NOT NULL,
@@ -297,6 +297,8 @@ before(async () => {
     )
   `);
   await createDailyTodoLogTables(turso);
+  // Delta pulls read `sync_stamps` (migration 0031); the hand-built schema above needs it too.
+  await installSyncStamps(turso);
 });
 
 beforeEach(async () => {

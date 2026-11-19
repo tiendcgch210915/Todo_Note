@@ -292,6 +292,22 @@ export const DISMISS = {
   replaceWithinMs: 4 * MINUTE,
 } as const;
 
+/**
+ * Hoãn nhắc ("báo lại" như đồng hồ báo thức): `POST /todos/:id/snooze` dời giờ hẹn của todo thêm N phút.
+ *  - `presetMinutes`: các lựa chọn app hiện sẵn (5/10/15/30/60); server không bắt buộc chọn trong danh sách vì
+ *    "tùy chỉnh" là số phút nguyên bất kỳ trong [`minMinutes`, `maxMinutes`]. Dời xa hơn một ngày là việc "dời lịch".
+ *  - Hoãn LUÔN gửi tin gỡ thẻ tới mọi máy (người dùng vừa yêu cầu, nên không áp quy tắc `DISMISS.replaceWithinMs`),
+ *    nhưng app không đọc được giờ đăng của thẻ nên tin gỡ đến trễ có thể xóa nhầm nhắc mới cùng thẻ. Vì vậy TTL của
+ *    nó luôn ngắn hơn thời gian tới nhắc mới: `dismissMarginMs` trừ vào khoảng đó, tối thiểu `dismissMinTtlMs`.
+ */
+export const SNOOZE = {
+  presetMinutes: [5, 10, 15, 30, 60],
+  minMinutes: 1,
+  maxMinutes: 24 * 60,
+  dismissMarginMs: 15_000,
+  dismissMinTtlMs: 5_000,
+} as const;
+
 export const DISPATCH = {
   /** Số job tối đa xử lý trong một lần tick. */
   batchSize: 200,

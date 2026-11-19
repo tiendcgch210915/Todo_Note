@@ -62,6 +62,55 @@ export const applyAllMigrations = async (db: TestDb): Promise<void> => {
   }
 };
 
+const SYNC_STAMPS_MIGRATION = "0031_sync_write_cursor.sql";
+
+const tableExists = async (db: TestDb, name: string): Promise<boolean> =>
+  (
+    await db.execute({
+      sql: "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?",
+      args: [name],
+    })
+  ).rows.length > 0;
+
+/** Bảng mà một câu lệnh của migration 0031 nhắm tới (trigger `... ON <bảng>`, backfill `... FROM <bảng>`). */
+const syncStampTable = (statement: string): string | null => {
+  const trigger = /^\s*CREATE TRIGGER\s+\w+\s+AFTER\s+\w+\s+ON\s+(\w+)/i.exec(statement);
+  if (trigger) return trigger[1];
+  const backfill = /^\s*INSERT INTO sync_stamps[\s\S]*\bFROM\s+(\w+)\s*$/i.exec(statement);
+  return backfill ? backfill[1] : null;
+};
+
+const syncStampStatements = async (): Promise<string[]> =>
+  parseStatements(await readFile(join(MIGRATIONS_DIR, SYNC_STAMPS_MIGRATION), "utf-8"));
+
+/**
+ * Dành cho các test vẫn tự dựng bảng bằng DDL tay mà có gọi pull gia tăng: tạo `sync_stamps` và các trigger
+ * đóng dấu (migration 0031, dùng đúng file thật) cho những bảng đồng bộ ĐANG TỒN TẠI; bảng chưa có thì bỏ qua.
+ * Gọi sau khi đã tạo bảng. Gọi lại là no-op.
+ */
+export const installSyncStamps = async (db: TestDb): Promise<void> => {
+  if (await tableExists(db, "sync_stamps")) return;
+  for (const statement of await syncStampStatements()) {
+    const table = syncStampTable(statement);
+    if (table !== null && !(await tableExists(db, table))) continue;
+    await db.execute(statement);
+  }
+};
+
+/**
+ * Đóng dấu lại MỌI dòng bằng `updated_at` của nó (đúng phép backfill của migration 0031). Dùng cho fixture
+ * chèn dòng với `updated_at` do test chọn: pull gia tăng xét "dòng được GHI sau `since`" theo `synced_at`
+ * (đồng hồ DB lúc chèn = bây giờ), nên fixture muốn nói "dòng này ghi từ lâu" phải đặt lại dấu.
+ */
+export const restampFromUpdatedAt = async (db: TestDb): Promise<void> => {
+  await db.execute("DELETE FROM sync_stamps");
+  for (const statement of await syncStampStatements()) {
+    if (!statement.startsWith("INSERT INTO sync_stamps")) continue;
+    const table = syncStampTable(statement);
+    if (table !== null && (await tableExists(db, table))) await db.execute(statement);
+  }
+};
+
 /**
  * Dành cho các test dịch vụ vẫn tự dựng bảng bằng DDL tay: chỉ thêm các bảng của hệ thống
  * thông báo (migration 0016) cùng bảng `users` tối thiểu mà các móc tạo/hủy job cần đọc, để
@@ -114,6 +163,11 @@ export const createNotificationTables = async (db: TestDb): Promise<void> => {
     const columns = await db.execute("PRAGMA table_info(notification_settings)");
     return !columns.rows.some((row) => row.name === "morning_enabled");
   });
+  await applyMigrationFileWhen(db, "0029_checklist_occurrence_skip.sql", async () => {
+    const columns = await db.execute("PRAGMA table_info(checklist_schedule_overrides)");
+    return !columns.rows.some((row) => row.name === "skipped");
+  });
+  await applyMigrationFileOnce(db, "0030_todo_series_reminder_times.sql", "todo_series_reminder_times");
 };
 
 /**

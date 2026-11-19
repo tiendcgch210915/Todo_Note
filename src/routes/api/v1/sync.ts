@@ -25,7 +25,10 @@ export default async function syncRoutes(app: FastifyInstance) {
    * Query params:
    *   since  optional ISO-8601 UTC timestamp
    *          omitted / empty → initial sync (living entities only)
-   *          present        → delta (entities with updated_at > since, incl. soft-deleted)
+   *          present        → delta: entities WRITTEN on the server after `since` (incl. soft-deleted),
+   *                           whatever `updated_at` they carry (an offline edit pushed late has an old one)
+   *
+   * `server_time` is the cursor to send back as `since`; it is read before the data (see getSyncCursorTime).
    */
   app.get("/changes", async (req, reply) => {
     const parsed = PullQuerySchema.safeParse(req.query);
@@ -35,10 +38,10 @@ export default async function syncRoutes(app: FastifyInstance) {
 
     const since = parsed.data.since; // undefined = initial
     try {
-      const changes = await pullSyncChanges(req.userId, since ?? null);
+      const { serverTime, changes } = await pullSyncChanges(req.userId, since ?? null);
 
       return reply.send({
-        server_time: nowISO(),
+        server_time: serverTime,
         changes,
       });
     } catch (error) {

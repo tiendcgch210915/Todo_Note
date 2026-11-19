@@ -396,6 +396,7 @@ What the server guarantees / does not:
 - If the next notification of that todo **for its new schedule** is due within 4 minutes (e.g. moved to 09:03 at 10:00 -> repeat at 10:03, or moved to 10:03 -> the new reminder at 10:03) no dismiss is sent: that notification has the same tag and replaces the old card by itself. A leftover notification of the *old* schedule does not count (the server cancels it without sending), so the dismiss is still sent.
 - The tag of an occurrence of a recurring todo is the series root's id, so the dismiss removes whatever card currently carries that tag on the phone. Todos of one series normally have a single open occurrence at a time, so this is the card of the todo that was edited.
 - Best effort. It is a high-priority data message, so Doze / aggressive battery savers / a force-stopped app can delay or drop it, and a phone that stays offline longer than 3 minutes misses it (the card then stays until replaced or swiped away).
+- A **snooze** (`POST /todos/:id/snooze`, see "Snooze a todo's reminder") is the one case that always sends it, even inside the 4-minute window, with a `ttl` shortened to end before the new reminder is due.
 
 **The same `dismiss` message is also sent when the user starts or resumes a countdown** (`PUT /todos/:id/timer`, `action` `start` or `resume`). Once the user is working on the todo the reminder / nudge card on the phone is obsolete, but the server can only stop *future* nudges, so it asks every device to remove the card. Same payload, same handling in the app (cancel by `data.tag`), nothing new to implement. Details:
 
@@ -442,6 +443,68 @@ Migration `0027_todo_reminder_repeat.sql` rebuilds `notification_jobs` so its `k
 
 A reminder that was held or spaced out and goes out later than the appointment time no longer gets the +5 minute repeat if that moment has already passed. Tests: `tests/reminder-queue.test.ts`.
 
+## Snooze a todo's reminder (`POST /api/v1/todos/:id/snooze`)
+
+Like an alarm clock's snooze: the user cannot act now, so the todo's reminder moves N minutes later, every device gets the new time, and the notification on the phones disappears. The app offers **5, 10, 15, 30, 60 minutes or a custom number**; the server accepts any whole number of minutes from **1 to 1440** (a day; further away is "move to another day").
+
+**Request** (user JWT; applies to a todo that has a date and a time, top-level, open or in progress)
+
+```json
+{ "minutes": 30 }
+```
+
+**200**
+
+```json
+{
+  "todo": { "id": "...", "scheduled_date": "2026-06-20", "time": "15:30", "...": "the whole todo, same shape as PATCH /todos/:id" },
+  "minutes": 30,
+  "remind_at": "2026-06-20T08:30:00.000Z",
+  "previous": { "scheduled_date": "2026-06-20", "time": "15:00" }
+}
+```
+
+`remind_at` is when the reminder is due again (UTC). A reminder can still arrive later than that when it is held behind another todo's countdown (see "Reminders wait while another todo is being counted down"). `previous` lets the app offer "Undo" with `PATCH /todos/:id` `{ "scheduled_date": ..., "time": ..., "time_scope": "this" }`.
+
+| Status | Body | Meaning |
+| --- | --- | --- |
+| 400 | `{ "error": "bad_input", "issues": [...] }` | `minutes` missing, not an integer, below 1 or above 1440. |
+| 404 | `{ "error": "not_found" }` | Unknown, deleted or someone else's todo. Drop the card. |
+| 409 | `{ "error": "todo_completed" }` | Done or archived: nothing is left to remind about. Drop the card. |
+| 409 | `{ "error": "no_reminder" }` | The todo has no date or no time, or it is a subtask: there is no reminder to move. |
+| 409 | `{ "error": "duplicate" }` | A recurring todo whose snooze would roll over midnight onto a day another occurrence of the series already holds. Offer a shorter snooze. |
+| 401 | | The usual auth handling. |
+
+**The new time** is `minutes` after the **later** of the todo's current reminder time and the current minute, in the user's time zone (`users.timezone`, default `Asia/Ho_Chi_Minh`). Seconds are dropped (the time is `HH:mm`).
+
+| Situation | Todo | Snooze | Now | Result |
+| --- | --- | --- | --- | --- |
+| Tapped on the on-time reminder | 15:00 | 30 | 15:00:40 | **15:30** |
+| Tapped on a nudge two hours late | 15:00 | 15 | 17:03:20 | 17:18 (counted from now, a time in the past would never ring) |
+| Snoozed before it is due (todo screen) | 15:00 | 30 | 14:00 | 15:30 |
+| Past midnight | 23:50 | 30 | 23:50:10 | 00:20 **the next day** (`scheduled_date` moves too) |
+
+An overdue todo (dated before today) lands on today; the past day is closed first, exactly as for any other edit of a past-day todo.
+
+**Recurring todos: only this occurrence.** The edit is always `time_scope: "this"`: today's run of a daily todo moves, the series' usual time does not, and the next occurrence is generated at the usual time. There is no "Today only / All occurrences" prompt for a snooze.
+
+**What the server does** (one request, nothing for the app to chain):
+
+1. Saves `scheduled_date` / `time` like any other todo edit, so the other devices receive them in their next `GET /sync/changes` (the todo's `updated_at` moves too); no new sync entity or field.
+2. Re-arms the reminder around the **new** time: the on-time `todo_reminder`, the +5 minute repeat (important + urgent), and the hourly / 2-hourly `todo_overdue` nudges all follow it, and an already sent reminder is armed again. Same-time reminders re-queue.
+3. Sends the `type: "dismiss"` message (see "Removing a card when the todo's time or date changes") to **all** the user's devices, the one that snoozed included, with the same payload and the same app handling. Unlike an ordinary time edit it is **always** sent: also when the next notification is due within 4 minutes (a 3-minute snooze), and also when the server has no record of a delivered card. Its FCM `ttl` is shortened to 15 seconds less than the time until the new reminder (at most 3 minutes, at least 5 seconds), because the app cancels by `data.tag` and ignores `data.before`: a late dismiss must expire before the new reminder is shown, or it would remove it.
+
+**What the app has to do:**
+
+- **Where the button can be.** A reminder that the system draws itself (the app is in the background or closed; the FCM `notification` block) is drawn by Android and **cannot carry action buttons**. Only a notification the app draws itself can: the foreground case (`PushMessageDispatcher.onForegroundMessage` -> `PluginNotificationSink.show`) can add a "Snooze" action; everywhere else the snooze has to start from the todo (tapping the card opens it, and the todo screen offers the same picker).
+- **The picker:** 5 / 10 / 15 / 30 / 60 minutes and "Custom" (whole minutes, 1 to 1440). On a choice call the endpoint and cancel the local card at once (`TrayCleanup`, tag `todo:<series root id or todo id>`); the dismiss message only covers the other devices.
+- **Show the result** from the response (`todo.time`, and `todo.scheduled_date` when it moved) and update the local copy of the todo; the other devices pick it up with their next pull.
+- **`404` / `409 todo_completed`:** drop the card and the todo is gone or finished. `409 no_reminder`: the card is stale. `409 duplicate`: tell the user to pick a shorter time.
+- **Offline.** The endpoint needs the network. If the app wants snooze to work offline it applies the same rule locally (the table above) and saves it as a normal edit of the todo with `time_scope: "this"`; the server then handles it like any time edit (jobs re-armed, and the old card removed by the ordinary `dismiss` rules).
+- Do **not** call `reminder-ack` for the snooze: the reminder of the new time is armed again by the server.
+
+Tests: `tests/todo-snooze.test.ts`.
+
 ## Verification
 
 - `npx tsc --noEmit` is clean.
@@ -450,6 +513,7 @@ A reminder that was held or spaced out and goes out later than the appointment t
 - Manual send: `npm run notify:job-test -- <userId> checklist_due` (then `--cleanup`).
 - Day marks and start-day rule: migration `0023_checklist_occurrence_marks.sql` creates `checklist_occurrence_marks` and indexes `checklist_runs` by `started_at` (dropping the unused `completed_at` index). Apply it with `npm run db:migrate` **before** deploying the code: the sync pull selects the new table, so an unmigrated database fails every pull. Covered by `tests/checklist-occurrence-marks.test.ts` (rule, REST, sync, reminders, habits) and `tests/migration-0023.test.ts`.
 - Reminder repeat: migration `0027_todo_reminder_repeat.sql` (see "Reminder repeat" above), covered by `tests/reminder-repeat.test.ts` and `tests/migration-0027.test.ts`.
+- Snooze: no migration; it is a new endpoint on the existing todo columns and the existing `dismiss` message (see "Snooze a todo's reminder"), covered by `tests/todo-snooze.test.ts`.
 - Card removal on reschedule: migration `0026_notification_card_key.sql` adds the nullable column `notification_jobs.card_key` (the schedule a delivered reminder / repeat was sent for). Apply it with `npm run db:migrate` **before** deploying the code: the tick writes the column when it marks a job sent. Covered by `tests/notification-dismiss.test.ts`.
 - Removed overdue nudge: migration `0024_cancel_checklist_overdue.sql` cancels the pending `checklist_overdue` jobs (history is kept and the kind stays allowed in the table). It is a data cleanup only: even if it has not run yet, the server cancels any leftover `checklist_overdue` job when it comes due instead of sending it. Tests: `tests/overdue-nudges.test.ts` (checklist section), `tests/checklist-due.test.ts`, `tests/migration-0024.test.ts`.
 - Pause: migration `0021_checklist_schedule_pause.sql` adds the two nullable columns `paused_from` / `paused_until` (existing rows = not paused). Apply it with `npm run db:migrate` **before** deploying the code, because the code selects and writes them. Covered by the `pause` tests in `tests/checklist-schedule.test.ts` (expansion), `tests/checklist-schedule-api.test.ts` (REST, sync, jobs) and `tests/checklist-due.test.ts` (planner, overdue nudges, re-validation before sending).

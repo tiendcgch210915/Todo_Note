@@ -153,7 +153,6 @@ const liveChildren = async (
 };
 
 before(async () => {
-  await createNotificationTables(turso);
   await turso.execute(`
     CREATE TABLE IF NOT EXISTS todos (
       id TEXT PRIMARY KEY,
@@ -186,6 +185,7 @@ before(async () => {
       deleted_at TEXT
     )
   `);
+  await createNotificationTables(turso);
   await turso.execute(`
     CREATE TABLE IF NOT EXISTS tags (
       id TEXT PRIMARY KEY,

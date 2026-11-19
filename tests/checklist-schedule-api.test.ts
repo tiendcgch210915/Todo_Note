@@ -445,6 +445,37 @@ test("a per-day override changes that day's time, is flagged, and leaves the oth
   );
 });
 
+test("skipping a checklist hides only that user's local day and keeps the repeat rule", async () => {
+  const today = localDateOf(new Date(), "Asia/Ho_Chi_Minh");
+  const yesterday = addDays(today, -1);
+  const tomorrow = addDays(today, 1);
+  const rule = daily({ start_date: yesterday, time: "23:59" });
+  const original = (await putSchedule(SYS, rule)).body.schedule;
+  await putSchedule(SYS, rule, OTHER_USER_ID);
+  await putOccurrence(SYS, yesterday, { time: "09:00" });
+  await putOccurrence(SYS, today, { time: "23:58" });
+
+  for (let attempt = 0; attempt < 2; attempt++) {
+    const result = await putOccurrence(SYS, today, { skipped: true });
+    assert.equal(result.status, 200);
+    assert.deepEqual(result.body, { checklistId: SYS, date: today, skipped: true });
+  }
+  const days = (await occurrences(yesterday, tomorrow)).body.items as Json[];
+  assert.deepEqual(days.map((item) => [item.date, item.time]), [
+    [yesterday, "09:00"], [tomorrow, "23:59"],
+  ]);
+  assert.deepEqual((await getSchedule(SYS)).body.schedule, original);
+  assert.equal((await occurrences(today, today, OTHER_USER_ID)).body.items[0].time, "23:59");
+  assert.equal((await jobsRepo.getOccurrenceJob(USER_ID, "checklist_due", SYS, tomorrow))?.status, "pending");
+  assert.equal((await call("PUT", `/checklists/templates/${SYS}/occurrences/${today}/status`, { status: "done" })).status, 400);
+
+  await putOccurrence(SYS, today, { time: "13:00" });
+  assert.equal((await occurrences(today, today)).body.items[0].time, "13:00");
+  await putOccurrence(SYS, today, { skipped: true });
+  assert.equal((await deleteOccurrence(SYS, today)).status, 204);
+  assert.equal((await occurrences(today, today)).body.items[0].time, "23:59");
+});
+
 test("overriding twice keeps one row with the latest time; deleting restores the schedule time", async () => {
   await putSchedule(A, daily());
   await putOccurrence(A, "2026-06-02", { time: "21:15" });
@@ -489,6 +520,7 @@ test("override input is validated", async () => {
   for (const [label, date, body] of [
     ["a bad time", "2026-06-02", { time: "25:00" }],
     ["a missing time", "2026-06-02", {}],
+    ["skip and change time together", "2026-06-02", { time: "08:00", skipped: true }],
     ["a bad date", "2026-6-2", { time: "08:00" }],
     ["a non-existent date", "2026-02-30", { time: "08:00" }],
   ] as Array<[string, string, unknown]>) {
@@ -762,6 +794,22 @@ test("sync: deleting an override restores the schedule time", async () => {
   const item = (await occurrences("2026-06-02", "2026-06-02")).body.items[0];
   assert.equal(item.time, "07:30");
   assert.equal(item.overridden, false);
+});
+
+test("sync preserves a skipped date across older clients and can explicitly reschedule it", async () => {
+  await push("checklist_schedule", "create", schedulePayload("sched-1"));
+  const write = (fields: Json) =>
+    push("checklist_schedule_override", "create", overridePayload("skip-day", fields));
+  const list = () => occurrences("2026-06-02", "2026-06-02");
+  assert.equal((await write({ skipped: true }))[0].status, "applied");
+  assert.deepEqual((await list()).body.items, []);
+  const delta = await getChangesSince(USER_ID, EARLIER);
+  assert.equal(delta.checklist_schedule_overrides[0].skipped, true);
+  await write({ time: "12:00", updated_at: LATER });
+  await write({ skipped: false, updated_at: EARLIER });
+  assert.deepEqual((await list()).body.items, []);
+  await write({ skipped: false, time: "14:30", updated_at: "2026-06-03T00:00:00.000Z" });
+  assert.equal((await list()).body.items[0].time, "14:30");
 });
 
 test("sync: deleting a checklist soft-deletes its schedule and overrides, and the delta says so", async () => {
